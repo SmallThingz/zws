@@ -105,7 +105,7 @@ pub fn acceptServerHandshake(
         return error.InvalidUpgradeHeader;
     }
 
-    const key = req.sec_websocket_key orelse return error.MissingWebSocketKey;
+    const key = std.mem.trim(u8, req.sec_websocket_key orelse return error.MissingWebSocketKey, " \t");
     const version = req.sec_websocket_version orelse return error.MissingWebSocketVersion;
     if (!std.mem.eql(u8, std.mem.trim(u8, version, " \t"), "13")) {
         return error.UnsupportedWebSocketVersion;
@@ -212,6 +212,14 @@ test "acceptServerHandshake accepts trimmed valid request without subprotocol se
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", response.accept_key[0..]);
     try std.testing.expect(response.selected_subprotocol == null);
     try std.testing.expectEqual(@as(usize, 0), response.extra_headers.len);
+}
+
+test "acceptServerHandshake trims websocket key before validation" {
+    var req = validRequest();
+    req.sec_websocket_key = " \tdGhlIHNhbXBsZSBub25jZQ== \t";
+
+    const response = try acceptServerHandshake(req, .{});
+    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", response.accept_key[0..]);
 }
 
 test "acceptServerHandshake reports all validation errors" {

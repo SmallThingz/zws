@@ -39,6 +39,30 @@ fn trimSpaces(s: []const u8) []const u8 {
     return s[a..b];
 }
 
+fn assignHandshakeHeader(req: *zws.ServerHandshakeRequest, name: []const u8, value: []const u8) void {
+    if (std.ascii.eqlIgnoreCase(name, "connection")) {
+        req.connection = value;
+    } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
+        req.upgrade = value;
+    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
+        req.sec_websocket_key = value;
+    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
+        req.sec_websocket_version = value;
+    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-protocol")) {
+        req.sec_websocket_protocol = value;
+    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-extensions")) {
+        req.sec_websocket_extensions = value;
+    } else if (std.ascii.eqlIgnoreCase(name, "origin")) {
+        req.origin = value;
+    } else if (std.ascii.eqlIgnoreCase(name, "host")) {
+        req.host = value;
+    }
+}
+
+fn flushIfBuffered(w: *Io.Writer) Io.Writer.Error!void {
+    if (w.buffered().len != 0) try w.flush();
+}
+
 fn setTcpNoDelay(stream: *const std.Io.net.Stream) void {
     if (builtin.os.tag != .linux) return;
     const linux = std.os.linux;
@@ -74,23 +98,7 @@ fn parseHandshakeRequest(r: *Io.Reader) !zws.ServerHandshakeRequest {
         const name = line[0..colon];
         const value = trimSpaces(line[colon + 1 ..]);
 
-        if (std.ascii.eqlIgnoreCase(name, "connection")) {
-            req.connection = value;
-        } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
-            req.upgrade = value;
-        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
-            req.sec_websocket_key = value;
-        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
-            req.sec_websocket_version = value;
-        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-protocol")) {
-            req.sec_websocket_protocol = value;
-        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-extensions")) {
-            req.sec_websocket_extensions = value;
-        } else if (std.ascii.eqlIgnoreCase(name, "origin")) {
-            req.origin = value;
-        } else if (std.ascii.eqlIgnoreCase(name, "host")) {
-            req.host = value;
-        }
+        assignHandshakeHeader(&req, name, value);
     }
 
     return req;
@@ -122,9 +130,7 @@ fn handleConn(io: Io, stream: std.Io.net.Stream) Io.Cancelable!void {
             sw.interface.flush() catch {};
             return;
         }
-        if (sw.interface.buffered().len != 0) {
-            sw.interface.flush() catch return;
-        }
+        flushIfBuffered(&sw.interface) catch return;
     }
 }
 

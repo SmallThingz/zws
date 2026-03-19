@@ -3,6 +3,10 @@ const Io = std.Io;
 
 const proto = @import("protocol.zig");
 
+const control_payload_max_len = 125;
+const frame_header_max_len = 14;
+const mask_len = 4;
+
 pub const Role = proto.Role;
 pub const Opcode = proto.Opcode;
 pub const MessageOpcode = proto.MessageOpcode;
@@ -63,6 +67,7 @@ pub const CloseFrame = struct {
 };
 
 pub const BorrowedFrame = struct {
+    /// Borrowed payload backed by the reader buffer until the next peek/fill.
     header: FrameHeader,
     payload: []u8,
 };
@@ -75,9 +80,11 @@ pub const EchoResult = struct {
 const ParsedHeader = struct {
     header: FrameHeader,
     header_len: usize,
-    mask: [4]u8,
+    mask: [mask_len]u8,
 };
 
+/// Creates a websocket connection type specialized for a fixed role and policy
+/// set so the hot path can be compiled without runtime configuration branches.
 pub fn Conn(comptime static: StaticConfig) type {
     const expects_masked = static.role == .server;
     const auto_pong = static.auto_pong;
@@ -93,7 +100,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         recv_active: bool = false,
         recv_header: FrameHeader = undefined,
         recv_remaining: u64 = 0,
-        recv_mask: [4]u8 = .{0} ** 4,
+        recv_mask: [mask_len]u8 = .{0} ** mask_len,
         recv_mask_offset: usize = 0,
         recv_fragment_opcode: ?MessageOpcode = null,
 
@@ -224,7 +231,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         pub fn readMessage(self: *Self, buf: []u8) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!Message {
             var total_len: usize = 0;
             var message_opcode: ?MessageOpcode = null;
-            var control_buf: [125]u8 = undefined;
+            var control_buf: [control_payload_max_len]u8 = undefined;
 
             while (true) {
                 const header = try self.beginFrame();
@@ -282,17 +289,17 @@ pub fn Conn(comptime static: StaticConfig) type {
             payload: []const u8,
             fin: bool,
         ) (ProtocolError || Io.Writer.Error)!void {
-            if (proto.isControl(opcode) and payload.len > 125) return error.ControlFrameTooLarge;
+            if (proto.isControl(opcode) and payload.len > control_payload_max_len) return error.ControlFrameTooLarge;
             try self.validateOutgoingSequence(opcode, fin);
 
-            var header_buf: [14]u8 = undefined;
+            var header_buf: [frame_header_max_len]u8 = undefined;
             var header_len: usize = 0;
 
             const fin_bit: u8 = if (fin) 0x80 else 0;
             header_buf[header_len] = @as(u8, @intFromEnum(opcode)) | fin_bit;
             header_len += 1;
 
-            if (payload.len <= 125) {
+            if (payload.len <= control_payload_max_len) {
                 header_buf[header_len] = @as(u8, @intCast(payload.len));
                 if (comptime !expects_masked) header_buf[header_len] |= 0x80;
                 header_len += 1;
@@ -311,7 +318,7 @@ pub fn Conn(comptime static: StaticConfig) type {
             }
 
             if (comptime !expects_masked) {
-                var mask: [4]u8 = undefined;
+                var mask: [mask_len]u8 = undefined;
                 self.mask_prng.random().bytes(mask[0..]);
                 @memcpy(header_buf[header_len..][0..4], mask[0..]);
                 header_len += 4;
@@ -334,9 +341,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         pub fn writeText(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
-            if (comptime validate_utf8) {
-                if (!std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
-            }
+            try validateUtf8IfEnabled(validate_utf8, payload);
             try self.writeFrame(.text, payload, true);
         }
 
@@ -345,13 +350,11 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         pub fn writePing(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
-            if (payload.len > 125) return error.ControlFrameTooLarge;
-            try self.writeFrame(.ping, payload, true);
+            try self.writeControlFrame(.ping, payload);
         }
 
         pub fn writePong(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
-            if (payload.len > 125) return error.ControlFrameTooLarge;
-            try self.writeFrame(.pong, payload, true);
+            try self.writeControlFrame(.pong, payload);
         }
 
         pub fn writeClose(
@@ -360,11 +363,9 @@ pub fn Conn(comptime static: StaticConfig) type {
             reason: []const u8,
         ) (ProtocolError || Io.Writer.Error)!void {
             if (code == null and reason.len != 0) return error.InvalidClosePayload;
-            if (comptime validate_utf8) {
-                if (!std.unicode.utf8ValidateSlice(reason)) return error.InvalidUtf8;
-            }
+            try validateUtf8IfEnabled(validate_utf8, reason);
 
-            var payload: [125]u8 = undefined;
+            var payload: [control_payload_max_len]u8 = undefined;
             var len: usize = 0;
             if (code) |close_code| {
                 if (!proto.isValidCloseCode(close_code)) return error.InvalidCloseCode;
@@ -372,11 +373,11 @@ pub fn Conn(comptime static: StaticConfig) type {
                 len = 2;
             }
 
-            if (len + reason.len > 125) return error.ControlFrameTooLarge;
+            if (len + reason.len > control_payload_max_len) return error.ControlFrameTooLarge;
             @memcpy(payload[len..][0..reason.len], reason);
             len += reason.len;
 
-            try self.writeFrame(.close, payload[0..len], true);
+            try self.writeControlFrame(.close, payload[0..len]);
             self.close_sent = true;
         }
 
@@ -404,10 +405,12 @@ pub fn Conn(comptime static: StaticConfig) type {
             var idx: usize = 2;
             if (payload_len == 126) {
                 payload_len = std.mem.readInt(u16, bytes[idx..][0..2], .big);
+                if (payload_len < 126) return error.InvalidFrameLength;
                 idx += 2;
             } else if (payload_len == 127) {
                 if ((bytes[idx] & 0x80) != 0) return error.InvalidFrameLength;
                 payload_len = std.mem.readInt(u64, bytes[idx..][0..8], .big);
+                if (payload_len <= std.math.maxInt(u16)) return error.InvalidFrameLength;
                 idx += 8;
             }
 
@@ -415,7 +418,7 @@ pub fn Conn(comptime static: StaticConfig) type {
 
             if (proto.isControl(opcode)) {
                 if (!fin) return error.ControlFrameFragmented;
-                if (payload_len > 125) return error.ControlFrameTooLarge;
+                if (payload_len > control_payload_max_len) return error.ControlFrameTooLarge;
             } else switch (opcode) {
                 .continuation => {
                     if (self.recv_fragment_opcode == null) return error.UnexpectedContinuation;
@@ -426,9 +429,9 @@ pub fn Conn(comptime static: StaticConfig) type {
                 else => unreachable,
             }
 
-            var mask: [4]u8 = .{0} ** 4;
+            var mask: [mask_len]u8 = .{0} ** mask_len;
             if (masked) {
-                mask = bytes[idx..][0..4].*;
+                mask = bytes[idx..][0..mask_len].*;
             }
 
             return .{
@@ -446,12 +449,12 @@ pub fn Conn(comptime static: StaticConfig) type {
         fn echoFramePayload(self: *Self, header: FrameHeader, payload: []const u8) (ProtocolError || Io.Writer.Error)!EchoResult {
             switch (header.opcode) {
                 .continuation, .text, .binary => try self.writeFrame(header.opcode, payload, header.fin),
-                .ping => try self.writePong(payload),
+                .ping => try self.writeControlFrame(.pong, payload),
                 .pong => {},
                 .close => {
                     self.close_received = true;
+                    const close_frame = try parseClosePayload(payload, validate_utf8);
                     if (!self.close_sent) {
-                        const close_frame = try parseClosePayload(payload, validate_utf8);
                         try self.writeClose(close_frame.code, close_frame.reason);
                     }
                 },
@@ -460,6 +463,11 @@ pub fn Conn(comptime static: StaticConfig) type {
                 .opcode = header.opcode,
                 .payload_len = payload.len,
             };
+        }
+
+        fn writeControlFrame(self: *Self, opcode: Opcode, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
+            if (payload.len > control_payload_max_len) return error.ControlFrameTooLarge;
+            try self.writeFrame(opcode, payload, true);
         }
 
         fn validateOutgoingSequence(self: *Self, opcode: Opcode, fin: bool) ProtocolError!void {
@@ -503,6 +511,12 @@ pub fn Conn(comptime static: StaticConfig) type {
     };
 }
 
+fn validateUtf8IfEnabled(comptime enabled: bool, payload: []const u8) ProtocolError!void {
+    if (comptime enabled) {
+        if (!std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
+    }
+}
+
 pub fn parseClosePayload(payload: []const u8, validate_utf8: bool) ProtocolError!CloseFrame {
     if (payload.len == 0) {
         return .{};
@@ -527,7 +541,7 @@ fn neededHeaderLen(second: u8) usize {
         (if ((second & 0x80) != 0) @as(usize, 4) else @as(usize, 0));
 }
 
-fn applyMask(bytes: []u8, mask: [4]u8, start_offset: usize) void {
+fn applyMask(bytes: []u8, mask: [mask_len]u8, start_offset: usize) void {
     if (bytes.len == 0) return;
 
     const offset = start_offset & 3;
@@ -554,12 +568,12 @@ fn appendTestFrame(
     fin: bool,
     masked: bool,
     payload: []const u8,
-    mask: [4]u8,
+    mask: [mask_len]u8,
 ) !void {
     const first: u8 = @as(u8, @intFromEnum(opcode)) | if (fin) @as(u8, 0x80) else 0;
     try out.append(a, first);
 
-    if (payload.len <= 125) {
+    if (payload.len <= control_payload_max_len) {
         try out.append(a, @as(u8, @intCast(payload.len)) | if (masked) @as(u8, 0x80) else 0);
     } else if (payload.len <= std.math.maxInt(u16)) {
         try out.append(a, 126 | if (masked) @as(u8, 0x80) else 0);
@@ -762,6 +776,46 @@ test "beginFrame rejects invalid extended length and configured frame limit" {
         var writer = Io.Writer.fixed(sink[0..]);
         var conn = Conn(.{}).init(&reader, &writer, .{ .max_frame_payload_len = 3 });
         try std.testing.expectError(error.FrameTooLarge, conn.beginFrame());
+    }
+    {
+        const wire = [_]u8{
+            0x82,
+            0xFE,
+            0x00,
+            0x7D,
+            1,
+            2,
+            3,
+            4,
+        };
+        var reader = Io.Reader.fixed(wire[0..]);
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
+        try std.testing.expectError(error.InvalidFrameLength, conn.beginFrame());
+    }
+    {
+        const wire = [_]u8{
+            0x82,
+            0xFF,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0xFF,
+            0xFF,
+            1,
+            2,
+            3,
+            4,
+        };
+        var reader = Io.Reader.fixed(wire[0..]);
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
+        try std.testing.expectError(error.InvalidFrameLength, conn.beginFrame());
     }
 }
 
@@ -1148,6 +1202,21 @@ test "echoFrame preserves fragmentation and mirrors close payload" {
         0x05, 0x03, 0xE8, 'b', 'y',
         'e',
     }, out[0..writer.end]);
+}
+
+test "echoFrame validates close payload even after local close was sent" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, &.{0x03}, .{ 1, 2, 3, 4 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var out: [16]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+    try conn.writeClose(null, "");
+
+    var scratch: [8]u8 = undefined;
+    try std.testing.expectError(error.InvalidClosePayload, conn.echoFrame(scratch[0..]));
 }
 
 test "applyMask is reversible across chunk boundaries and offsets" {

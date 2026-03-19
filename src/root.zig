@@ -4,7 +4,13 @@
 //! - low-level frame streaming (`beginFrame`, `readFrameChunk`, `readFrameAll`, `discardFrame`)
 //! - convenience helpers (`readFrame`, `readMessage`, `writeFrame`, `writeText`, `writeBinary`)
 //! - strict server handshake validation (`acceptServerHandshake`, `writeServerHandshakeResponse`)
+//!
+//! `ConnType` exposes the comptime-specialized connection type constructor.
+//! `Conn`, `ServerConn`, and `ClientConn` are convenient aliases for common
+//! configurations.
 const proto = @import("protocol.zig");
+const handshake = @import("handshake.zig");
+const conn = @import("conn.zig");
 
 pub const Role = proto.Role;
 pub const Opcode = proto.Opcode;
@@ -14,30 +20,30 @@ pub const isControl = proto.isControl;
 pub const isData = proto.isData;
 pub const isValidCloseCode = proto.isValidCloseCode;
 
-pub const Header = @import("handshake.zig").Header;
-pub const ServerHandshakeRequest = @import("handshake.zig").ServerHandshakeRequest;
-pub const ServerHandshakeOptions = @import("handshake.zig").ServerHandshakeOptions;
-pub const ServerHandshakeResponse = @import("handshake.zig").ServerHandshakeResponse;
-pub const HandshakeError = @import("handshake.zig").HandshakeError;
-pub const computeAcceptKey = @import("handshake.zig").computeAcceptKey;
-pub const acceptServerHandshake = @import("handshake.zig").acceptServerHandshake;
-pub const writeServerHandshakeResponse = @import("handshake.zig").writeServerHandshakeResponse;
-pub const serverHandshake = @import("handshake.zig").serverHandshake;
+pub const Header = handshake.Header;
+pub const ServerHandshakeRequest = handshake.ServerHandshakeRequest;
+pub const ServerHandshakeOptions = handshake.ServerHandshakeOptions;
+pub const ServerHandshakeResponse = handshake.ServerHandshakeResponse;
+pub const HandshakeError = handshake.HandshakeError;
+pub const computeAcceptKey = handshake.computeAcceptKey;
+pub const acceptServerHandshake = handshake.acceptServerHandshake;
+pub const writeServerHandshakeResponse = handshake.writeServerHandshakeResponse;
+pub const serverHandshake = handshake.serverHandshake;
 
-pub const StaticConfig = @import("conn.zig").StaticConfig;
-pub const Config = @import("conn.zig").Config;
-pub const ProtocolError = @import("conn.zig").ProtocolError;
-pub const FrameHeader = @import("conn.zig").FrameHeader;
-pub const Frame = @import("conn.zig").Frame;
-pub const Message = @import("conn.zig").Message;
-pub const CloseFrame = @import("conn.zig").CloseFrame;
-pub const BorrowedFrame = @import("conn.zig").BorrowedFrame;
-pub const EchoResult = @import("conn.zig").EchoResult;
-pub const ConnType = @import("conn.zig").Conn;
-pub const Conn = @import("conn.zig").Conn(.{});
-pub const ServerConn = @import("conn.zig").Conn(.{ .role = .server });
-pub const ClientConn = @import("conn.zig").Conn(.{ .role = .client });
-pub const parseClosePayload = @import("conn.zig").parseClosePayload;
+pub const StaticConfig = conn.StaticConfig;
+pub const Config = conn.Config;
+pub const ProtocolError = conn.ProtocolError;
+pub const FrameHeader = conn.FrameHeader;
+pub const Frame = conn.Frame;
+pub const Message = conn.Message;
+pub const CloseFrame = conn.CloseFrame;
+pub const BorrowedFrame = conn.BorrowedFrame;
+pub const EchoResult = conn.EchoResult;
+pub const ConnType = conn.Conn;
+pub const Conn = conn.Conn(.{});
+pub const ServerConn = conn.Conn(.{ .role = .server });
+pub const ClientConn = conn.Conn(.{ .role = .client });
+pub const parseClosePayload = conn.parseClosePayload;
 
 test {
     _ = @import("protocol.zig");
