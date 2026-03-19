@@ -185,6 +185,7 @@ test "computeAcceptKey matches RFC example" {
 test "containsTokenIgnoreCase ignores ASCII case and whitespace" {
     try std.testing.expect(containsTokenIgnoreCase("keep-alive, Upgrade", "upgrade"));
     try std.testing.expect(containsTokenIgnoreCase(" keep-alive ,\tUPGRADE ", "upgrade"));
+    try std.testing.expect(containsTokenIgnoreCase("keep-alive,, Upgrade ,", "upgrade"));
     try std.testing.expect(!containsTokenIgnoreCase("upgrader", "upgrade"));
     try std.testing.expect(!containsTokenIgnoreCase("", "upgrade"));
 }
@@ -199,6 +200,7 @@ test "validateClientKey enforces valid base64 and 16 decoded bytes" {
 test "subprotocolWasOffered matches exact token only" {
     try std.testing.expect(subprotocolWasOffered("chat, superchat", "chat"));
     try std.testing.expect(subprotocolWasOffered("chat, superchat", "superchat"));
+    try std.testing.expect(subprotocolWasOffered(" chat , , superchat ", "chat"));
     try std.testing.expect(!subprotocolWasOffered("chatty, superchat", "chat"));
     try std.testing.expect(!subprotocolWasOffered("", "chat"));
 }
@@ -220,6 +222,22 @@ test "acceptServerHandshake trims websocket key before validation" {
 
     const response = try acceptServerHandshake(req, .{});
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", response.accept_key[0..]);
+}
+
+test "acceptServerHandshake allows extensions unless configured to reject them" {
+    var req = validRequest();
+    req.sec_websocket_extensions = "permessage-deflate";
+
+    const response = try acceptServerHandshake(req, .{});
+    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", response.accept_key[0..]);
+}
+
+test "acceptServerHandshake accepts connection token with extra commas and spaces" {
+    var req = validRequest();
+    req.connection = "keep-alive, , Upgrade ,";
+
+    const response = try acceptServerHandshake(req, .{});
+    try std.testing.expect(response.selected_subprotocol == null);
 }
 
 test "acceptServerHandshake reports all validation errors" {
@@ -332,6 +350,31 @@ test "writeServerHandshakeResponse omits optional headers when absent" {
             "upgrade: websocket\r\n" ++
             "connection: Upgrade\r\n" ++
             "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+            "\r\n",
+        out[0..writer.end],
+    );
+}
+
+test "writeServerHandshakeResponse preserves header order for subprotocol and extras" {
+    var out: [256]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    try writeServerHandshakeResponse(&writer, .{
+        .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
+        .selected_subprotocol = "chat",
+        .extra_headers = &.{
+            .{ .name = "x-first", .value = "1" },
+            .{ .name = "x-second", .value = "2" },
+        },
+    });
+
+    try std.testing.expectEqualStrings(
+        "HTTP/1.1 101 Switching Protocols\r\n" ++
+            "upgrade: websocket\r\n" ++
+            "connection: Upgrade\r\n" ++
+            "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
+            "sec-websocket-protocol: chat\r\n" ++
+            "x-first: 1\r\n" ++
+            "x-second: 2\r\n" ++
             "\r\n",
         out[0..writer.end],
     );

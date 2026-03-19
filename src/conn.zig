@@ -163,11 +163,12 @@ pub fn Conn(comptime static: StaticConfig) type {
 
             const header_bytes = if (prefix.len >= header_need) prefix else try self.reader.peek(header_need);
             const parsed = (try self.parseHeaderBytes(header_bytes)).?;
-            const total_len = parsed.header_len + @as(usize, @intCast(parsed.header.payload_len));
+            const payload_len: usize = std.math.cast(usize, parsed.header.payload_len) orelse return null;
+            const total_len = std.math.add(usize, parsed.header_len, payload_len) catch return null;
             if (total_len > self.reader.buffer.len) return null;
 
             const frame_bytes = try self.reader.peek(total_len);
-            const payload = frame_bytes[parsed.header_len..][0..@as(usize, @intCast(parsed.header.payload_len))];
+            const payload = frame_bytes[parsed.header_len..][0..payload_len];
             if (parsed.header.masked) applyMask(payload, parsed.mask, 0);
             self.reader.toss(total_len);
             self.noteConsumedFrame(parsed.header);
@@ -190,7 +191,8 @@ pub fn Conn(comptime static: StaticConfig) type {
             }
             if (dest.len == 0) return dest[0..0];
 
-            const n: usize = @min(dest.len, @as(usize, @intCast(self.recv_remaining)));
+            const remaining = std.math.cast(usize, self.recv_remaining) orelse std.math.maxInt(usize);
+            const n: usize = @min(dest.len, remaining);
             try self.reader.readSliceAll(dest[0..n]);
             if (self.recv_header.masked) applyMask(dest[0..n], self.recv_mask, self.recv_mask_offset);
 
@@ -203,12 +205,13 @@ pub fn Conn(comptime static: StaticConfig) type {
 
         pub fn readFrameAll(self: *Self, dest: []u8) (ProtocolError || Io.Reader.Error)![]u8 {
             if (!self.recv_active) return error.NoActiveFrame;
-            if (self.recv_remaining > dest.len) return error.MessageTooLarge;
+            const remaining = std.math.cast(usize, self.recv_remaining) orelse return error.MessageTooLarge;
+            if (remaining > dest.len) return error.MessageTooLarge;
             if (self.recv_remaining == 0) {
                 self.finishActiveFrame();
                 return dest[0..0];
             }
-            return try self.readFrameChunk(dest[0..@as(usize, @intCast(self.recv_remaining))]);
+            return try self.readFrameChunk(dest[0..remaining]);
         }
 
         pub fn discardFrame(self: *Self) (ProtocolError || Io.Reader.Error)!void {
@@ -230,7 +233,7 @@ pub fn Conn(comptime static: StaticConfig) type {
 
         pub fn readMessage(self: *Self, buf: []u8) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!Message {
             var total_len: usize = 0;
-            var message_opcode: ?MessageOpcode = null;
+            var message_opcode: ?MessageOpcode = self.recv_fragment_opcode;
             var control_buf: [control_payload_max_len]u8 = undefined;
 
             while (true) {
@@ -603,6 +606,21 @@ fn appendMalformedHeader(out: *std.ArrayList(u8), a: std.mem.Allocator, first: u
     try out.append(a, second);
 }
 
+test "validateUtf8IfEnabled enforces comptime-enabled validation only" {
+    const invalid_utf8 = [_]u8{ 0xC3, 0x28 };
+    try validateUtf8IfEnabled(false, invalid_utf8[0..]);
+    try std.testing.expectError(error.InvalidUtf8, validateUtf8IfEnabled(true, invalid_utf8[0..]));
+}
+
+test "neededHeaderLen covers base extended and masked layouts" {
+    try std.testing.expectEqual(@as(usize, 2), neededHeaderLen(0x05));
+    try std.testing.expectEqual(@as(usize, 6), neededHeaderLen(0x85));
+    try std.testing.expectEqual(@as(usize, 4), neededHeaderLen(126));
+    try std.testing.expectEqual(@as(usize, 8), neededHeaderLen(0xFE));
+    try std.testing.expectEqual(@as(usize, 10), neededHeaderLen(127));
+    try std.testing.expectEqual(@as(usize, 14), neededHeaderLen(0xFF));
+}
+
 test "server reads masked text frame" {
     const wire = [_]u8{
         0x81,
@@ -926,6 +944,57 @@ test "readFrameChunk and readFrameAll enforce active frame semantics" {
     try std.testing.expectError(error.NoActiveFrame, conn.discardFrame());
 }
 
+test "readFrameChunk handles recv_remaining values larger than usize" {
+    var reader = Io.Reader.fixed("ab"[0..]);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+    conn.recv_active = true;
+    conn.recv_header = .{
+        .fin = true,
+        .masked = false,
+        .opcode = .binary,
+        .payload_len = std.math.maxInt(u64),
+    };
+    conn.recv_remaining = std.math.maxInt(u64);
+
+    var buf: [2]u8 = undefined;
+    const chunk = try conn.readFrameChunk(buf[0..]);
+    try std.testing.expectEqualStrings("ab", chunk);
+    try std.testing.expectEqual(std.math.maxInt(u64) - 2, conn.recv_remaining);
+    try std.testing.expect(conn.recv_active);
+}
+
+test "beginFrameBorrowed returns FrameActive while a streamed frame is active" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "abc", .{ 1, 2, 3, 4 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+
+    _ = try conn.beginFrame();
+    try std.testing.expectError(error.FrameActive, conn.beginFrameBorrowed());
+}
+
+test "readFrameBorrowed returns null when the buffered reader cannot hold the frame" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "abc", .{ 1, 2, 3, 4 });
+
+    var base_reader = Io.Reader.fixed(wire.items);
+    var indirect_buffer: [6]u8 = undefined;
+    var indirect = std.testing.ReaderIndirect.init(&base_reader, indirect_buffer[0..]);
+
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&indirect.interface, &writer, .{});
+
+    try std.testing.expect((try conn.readFrameBorrowed()) == null);
+}
+
 test "readFrameChunk zero length does not consume payload and discardFrame drains current frame" {
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(std.testing.allocator);
@@ -1146,6 +1215,24 @@ test "writeText writePing writePong and writeClose validate inputs" {
     }
 }
 
+test "client control writers emit masked frames" {
+    var out: [64]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var reader = Io.Reader.fixed(""[0..]);
+    var conn = Conn(.{ .role = .client }).init(&reader, &writer, .{});
+
+    try conn.writePing("!");
+    try conn.writePong("?");
+
+    const written = out[0..writer.end];
+    try std.testing.expectEqual(@as(u8, 0x89), written[0]);
+    try std.testing.expectEqual(@as(u8, 0x81), written[1]);
+    try std.testing.expectEqual(written[6], '!' ^ written[2]);
+    try std.testing.expectEqual(@as(u8, 0x8A), written[7]);
+    try std.testing.expectEqual(@as(u8, 0x81), written[8]);
+    try std.testing.expectEqual(written[13], '?' ^ written[9]);
+}
+
 test "parseClosePayload covers empty invalid code and utf8-disabled behavior" {
     {
         const close = try parseClosePayload("", true);
@@ -1160,6 +1247,7 @@ test "parseClosePayload covers empty invalid code and utf8-disabled behavior" {
         try std.testing.expectEqual(@as(?u16, 1000), close.code);
         try std.testing.expectEqualSlices(u8, &.{ 0xC3, 0x28 }, close.reason);
     }
+    try std.testing.expectError(error.InvalidUtf8, parseClosePayload(&[_]u8{ 0x03, 0xE8, 0xC3, 0x28 }, true));
 }
 
 test "readFrameBorrowed unmasks payload without a copy" {
@@ -1176,6 +1264,46 @@ test "readFrameBorrowed unmasks payload without a copy" {
     try std.testing.expectEqual(Opcode.text, frame.header.opcode);
     try std.testing.expect(frame.header.fin);
     try std.testing.expectEqualStrings("borrowed", frame.payload);
+}
+
+test "readFrameBorrowed handles empty payload control frames" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .ping, true, true, "", .{ 1, 2, 3, 4 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+
+    const frame = (try conn.readFrameBorrowed()).?;
+    try std.testing.expectEqual(Opcode.ping, frame.header.opcode);
+    try std.testing.expectEqual(@as(usize, 0), frame.payload.len);
+}
+
+test "readFrameBorrowed returns null for payload sizes that cannot fit in usize" {
+    const wire = [_]u8{
+        0x82,
+        0xFF,
+        0x7F,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        0xFF,
+        1,
+        2,
+        3,
+        4,
+    };
+    var reader = Io.Reader.fixed(wire[0..]);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+
+    try std.testing.expect((try conn.readFrameBorrowed()) == null);
 }
 
 test "echoFrame preserves fragmentation and mirrors close payload" {
@@ -1204,6 +1332,43 @@ test "echoFrame preserves fragmentation and mirrors close payload" {
     }, out[0..writer.end]);
 }
 
+test "echoFrame falls back to scratch buffer when borrowing is unavailable" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "abc", .{ 1, 2, 3, 4 });
+
+    var base_reader = Io.Reader.fixed(wire.items);
+    var indirect_buffer: [6]u8 = undefined;
+    var indirect = std.testing.ReaderIndirect.init(&base_reader, indirect_buffer[0..]);
+
+    var out: [16]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&indirect.interface, &writer, .{});
+    var scratch: [8]u8 = undefined;
+
+    const echoed = try conn.echoFrame(scratch[0..]);
+    try std.testing.expectEqual(Opcode.binary, echoed.opcode);
+    try std.testing.expectEqual(@as(usize, 3), echoed.payload_len);
+    try std.testing.expectEqualSlices(u8, &.{ 0x82, 0x03, 'a', 'b', 'c' }, out[0..writer.end]);
+}
+
+test "echoFrame ignores pong frames without writing output" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .pong, true, true, "!", .{ 1, 2, 3, 4 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var out: [8]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+    var scratch: [4]u8 = undefined;
+
+    const echoed = try conn.echoFrame(scratch[0..]);
+    try std.testing.expectEqual(Opcode.pong, echoed.opcode);
+    try std.testing.expectEqual(@as(usize, 1), echoed.payload_len);
+    try std.testing.expectEqual(@as(usize, 0), writer.end);
+}
+
 test "echoFrame validates close payload even after local close was sent" {
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(std.testing.allocator);
@@ -1217,6 +1382,62 @@ test "echoFrame validates close payload even after local close was sent" {
 
     var scratch: [8]u8 = undefined;
     try std.testing.expectError(error.InvalidClosePayload, conn.echoFrame(scratch[0..]));
+}
+
+test "readMessage accepts empty text messages" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .text, true, true, "", .{ 1, 2, 3, 4 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+    var buf: [1]u8 = undefined;
+
+    const msg = try conn.readMessage(buf[0..]);
+    try std.testing.expectEqual(MessageOpcode.text, msg.opcode);
+    try std.testing.expectEqual(@as(usize, 0), msg.payload.len);
+}
+
+test "readMessage handles control frames interleaved with fragments" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "he", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .ping, true, true, "!", .{ 5, 6, 7, 8 });
+    try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, "llo", .{ 9, 10, 11, 12 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var out: [8]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+    var buf: [8]u8 = undefined;
+
+    const msg = try conn.readMessage(buf[0..]);
+    try std.testing.expectEqual(MessageOpcode.text, msg.opcode);
+    try std.testing.expectEqualStrings("hello", msg.payload);
+    try std.testing.expectEqualSlices(u8, &.{ 0x8A, 0x01, '!' }, out[0..writer.end]);
+}
+
+test "readMessage resumes fragmented messages after frame-level reads" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "he", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, "llo", .{ 5, 6, 7, 8 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+    var frame_buf: [4]u8 = undefined;
+    const frame = try conn.readFrame(frame_buf[0..]);
+    try std.testing.expectEqual(Opcode.text, frame.header.opcode);
+    try std.testing.expectEqualStrings("he", frame.payload);
+
+    var msg_buf: [8]u8 = undefined;
+    const msg = try conn.readMessage(msg_buf[0..]);
+    try std.testing.expectEqual(MessageOpcode.text, msg.opcode);
+    try std.testing.expectEqualStrings("llo", msg.payload);
 }
 
 test "applyMask is reversible across chunk boundaries and offsets" {

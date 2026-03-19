@@ -105,3 +105,18 @@ test "close code reserved boundaries are rejected" {
     try std.testing.expect(isValidCloseCode(1016));
     try std.testing.expect(isValidCloseCode(4999));
 }
+
+test "CloseCode enum values match RFC assignments" {
+    try std.testing.expectEqual(@as(u16, 1000), @intFromEnum(CloseCode.normal_closure));
+    try std.testing.expectEqual(@as(u16, 1001), @intFromEnum(CloseCode.going_away));
+    try std.testing.expectEqual(@as(u16, 1002), @intFromEnum(CloseCode.protocol_error));
+    try std.testing.expectEqual(@as(u16, 1003), @intFromEnum(CloseCode.unsupported_data));
+    try std.testing.expectEqual(@as(u16, 1007), @intFromEnum(CloseCode.invalid_frame_payload_data));
+    try std.testing.expectEqual(@as(u16, 1008), @intFromEnum(CloseCode.policy_violation));
+    try std.testing.expectEqual(@as(u16, 1009), @intFromEnum(CloseCode.message_too_big));
+    try std.testing.expectEqual(@as(u16, 1010), @intFromEnum(CloseCode.mandatory_extension));
+    try std.testing.expectEqual(@as(u16, 1011), @intFromEnum(CloseCode.internal_error));
+    try std.testing.expectEqual(@as(u16, 1012), @intFromEnum(CloseCode.service_restart));
+    try std.testing.expectEqual(@as(u16, 1013), @intFromEnum(CloseCode.try_again_later));
+    try std.testing.expectEqual(@as(u16, 1014), @intFromEnum(CloseCode.bad_gateway));
+}
