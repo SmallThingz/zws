@@ -3,6 +3,12 @@ const zws = @import("zwebsocket");
 const builtin = @import("builtin");
 
 const Io = std.Io;
+const BenchConn = zws.ConnType(.{
+    .role = .server,
+    .auto_pong = false,
+    .auto_reply_close = false,
+    .validate_utf8 = false,
+});
 
 fn usage() void {
     std.debug.print(
@@ -104,28 +110,17 @@ fn handleConn(io: Io, stream: std.Io.net.Stream) Io.Cancelable!void {
     _ = zws.serverHandshake(&sw.interface, req, .{}) catch return;
     sw.interface.flush() catch return;
 
-    var conn = zws.Conn.init(&sr.interface, &sw.interface, .{
-        .role = .server,
-        .auto_pong = false,
-        .auto_reply_close = false,
-        .validate_utf8 = false,
-    });
+    var conn = BenchConn.init(&sr.interface, &sw.interface, .{});
 
     var payload_buf: [64 * 1024]u8 = undefined;
     while (true) {
-        const frame = conn.readFrame(payload_buf[0..]) catch |err| switch (err) {
+        const echoed = conn.echoFrame(payload_buf[0..]) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return,
         };
-        switch (frame.header.opcode) {
-            .text, .binary => conn.writeFrame(frame.header.opcode, frame.payload, true) catch return,
-            .ping => conn.writePong(frame.payload) catch return,
-            .close => {
-                conn.writeClose(null, "") catch {};
-                sw.interface.flush() catch {};
-                return;
-            },
-            else => return,
+        if (echoed.opcode == .close) {
+            sw.interface.flush() catch {};
+            return;
         }
         if (sw.interface.buffered().len != 0) {
             sw.interface.flush() catch return;

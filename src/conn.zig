@@ -28,11 +28,14 @@ pub const ProtocolError = error{
     UnexpectedContinuationWrite,
 };
 
-pub const Config = struct {
+pub const StaticConfig = struct {
     role: Role = .server,
     auto_pong: bool = true,
     auto_reply_close: bool = true,
     validate_utf8: bool = true,
+};
+
+pub const Config = struct {
     max_frame_payload_len: u64 = std.math.maxInt(u64),
     max_message_payload_len: usize = std.math.maxInt(usize),
 };
@@ -59,349 +62,446 @@ pub const CloseFrame = struct {
     reason: []const u8 = "",
 };
 
-pub const Conn = struct {
-    reader: *Io.Reader,
-    writer: *Io.Writer,
-    config: Config,
-    mask_prng: std.Random.DefaultPrng,
+pub const BorrowedFrame = struct {
+    header: FrameHeader,
+    payload: []u8,
+};
 
-    recv_active: bool = false,
-    recv_header: FrameHeader = undefined,
-    recv_remaining: u64 = 0,
-    recv_mask: [4]u8 = .{0} ** 4,
-    recv_mask_offset: usize = 0,
-    recv_fragment_opcode: ?MessageOpcode = null,
+pub const EchoResult = struct {
+    opcode: Opcode,
+    payload_len: usize,
+};
 
-    send_fragment_opcode: ?MessageOpcode = null,
-    close_sent: bool = false,
-    close_received: bool = false,
+const ParsedHeader = struct {
+    header: FrameHeader,
+    header_len: usize,
+    mask: [4]u8,
+};
 
-    const Self = @This();
-    const masked_write_scratch_len = 4096;
+pub fn Conn(comptime static: StaticConfig) type {
+    const expects_masked = static.role == .server;
+    const auto_pong = static.auto_pong;
+    const auto_reply_close = static.auto_reply_close;
+    const validate_utf8 = static.validate_utf8;
 
-    pub fn init(reader: *Io.Reader, writer: *Io.Writer, config: Config) Self {
-        const seed = nextMaskSeed() ^
-            @as(u64, @truncate(@intFromPtr(reader))) ^
-            (@as(u64, @truncate(@intFromPtr(writer))) << 1);
-        return .{
-            .reader = reader,
-            .writer = writer,
-            .config = config,
-            .mask_prng = std.Random.DefaultPrng.init(seed),
-        };
-    }
+    return struct {
+        reader: *Io.Reader,
+        writer: *Io.Writer,
+        config: Config,
+        mask_prng: std.Random.DefaultPrng,
 
-    fn nextMaskSeed() u64 {
-        const Seed = struct {
-            var value: u64 = 0x9e37_79b9_7f4a_7c15;
-        };
-        Seed.value +%= 0xbf58_476d_1ce4_e5b9;
-        return Seed.value;
-    }
+        recv_active: bool = false,
+        recv_header: FrameHeader = undefined,
+        recv_remaining: u64 = 0,
+        recv_mask: [4]u8 = .{0} ** 4,
+        recv_mask_offset: usize = 0,
+        recv_fragment_opcode: ?MessageOpcode = null,
 
-    pub fn flush(self: *Self) Io.Writer.Error!void {
-        try self.writer.flush();
-    }
+        send_fragment_opcode: ?MessageOpcode = null,
+        close_sent: bool = false,
+        close_received: bool = false,
 
-    pub fn beginFrame(self: *Self) (ProtocolError || Io.Reader.Error)!FrameHeader {
-        if (self.recv_active) return error.FrameActive;
+        const Self = @This();
+        const masked_write_scratch_len = 4096;
 
-        var header_buf: [2]u8 = undefined;
-        try self.reader.readSliceAll(header_buf[0..]);
-
-        if ((header_buf[0] & 0x70) != 0) return error.ReservedBitsSet;
-
-        const opcode: Opcode = switch (@as(u4, @truncate(header_buf[0]))) {
-            0x0 => .continuation,
-            0x1 => .text,
-            0x2 => .binary,
-            0x8 => .close,
-            0x9 => .ping,
-            0xA => .pong,
-            else => return error.UnknownOpcode,
-        };
-        const fin = (header_buf[0] & 0x80) != 0;
-        const masked = (header_buf[1] & 0x80) != 0;
-
-        const expected_masked = self.config.role == .server;
-        if (masked != expected_masked) return error.MaskBitInvalid;
-
-        var payload_len: u64 = header_buf[1] & 0x7f;
-        if (payload_len == 126) {
-            var ext: [2]u8 = undefined;
-            try self.reader.readSliceAll(ext[0..]);
-            payload_len = std.mem.readInt(u16, ext[0..], .big);
-        } else if (payload_len == 127) {
-            var ext: [8]u8 = undefined;
-            try self.reader.readSliceAll(ext[0..]);
-            if ((ext[0] & 0x80) != 0) return error.InvalidFrameLength;
-            payload_len = std.mem.readInt(u64, ext[0..], .big);
-        }
-
-        if (payload_len > self.config.max_frame_payload_len) return error.FrameTooLarge;
-
-        if (proto.isControl(opcode)) {
-            if (!fin) return error.ControlFrameFragmented;
-            if (payload_len > 125) return error.ControlFrameTooLarge;
-        } else switch (opcode) {
-            .continuation => {
-                if (self.recv_fragment_opcode == null) return error.UnexpectedContinuation;
-            },
-            .text, .binary => {
-                if (self.recv_fragment_opcode != null) return error.ExpectedContinuation;
-            },
-            else => unreachable,
-        }
-
-        if (masked) {
-            try self.reader.readSliceAll(self.recv_mask[0..]);
-        } else {
-            self.recv_mask = .{0} ** 4;
-        }
-
-        self.recv_header = .{
-            .fin = fin,
-            .masked = masked,
-            .opcode = opcode,
-            .payload_len = payload_len,
-        };
-        self.recv_active = true;
-        self.recv_remaining = payload_len;
-        self.recv_mask_offset = 0;
-
-        if (!fin) {
-            if (proto.messageOpcode(opcode)) |message_opcode| {
-                self.recv_fragment_opcode = message_opcode;
-            }
-        }
-
-        return self.recv_header;
-    }
-
-    pub fn readFrameChunk(self: *Self, dest: []u8) (ProtocolError || Io.Reader.Error)![]u8 {
-        if (!self.recv_active) return error.NoActiveFrame;
-        if (self.recv_remaining == 0) {
-            self.finishActiveFrame();
-            return dest[0..0];
-        }
-        if (dest.len == 0) return dest[0..0];
-
-        const n: usize = @min(dest.len, @as(usize, @intCast(self.recv_remaining)));
-        try self.reader.readSliceAll(dest[0..n]);
-        if (self.recv_header.masked) applyMask(dest[0..n], self.recv_mask, self.recv_mask_offset);
-
-        self.recv_remaining -= n;
-        self.recv_mask_offset += n;
-
-        if (self.recv_remaining == 0) self.finishActiveFrame();
-        return dest[0..n];
-    }
-
-    pub fn readFrameAll(self: *Self, dest: []u8) (ProtocolError || Io.Reader.Error)![]u8 {
-        if (!self.recv_active) return error.NoActiveFrame;
-        if (self.recv_remaining > dest.len) return error.MessageTooLarge;
-        if (self.recv_remaining == 0) {
-            self.finishActiveFrame();
-            return dest[0..0];
-        }
-        return try self.readFrameChunk(dest[0..@as(usize, @intCast(self.recv_remaining))]);
-    }
-
-    pub fn discardFrame(self: *Self) (ProtocolError || Io.Reader.Error)!void {
-        if (!self.recv_active) return error.NoActiveFrame;
-        var scratch: [512]u8 = undefined;
-        while (self.recv_active) {
-            _ = try self.readFrameChunk(scratch[0..]);
-        }
-    }
-
-    pub fn readFrame(self: *Self, buf: []u8) (ProtocolError || Io.Reader.Error)!Frame {
-        const header = try self.beginFrame();
-        const payload = try self.readFrameAll(buf);
-        return .{
-            .header = header,
-            .payload = payload,
-        };
-    }
-
-    pub fn readMessage(self: *Self, buf: []u8) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!Message {
-        var total_len: usize = 0;
-        var message_opcode: ?MessageOpcode = null;
-        var control_buf: [125]u8 = undefined;
-
-        while (true) {
-            const header = try self.beginFrame();
-            if (proto.isControl(header.opcode)) {
-                const payload = try self.readFrameAll(control_buf[0..]);
-                switch (header.opcode) {
-                    .ping => if (self.config.auto_pong) try self.writePong(payload),
-                    .pong => {},
-                    .close => {
-                        self.close_received = true;
-                        const close_frame = try parseClosePayload(payload, self.config.validate_utf8);
-                        if (self.config.auto_reply_close and !self.close_sent) {
-                            try self.writeClose(close_frame.code, close_frame.reason);
-                        }
-                        return error.ConnectionClosed;
-                    },
-                    else => unreachable,
-                }
-                continue;
-            }
-
-            if (message_opcode == null) {
-                message_opcode = proto.messageOpcode(header.opcode) orelse unreachable;
-            }
-
-            if (header.payload_len > buf.len - total_len) return error.MessageTooLarge;
-            const chunk = try self.readFrameAll(buf[total_len..]);
-            total_len += chunk.len;
-
-            if (total_len > self.config.max_message_payload_len) return error.MessageTooLarge;
-            if (!header.fin) continue;
-
-            const final_opcode = message_opcode.?;
-            if (final_opcode == .text and self.config.validate_utf8 and !std.unicode.utf8ValidateSlice(buf[0..total_len])) {
-                return error.InvalidUtf8;
-            }
+        pub fn init(reader: *Io.Reader, writer: *Io.Writer, config: Config) Self {
+            const seed = nextMaskSeed() ^
+                @as(u64, @truncate(@intFromPtr(reader))) ^
+                (@as(u64, @truncate(@intFromPtr(writer))) << 1);
             return .{
-                .opcode = final_opcode,
-                .payload = buf[0..total_len],
+                .reader = reader,
+                .writer = writer,
+                .config = config,
+                .mask_prng = std.Random.DefaultPrng.init(seed),
             };
         }
-    }
 
-    pub fn writeFrame(
-        self: *Self,
-        opcode: Opcode,
-        payload: []const u8,
-        fin: bool,
-    ) (ProtocolError || Io.Writer.Error)!void {
-        if (proto.isControl(opcode) and payload.len > 125) return error.ControlFrameTooLarge;
-        try self.validateOutgoingSequence(opcode, fin);
-
-        var header_buf: [14]u8 = undefined;
-        var header_len: usize = 0;
-
-        const fin_bit: u8 = if (fin) 0x80 else 0;
-        header_buf[header_len] = @as(u8, @intFromEnum(opcode)) | fin_bit;
-        header_len += 1;
-
-        const masked = self.config.role == .client;
-        if (payload.len <= 125) {
-            header_buf[header_len] = @as(u8, @intCast(payload.len));
-            if (masked) header_buf[header_len] |= 0x80;
-            header_len += 1;
-        } else if (payload.len <= std.math.maxInt(u16)) {
-            header_buf[header_len] = 126;
-            if (masked) header_buf[header_len] |= 0x80;
-            header_len += 1;
-            std.mem.writeInt(u16, header_buf[header_len..][0..2], @as(u16, @intCast(payload.len)), .big);
-            header_len += 2;
-        } else {
-            header_buf[header_len] = 127;
-            if (masked) header_buf[header_len] |= 0x80;
-            header_len += 1;
-            std.mem.writeInt(u64, header_buf[header_len..][0..8], payload.len, .big);
-            header_len += 8;
+        fn nextMaskSeed() u64 {
+            const Seed = struct {
+                var value: u64 = 0x9e37_79b9_7f4a_7c15;
+            };
+            Seed.value +%= 0xbf58_476d_1ce4_e5b9;
+            return Seed.value;
         }
 
-        if (masked) {
-            var mask: [4]u8 = undefined;
-            self.mask_prng.random().bytes(mask[0..]);
-            @memcpy(header_buf[header_len..][0..4], mask[0..]);
-            header_len += 4;
-            try self.writer.writeAll(header_buf[0..header_len]);
+        pub fn flush(self: *Self) Io.Writer.Error!void {
+            try self.writer.flush();
+        }
 
-            var scratch: [masked_write_scratch_len]u8 = undefined;
-            var offset: usize = 0;
-            while (offset < payload.len) {
-                const n = @min(masked_write_scratch_len, payload.len - offset);
-                @memcpy(scratch[0..n], payload[offset..][0..n]);
-                applyMask(scratch[0..n], mask, offset);
-                try self.writer.writeAll(scratch[0..n]);
-                offset += n;
+        pub fn beginFrame(self: *Self) (ProtocolError || Io.Reader.Error)!FrameHeader {
+            if (self.recv_active) return error.FrameActive;
+
+            const available = try self.reader.peekGreedy(2);
+            const prefix = if (available.len >= 2) available else try self.reader.peek(2);
+            const header_need = neededHeaderLen(prefix[1]);
+            const header_bytes = if (prefix.len >= header_need) prefix else try self.reader.peek(header_need);
+            const parsed = (try self.parseHeaderBytes(header_bytes)).?;
+
+            self.reader.toss(parsed.header_len);
+            self.recv_active = true;
+            self.recv_header = parsed.header;
+            self.recv_remaining = parsed.header.payload_len;
+            self.recv_mask = parsed.mask;
+            self.recv_mask_offset = 0;
+            return self.recv_header;
+        }
+
+        pub fn beginFrameBorrowed(self: *Self) (ProtocolError || Io.Reader.Error)!?BorrowedFrame {
+            if (self.recv_active) return error.FrameActive;
+
+            const available = try self.reader.peekGreedy(2);
+            const prefix = if (available.len >= 2) available else try self.reader.peek(2);
+            const header_need = neededHeaderLen(prefix[1]);
+            if (header_need > self.reader.buffer.len) return null;
+
+            const header_bytes = if (prefix.len >= header_need) prefix else try self.reader.peek(header_need);
+            const parsed = (try self.parseHeaderBytes(header_bytes)).?;
+            const total_len = parsed.header_len + @as(usize, @intCast(parsed.header.payload_len));
+            if (total_len > self.reader.buffer.len) return null;
+
+            const frame_bytes = try self.reader.peek(total_len);
+            const payload = frame_bytes[parsed.header_len..][0..@as(usize, @intCast(parsed.header.payload_len))];
+            if (parsed.header.masked) applyMask(payload, parsed.mask, 0);
+            self.reader.toss(total_len);
+            self.noteConsumedFrame(parsed.header);
+
+            return .{
+                .header = parsed.header,
+                .payload = payload,
+            };
+        }
+
+        pub fn readFrameBorrowed(self: *Self) (ProtocolError || Io.Reader.Error)!?BorrowedFrame {
+            return self.beginFrameBorrowed();
+        }
+
+        pub fn readFrameChunk(self: *Self, dest: []u8) (ProtocolError || Io.Reader.Error)![]u8 {
+            if (!self.recv_active) return error.NoActiveFrame;
+            if (self.recv_remaining == 0) {
+                self.finishActiveFrame();
+                return dest[0..0];
             }
-            return;
+            if (dest.len == 0) return dest[0..0];
+
+            const n: usize = @min(dest.len, @as(usize, @intCast(self.recv_remaining)));
+            try self.reader.readSliceAll(dest[0..n]);
+            if (self.recv_header.masked) applyMask(dest[0..n], self.recv_mask, self.recv_mask_offset);
+
+            self.recv_remaining -= n;
+            self.recv_mask_offset += n;
+
+            if (self.recv_remaining == 0) self.finishActiveFrame();
+            return dest[0..n];
         }
 
-        try self.writer.writeAll(header_buf[0..header_len]);
-        try self.writer.writeAll(payload);
-    }
-
-    pub fn writeText(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
-        if (self.config.validate_utf8 and !std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
-        try self.writeFrame(.text, payload, true);
-    }
-
-    pub fn writeBinary(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
-        try self.writeFrame(.binary, payload, true);
-    }
-
-    pub fn writePing(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
-        if (payload.len > 125) return error.ControlFrameTooLarge;
-        try self.writeFrame(.ping, payload, true);
-    }
-
-    pub fn writePong(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
-        if (payload.len > 125) return error.ControlFrameTooLarge;
-        try self.writeFrame(.pong, payload, true);
-    }
-
-    pub fn writeClose(
-        self: *Self,
-        code: ?u16,
-        reason: []const u8,
-    ) (ProtocolError || Io.Writer.Error)!void {
-        if (code == null and reason.len != 0) return error.InvalidClosePayload;
-        if (self.config.validate_utf8 and !std.unicode.utf8ValidateSlice(reason)) return error.InvalidUtf8;
-
-        var payload: [125]u8 = undefined;
-        var len: usize = 0;
-        if (code) |close_code| {
-            if (!proto.isValidCloseCode(close_code)) return error.InvalidCloseCode;
-            std.mem.writeInt(u16, payload[0..2], close_code, .big);
-            len = 2;
+        pub fn readFrameAll(self: *Self, dest: []u8) (ProtocolError || Io.Reader.Error)![]u8 {
+            if (!self.recv_active) return error.NoActiveFrame;
+            if (self.recv_remaining > dest.len) return error.MessageTooLarge;
+            if (self.recv_remaining == 0) {
+                self.finishActiveFrame();
+                return dest[0..0];
+            }
+            return try self.readFrameChunk(dest[0..@as(usize, @intCast(self.recv_remaining))]);
         }
 
-        if (len + reason.len > 125) return error.ControlFrameTooLarge;
-        @memcpy(payload[len..][0..reason.len], reason);
-        len += reason.len;
-
-        try self.writeFrame(.close, payload[0..len], true);
-        self.close_sent = true;
-    }
-
-    fn validateOutgoingSequence(self: *Self, opcode: Opcode, fin: bool) ProtocolError!void {
-        if (proto.isControl(opcode)) {
-            if (!fin) return error.ControlFrameFragmented;
-            return;
+        pub fn discardFrame(self: *Self) (ProtocolError || Io.Reader.Error)!void {
+            if (!self.recv_active) return error.NoActiveFrame;
+            var scratch: [512]u8 = undefined;
+            while (self.recv_active) {
+                _ = try self.readFrameChunk(scratch[0..]);
+            }
         }
 
-        switch (opcode) {
-            .continuation => {
-                if (self.send_fragment_opcode == null) return error.UnexpectedContinuationWrite;
-                if (fin) self.send_fragment_opcode = null;
-            },
-            .text, .binary => {
-                if (self.send_fragment_opcode != null) return error.FragmentWriteInProgress;
-                if (!fin) self.send_fragment_opcode = proto.messageOpcode(opcode).?;
-            },
-            else => unreachable,
+        pub fn readFrame(self: *Self, buf: []u8) (ProtocolError || Io.Reader.Error)!Frame {
+            const header = try self.beginFrame();
+            const payload = try self.readFrameAll(buf);
+            return .{
+                .header = header,
+                .payload = payload,
+            };
         }
-    }
 
-    fn finishActiveFrame(self: *Self) void {
-        const header = self.recv_header;
-        self.recv_active = false;
-        self.recv_remaining = 0;
-        self.recv_mask_offset = 0;
+        pub fn readMessage(self: *Self, buf: []u8) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!Message {
+            var total_len: usize = 0;
+            var message_opcode: ?MessageOpcode = null;
+            var control_buf: [125]u8 = undefined;
 
-        if (header.opcode == .continuation and header.fin) {
-            self.recv_fragment_opcode = null;
+            while (true) {
+                const header = try self.beginFrame();
+                if (proto.isControl(header.opcode)) {
+                    const payload = try self.readFrameAll(control_buf[0..]);
+                    switch (header.opcode) {
+                        .ping => if (comptime auto_pong) try self.writePong(payload),
+                        .pong => {},
+                        .close => {
+                            self.close_received = true;
+                            const close_frame = try parseClosePayload(payload, validate_utf8);
+                            if (comptime auto_reply_close) {
+                                if (!self.close_sent) try self.writeClose(close_frame.code, close_frame.reason);
+                            }
+                            return error.ConnectionClosed;
+                        },
+                        else => unreachable,
+                    }
+                    continue;
+                }
+
+                if (message_opcode == null) {
+                    message_opcode = proto.messageOpcode(header.opcode) orelse unreachable;
+                }
+
+                if (header.payload_len > buf.len - total_len) return error.MessageTooLarge;
+                const chunk = try self.readFrameAll(buf[total_len..]);
+                total_len += chunk.len;
+
+                if (total_len > self.config.max_message_payload_len) return error.MessageTooLarge;
+                if (!header.fin) continue;
+
+                const final_opcode = message_opcode.?;
+                if (comptime validate_utf8) {
+                    if (final_opcode == .text and !std.unicode.utf8ValidateSlice(buf[0..total_len])) return error.InvalidUtf8;
+                }
+                return .{
+                    .opcode = final_opcode,
+                    .payload = buf[0..total_len],
+                };
+            }
         }
-    }
-};
+
+        pub fn echoFrame(self: *Self, scratch: []u8) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!EchoResult {
+            if (try self.readFrameBorrowed()) |frame| {
+                return try self.echoFramePayload(frame.header, frame.payload);
+            }
+            const frame = try self.readFrame(scratch);
+            return try self.echoFramePayload(frame.header, frame.payload);
+        }
+
+        pub fn writeFrame(
+            self: *Self,
+            opcode: Opcode,
+            payload: []const u8,
+            fin: bool,
+        ) (ProtocolError || Io.Writer.Error)!void {
+            if (proto.isControl(opcode) and payload.len > 125) return error.ControlFrameTooLarge;
+            try self.validateOutgoingSequence(opcode, fin);
+
+            var header_buf: [14]u8 = undefined;
+            var header_len: usize = 0;
+
+            const fin_bit: u8 = if (fin) 0x80 else 0;
+            header_buf[header_len] = @as(u8, @intFromEnum(opcode)) | fin_bit;
+            header_len += 1;
+
+            if (payload.len <= 125) {
+                header_buf[header_len] = @as(u8, @intCast(payload.len));
+                if (comptime !expects_masked) header_buf[header_len] |= 0x80;
+                header_len += 1;
+            } else if (payload.len <= std.math.maxInt(u16)) {
+                header_buf[header_len] = 126;
+                if (comptime !expects_masked) header_buf[header_len] |= 0x80;
+                header_len += 1;
+                std.mem.writeInt(u16, header_buf[header_len..][0..2], @as(u16, @intCast(payload.len)), .big);
+                header_len += 2;
+            } else {
+                header_buf[header_len] = 127;
+                if (comptime !expects_masked) header_buf[header_len] |= 0x80;
+                header_len += 1;
+                std.mem.writeInt(u64, header_buf[header_len..][0..8], payload.len, .big);
+                header_len += 8;
+            }
+
+            if (comptime !expects_masked) {
+                var mask: [4]u8 = undefined;
+                self.mask_prng.random().bytes(mask[0..]);
+                @memcpy(header_buf[header_len..][0..4], mask[0..]);
+                header_len += 4;
+                try self.writer.writeAll(header_buf[0..header_len]);
+
+                var scratch: [masked_write_scratch_len]u8 = undefined;
+                var offset: usize = 0;
+                while (offset < payload.len) {
+                    const n = @min(masked_write_scratch_len, payload.len - offset);
+                    @memcpy(scratch[0..n], payload[offset..][0..n]);
+                    applyMask(scratch[0..n], mask, offset);
+                    try self.writer.writeAll(scratch[0..n]);
+                    offset += n;
+                }
+                return;
+            }
+
+            try self.writer.writeAll(header_buf[0..header_len]);
+            try self.writer.writeAll(payload);
+        }
+
+        pub fn writeText(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
+            if (comptime validate_utf8) {
+                if (!std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
+            }
+            try self.writeFrame(.text, payload, true);
+        }
+
+        pub fn writeBinary(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
+            try self.writeFrame(.binary, payload, true);
+        }
+
+        pub fn writePing(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
+            if (payload.len > 125) return error.ControlFrameTooLarge;
+            try self.writeFrame(.ping, payload, true);
+        }
+
+        pub fn writePong(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
+            if (payload.len > 125) return error.ControlFrameTooLarge;
+            try self.writeFrame(.pong, payload, true);
+        }
+
+        pub fn writeClose(
+            self: *Self,
+            code: ?u16,
+            reason: []const u8,
+        ) (ProtocolError || Io.Writer.Error)!void {
+            if (code == null and reason.len != 0) return error.InvalidClosePayload;
+            if (comptime validate_utf8) {
+                if (!std.unicode.utf8ValidateSlice(reason)) return error.InvalidUtf8;
+            }
+
+            var payload: [125]u8 = undefined;
+            var len: usize = 0;
+            if (code) |close_code| {
+                if (!proto.isValidCloseCode(close_code)) return error.InvalidCloseCode;
+                std.mem.writeInt(u16, payload[0..2], close_code, .big);
+                len = 2;
+            }
+
+            if (len + reason.len > 125) return error.ControlFrameTooLarge;
+            @memcpy(payload[len..][0..reason.len], reason);
+            len += reason.len;
+
+            try self.writeFrame(.close, payload[0..len], true);
+            self.close_sent = true;
+        }
+
+        fn parseHeaderBytes(self: *Self, bytes: []const u8) ProtocolError!?ParsedHeader {
+            if (bytes.len < 2) return null;
+            if ((bytes[0] & 0x70) != 0) return error.ReservedBitsSet;
+
+            const opcode: Opcode = switch (@as(u4, @truncate(bytes[0]))) {
+                0x0 => .continuation,
+                0x1 => .text,
+                0x2 => .binary,
+                0x8 => .close,
+                0x9 => .ping,
+                0xA => .pong,
+                else => return error.UnknownOpcode,
+            };
+            const fin = (bytes[0] & 0x80) != 0;
+            const masked = (bytes[1] & 0x80) != 0;
+            if (masked != expects_masked) return error.MaskBitInvalid;
+
+            const header_len = neededHeaderLen(bytes[1]);
+            if (bytes.len < header_len) return null;
+
+            var payload_len: u64 = bytes[1] & 0x7f;
+            var idx: usize = 2;
+            if (payload_len == 126) {
+                payload_len = std.mem.readInt(u16, bytes[idx..][0..2], .big);
+                idx += 2;
+            } else if (payload_len == 127) {
+                if ((bytes[idx] & 0x80) != 0) return error.InvalidFrameLength;
+                payload_len = std.mem.readInt(u64, bytes[idx..][0..8], .big);
+                idx += 8;
+            }
+
+            if (payload_len > self.config.max_frame_payload_len) return error.FrameTooLarge;
+
+            if (proto.isControl(opcode)) {
+                if (!fin) return error.ControlFrameFragmented;
+                if (payload_len > 125) return error.ControlFrameTooLarge;
+            } else switch (opcode) {
+                .continuation => {
+                    if (self.recv_fragment_opcode == null) return error.UnexpectedContinuation;
+                },
+                .text, .binary => {
+                    if (self.recv_fragment_opcode != null) return error.ExpectedContinuation;
+                },
+                else => unreachable,
+            }
+
+            var mask: [4]u8 = .{0} ** 4;
+            if (masked) {
+                mask = bytes[idx..][0..4].*;
+            }
+
+            return .{
+                .header = .{
+                    .fin = fin,
+                    .masked = masked,
+                    .opcode = opcode,
+                    .payload_len = payload_len,
+                },
+                .header_len = header_len,
+                .mask = mask,
+            };
+        }
+
+        fn echoFramePayload(self: *Self, header: FrameHeader, payload: []const u8) (ProtocolError || Io.Writer.Error)!EchoResult {
+            switch (header.opcode) {
+                .continuation, .text, .binary => try self.writeFrame(header.opcode, payload, header.fin),
+                .ping => try self.writePong(payload),
+                .pong => {},
+                .close => {
+                    self.close_received = true;
+                    if (!self.close_sent) {
+                        const close_frame = try parseClosePayload(payload, validate_utf8);
+                        try self.writeClose(close_frame.code, close_frame.reason);
+                    }
+                },
+            }
+            return .{
+                .opcode = header.opcode,
+                .payload_len = payload.len,
+            };
+        }
+
+        fn validateOutgoingSequence(self: *Self, opcode: Opcode, fin: bool) ProtocolError!void {
+            if (proto.isControl(opcode)) {
+                if (!fin) return error.ControlFrameFragmented;
+                return;
+            }
+
+            switch (opcode) {
+                .continuation => {
+                    if (self.send_fragment_opcode == null) return error.UnexpectedContinuationWrite;
+                    if (fin) self.send_fragment_opcode = null;
+                },
+                .text, .binary => {
+                    if (self.send_fragment_opcode != null) return error.FragmentWriteInProgress;
+                    if (!fin) self.send_fragment_opcode = proto.messageOpcode(opcode).?;
+                },
+                else => unreachable,
+            }
+        }
+
+        fn noteConsumedFrame(self: *Self, header: FrameHeader) void {
+            if (!header.fin) {
+                if (proto.messageOpcode(header.opcode)) |message_opcode| {
+                    self.recv_fragment_opcode = message_opcode;
+                }
+                return;
+            }
+            if (header.opcode == .continuation) {
+                self.recv_fragment_opcode = null;
+            }
+        }
+
+        fn finishActiveFrame(self: *Self) void {
+            const header = self.recv_header;
+            self.recv_active = false;
+            self.recv_remaining = 0;
+            self.recv_mask_offset = 0;
+            self.noteConsumedFrame(header);
+        }
+    };
+}
 
 pub fn parseClosePayload(payload: []const u8, validate_utf8: bool) ProtocolError!CloseFrame {
     if (payload.len == 0) {
@@ -418,6 +518,13 @@ pub fn parseClosePayload(payload: []const u8, validate_utf8: bool) ProtocolError
         .code = code,
         .reason = reason,
     };
+}
+
+fn neededHeaderLen(second: u8) usize {
+    const len_code = second & 0x7f;
+    return 2 +
+        (if (len_code == 126) @as(usize, 2) else if (len_code == 127) @as(usize, 8) else @as(usize, 0)) +
+        (if ((second & 0x80) != 0) @as(usize, 4) else @as(usize, 0));
 }
 
 fn applyMask(bytes: []u8, mask: [4]u8, start_offset: usize) void {
@@ -496,7 +603,7 @@ test "server reads masked text frame" {
     var reader = Io.Reader.fixed(wire[0..]);
     var sink_buf: [1]u8 = undefined;
     var writer = Io.Writer.fixed(sink_buf[0..]);
-    var conn = Conn.init(&reader, &writer, .{});
+    var conn = Conn(.{}).init(&reader, &writer, .{});
 
     var buf: [16]u8 = undefined;
     const frame = try conn.readFrame(buf[0..]);
@@ -510,7 +617,7 @@ test "server rejects unmasked client frame" {
     var reader = Io.Reader.fixed(wire[0..]);
     var sink_buf: [1]u8 = undefined;
     var writer = Io.Writer.fixed(sink_buf[0..]);
-    var conn = Conn.init(&reader, &writer, .{});
+    var conn = Conn(.{}).init(&reader, &writer, .{});
 
     try std.testing.expectError(error.MaskBitInvalid, conn.beginFrame());
 }
@@ -519,7 +626,7 @@ test "writeFrame writes unmasked server frame" {
     var out: [64]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
     var reader = Io.Reader.fixed(""[0..]);
-    var conn = Conn.init(&reader, &writer, .{ .role = .server });
+    var conn = Conn(.{}).init(&reader, &writer, .{});
 
     try conn.writeBinary("abc");
     try std.testing.expectEqualSlices(u8, &.{ 0x82, 0x03, 'a', 'b', 'c' }, out[0..writer.end]);
@@ -535,10 +642,7 @@ test "readMessage reassembles fragments and auto-pongs" {
     var reader = Io.Reader.fixed(wire[0..]);
     var out: [64]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
-    var conn = Conn.init(&reader, &writer, .{
-        .role = .server,
-        .auto_pong = true,
-    });
+    var conn = Conn(.{}).init(&reader, &writer, .{});
 
     var msg_buf: [32]u8 = undefined;
     const message = try conn.readMessage(msg_buf[0..]);
@@ -551,7 +655,7 @@ test "client writes masked frame" {
     var out: [64]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
     var reader = Io.Reader.fixed(""[0..]);
-    var conn = Conn.init(&reader, &writer, .{ .role = .client });
+    var conn = Conn(.{ .role = .client }).init(&reader, &writer, .{});
 
     try conn.writeText("ok");
     const written = out[0..writer.end];
@@ -576,7 +680,7 @@ test "generic writeFrame rejects oversized control payloads" {
     var out: [256]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
     var reader = Io.Reader.fixed(""[0..]);
-    var conn = Conn.init(&reader, &writer, .{});
+    var conn = Conn(.{}).init(&reader, &writer, .{});
 
     var payload: [126]u8 = undefined;
     @memset(payload[0..], 'x');
@@ -590,8 +694,8 @@ test "init produces distinct mask streams for different connections" {
     var writer2 = Io.Writer.fixed(out2[0..]);
     var reader1 = Io.Reader.fixed(""[0..]);
     var reader2 = Io.Reader.fixed(""[0..]);
-    var conn1 = Conn.init(&reader1, &writer1, .{ .role = .client });
-    var conn2 = Conn.init(&reader2, &writer2, .{ .role = .client });
+    var conn1 = Conn(.{ .role = .client }).init(&reader1, &writer1, .{});
+    var conn2 = Conn(.{ .role = .client }).init(&reader2, &writer2, .{});
 
     try conn1.writeBinary("ab");
     try conn2.writeBinary("ab");
@@ -602,7 +706,7 @@ test "flush forwards to writer" {
     var out: [16]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
     var reader = Io.Reader.fixed(""[0..]);
-    var conn = Conn.init(&reader, &writer, .{});
+    var conn = Conn(.{}).init(&reader, &writer, .{});
     try conn.flush();
 }
 
@@ -610,15 +714,17 @@ test "beginFrame rejects reserved bits and unknown opcode" {
     {
         const wire = [_]u8{ 0xC1, 0x80, 1, 2, 3, 4 };
         var reader = Io.Reader.fixed(wire[0..]);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{});
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try std.testing.expectError(error.ReservedBitsSet, conn.beginFrame());
     }
     {
         const wire = [_]u8{ 0x83, 0x80, 1, 2, 3, 4 };
         var reader = Io.Reader.fixed(wire[0..]);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{});
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try std.testing.expectError(error.UnknownOpcode, conn.beginFrame());
     }
 }
@@ -642,8 +748,9 @@ test "beginFrame rejects invalid extended length and configured frame limit" {
             4,
         };
         var reader = Io.Reader.fixed(wire[0..]);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{});
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try std.testing.expectError(error.InvalidFrameLength, conn.beginFrame());
     }
     {
@@ -651,8 +758,9 @@ test "beginFrame rejects invalid extended length and configured frame limit" {
         defer wire.deinit(std.testing.allocator);
         try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "1234", .{ 1, 2, 3, 4 });
         var reader = Io.Reader.fixed(wire.items);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{ .max_frame_payload_len = 3 });
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{ .max_frame_payload_len = 3 });
         try std.testing.expectError(error.FrameTooLarge, conn.beginFrame());
     }
 }
@@ -663,8 +771,9 @@ test "beginFrame enforces control frame rules and continuation sequencing" {
         defer wire.deinit(std.testing.allocator);
         try appendTestFrame(&wire, std.testing.allocator, .ping, false, true, "", .{ 1, 2, 3, 4 });
         var reader = Io.Reader.fixed(wire.items);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{});
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try std.testing.expectError(error.ControlFrameFragmented, conn.beginFrame());
     }
     {
@@ -674,8 +783,9 @@ test "beginFrame enforces control frame rules and continuation sequencing" {
         defer wire.deinit(std.testing.allocator);
         try appendTestFrame(&wire, std.testing.allocator, .ping, true, true, payload[0..], .{ 1, 2, 3, 4 });
         var reader = Io.Reader.fixed(wire.items);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{});
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try std.testing.expectError(error.ControlFrameTooLarge, conn.beginFrame());
     }
     {
@@ -683,8 +793,9 @@ test "beginFrame enforces control frame rules and continuation sequencing" {
         defer wire.deinit(std.testing.allocator);
         try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, "x", .{ 1, 2, 3, 4 });
         var reader = Io.Reader.fixed(wire.items);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{});
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try std.testing.expectError(error.UnexpectedContinuation, conn.beginFrame());
     }
     {
@@ -693,8 +804,9 @@ test "beginFrame enforces control frame rules and continuation sequencing" {
         try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "hel", .{ 1, 2, 3, 4 });
         try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "bad", .{ 5, 6, 7, 8 });
         var reader = Io.Reader.fixed(wire.items);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{});
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         _ = try conn.beginFrame();
         try conn.discardFrame();
         try std.testing.expectError(error.ExpectedContinuation, conn.beginFrame());
@@ -705,8 +817,9 @@ test "beginFrame supports client role and extended lengths" {
     {
         const wire = [_]u8{ 0x82, 0x02, 'o', 'k' };
         var reader = Io.Reader.fixed(wire[0..]);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{ .role = .client });
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{ .role = .client }).init(&reader, &writer, .{});
         const header = try conn.beginFrame();
         try std.testing.expectEqual(@as(u64, 2), header.payload_len);
         try std.testing.expect(!header.masked);
@@ -718,8 +831,9 @@ test "beginFrame supports client role and extended lengths" {
         @memset(payload[0..], 'x');
         try appendTestFrame(&wire, std.testing.allocator, .binary, true, false, payload[0..], .{ 0, 0, 0, 0 });
         var reader = Io.Reader.fixed(wire.items);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{ .role = .client });
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{ .role = .client }).init(&reader, &writer, .{});
         const header = try conn.beginFrame();
         try std.testing.expectEqual(@as(u64, 126), header.payload_len);
         try conn.discardFrame();
@@ -738,8 +852,9 @@ test "beginFrame supports client role and extended lengths" {
             0x00,
         };
         var reader = Io.Reader.fixed(wire[0..]);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{ .role = .client });
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{ .role = .client }).init(&reader, &writer, .{});
         const header = try conn.beginFrame();
         try std.testing.expectEqual(@as(u64, 65536), header.payload_len);
     }
@@ -747,8 +862,9 @@ test "beginFrame supports client role and extended lengths" {
 
 test "readFrameChunk and readFrameAll enforce active frame semantics" {
     var reader = Io.Reader.fixed(""[0..]);
-    var writer = Io.Writer.fixed(&[_]u8{});
-    var conn = Conn.init(&reader, &writer, .{});
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
     var tmp: [4]u8 = undefined;
 
     try std.testing.expectError(error.NoActiveFrame, conn.readFrameChunk(tmp[0..]));
@@ -763,8 +879,9 @@ test "readFrameChunk zero length does not consume payload and discardFrame drain
     try appendTestFrame(&wire, std.testing.allocator, .text, true, true, "z", .{ 5, 6, 7, 8 });
 
     var reader = Io.Reader.fixed(wire.items);
-    var writer = Io.Writer.fixed(&[_]u8{});
-    var conn = Conn.init(&reader, &writer, .{});
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
 
     _ = try conn.beginFrame();
     var empty: [0]u8 = .{};
@@ -784,8 +901,9 @@ test "readFrameAll rejects destination that is too small and zero payload frames
         defer wire.deinit(std.testing.allocator);
         try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "abcd", .{ 1, 2, 3, 4 });
         var reader = Io.Reader.fixed(wire.items);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{});
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         _ = try conn.beginFrame();
         var buf: [3]u8 = undefined;
         try std.testing.expectError(error.MessageTooLarge, conn.readFrameAll(buf[0..]));
@@ -795,8 +913,9 @@ test "readFrameAll rejects destination that is too small and zero payload frames
         defer wire.deinit(std.testing.allocator);
         try appendTestFrame(&wire, std.testing.allocator, .pong, true, true, "", .{ 1, 2, 3, 4 });
         var reader = Io.Reader.fixed(wire.items);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{});
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         var buf: [1]u8 = undefined;
         const frame = try conn.readFrame(buf[0..]);
         try std.testing.expectEqual(@as(u64, 0), frame.header.payload_len);
@@ -813,7 +932,7 @@ test "readMessage handles pong close and configured auto reply behavior" {
         var reader = Io.Reader.fixed(wire.items);
         var out: [16]u8 = undefined;
         var writer = Io.Writer.fixed(out[0..]);
-        var conn = Conn.init(&reader, &writer, .{ .auto_pong = false });
+        var conn = Conn(.{ .auto_pong = false }).init(&reader, &writer, .{});
         var buf: [8]u8 = undefined;
         const msg = try conn.readMessage(buf[0..]);
         try std.testing.expectEqual(MessageOpcode.binary, msg.opcode);
@@ -828,7 +947,7 @@ test "readMessage handles pong close and configured auto reply behavior" {
         var reader = Io.Reader.fixed(wire.items);
         var out: [32]u8 = undefined;
         var writer = Io.Writer.fixed(out[0..]);
-        var conn = Conn.init(&reader, &writer, .{});
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         var buf: [8]u8 = undefined;
         try std.testing.expectError(error.ConnectionClosed, conn.readMessage(buf[0..]));
         try std.testing.expect(conn.close_received);
@@ -842,7 +961,7 @@ test "readMessage handles pong close and configured auto reply behavior" {
         var reader = Io.Reader.fixed(wire.items);
         var out: [8]u8 = undefined;
         var writer = Io.Writer.fixed(out[0..]);
-        var conn = Conn.init(&reader, &writer, .{ .auto_reply_close = false });
+        var conn = Conn(.{ .auto_reply_close = false }).init(&reader, &writer, .{});
         var buf: [1]u8 = undefined;
         try std.testing.expectError(error.ConnectionClosed, conn.readMessage(buf[0..]));
         try std.testing.expect(conn.close_received);
@@ -858,8 +977,9 @@ test "readMessage enforces utf8 and message size limits" {
         defer wire.deinit(std.testing.allocator);
         try appendTestFrame(&wire, std.testing.allocator, .text, true, true, invalid_utf8[0..], .{ 1, 2, 3, 4 });
         var reader = Io.Reader.fixed(wire.items);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{});
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         var buf: [8]u8 = undefined;
         try std.testing.expectError(error.InvalidUtf8, conn.readMessage(buf[0..]));
     }
@@ -869,8 +989,9 @@ test "readMessage enforces utf8 and message size limits" {
         try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "abc", .{ 1, 2, 3, 4 });
         try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, "de", .{ 5, 6, 7, 8 });
         var reader = Io.Reader.fixed(wire.items);
-        var writer = Io.Writer.fixed(&[_]u8{});
-        var conn = Conn.init(&reader, &writer, .{ .max_message_payload_len = 4 });
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{ .max_message_payload_len = 4 });
         var buf: [8]u8 = undefined;
         try std.testing.expectError(error.MessageTooLarge, conn.readMessage(buf[0..]));
     }
@@ -883,7 +1004,7 @@ test "writeFrame supports extended lengths and sequencing rules" {
         var out: [256]u8 = undefined;
         var writer = Io.Writer.fixed(out[0..]);
         var reader = Io.Reader.fixed(""[0..]);
-        var conn = Conn.init(&reader, &writer, .{ .role = .server });
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try conn.writeBinary(payload[0..]);
         try std.testing.expectEqual(@as(u8, 0x82), out[0]);
         try std.testing.expectEqual(@as(u8, 126), out[1]);
@@ -898,7 +1019,7 @@ test "writeFrame supports extended lengths and sequencing rules" {
         defer std.testing.allocator.free(out);
         var writer = Io.Writer.fixed(out);
         var reader = Io.Reader.fixed(""[0..]);
-        var conn = Conn.init(&reader, &writer, .{ .role = .server });
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try conn.writeBinary(payload);
         try std.testing.expectEqual(@as(u8, 0x82), out[0]);
         try std.testing.expectEqual(@as(u8, 127), out[1]);
@@ -912,7 +1033,7 @@ test "writeFrame supports extended lengths and sequencing rules" {
         var out: [64]u8 = undefined;
         var writer = Io.Writer.fixed(out[0..]);
         var reader = Io.Reader.fixed(""[0..]);
-        var conn = Conn.init(&reader, &writer, .{});
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try conn.writeFrame(.text, "hel", false);
         try std.testing.expectError(error.FragmentWriteInProgress, conn.writeFrame(.binary, "x", true));
         try conn.writeFrame(.continuation, "lo", true);
@@ -927,7 +1048,7 @@ test "writeFrame supports extended lengths and sequencing rules" {
         var out: [8]u8 = undefined;
         var writer = Io.Writer.fixed(out[0..]);
         var reader = Io.Reader.fixed(""[0..]);
-        var conn = Conn.init(&reader, &writer, .{});
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try std.testing.expectError(error.UnexpectedContinuationWrite, conn.writeFrame(.continuation, "x", true));
         try std.testing.expectError(error.ControlFrameFragmented, conn.writeFrame(.ping, "", false));
     }
@@ -939,7 +1060,7 @@ test "writeText writePing writePong and writeClose validate inputs" {
         var out: [16]u8 = undefined;
         var writer = Io.Writer.fixed(out[0..]);
         var reader = Io.Reader.fixed(""[0..]);
-        var conn = Conn.init(&reader, &writer, .{});
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try std.testing.expectError(error.InvalidUtf8, conn.writeText(invalid_utf8[0..]));
     }
     {
@@ -948,7 +1069,7 @@ test "writeText writePing writePong and writeClose validate inputs" {
         var out: [16]u8 = undefined;
         var writer = Io.Writer.fixed(out[0..]);
         var reader = Io.Reader.fixed(""[0..]);
-        var conn = Conn.init(&reader, &writer, .{});
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try std.testing.expectError(error.ControlFrameTooLarge, conn.writePing(payload[0..]));
         try std.testing.expectError(error.ControlFrameTooLarge, conn.writePong(payload[0..]));
     }
@@ -956,7 +1077,7 @@ test "writeText writePing writePong and writeClose validate inputs" {
         var out: [256]u8 = undefined;
         var writer = Io.Writer.fixed(out[0..]);
         var reader = Io.Reader.fixed(""[0..]);
-        var conn = Conn.init(&reader, &writer, .{});
+        var conn = Conn(.{}).init(&reader, &writer, .{});
         try std.testing.expectError(error.InvalidClosePayload, conn.writeClose(null, "reason"));
         try std.testing.expectError(error.InvalidCloseCode, conn.writeClose(1005, ""));
         try std.testing.expectError(error.InvalidUtf8, conn.writeClose(1000, &[_]u8{ 0xC3, 0x28 }));
@@ -985,6 +1106,48 @@ test "parseClosePayload covers empty invalid code and utf8-disabled behavior" {
         try std.testing.expectEqual(@as(?u16, 1000), close.code);
         try std.testing.expectEqualSlices(u8, &.{ 0xC3, 0x28 }, close.reason);
     }
+}
+
+test "readFrameBorrowed unmasks payload without a copy" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .text, true, true, "borrowed", .{ 1, 2, 3, 4 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+
+    const frame = (try conn.readFrameBorrowed()).?;
+    try std.testing.expectEqual(Opcode.text, frame.header.opcode);
+    try std.testing.expect(frame.header.fin);
+    try std.testing.expectEqualStrings("borrowed", frame.payload);
+}
+
+test "echoFrame preserves fragmentation and mirrors close payload" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "hel", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, "lo", .{ 5, 6, 7, 8 });
+    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, &.{ 0x03, 0xE8, 'b', 'y', 'e' }, .{ 9, 10, 11, 12 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var out: [64]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+    var scratch: [16]u8 = undefined;
+
+    try std.testing.expectEqual(Opcode.text, (try conn.echoFrame(scratch[0..])).opcode);
+    try std.testing.expectEqual(Opcode.continuation, (try conn.echoFrame(scratch[0..])).opcode);
+    try std.testing.expectEqual(Opcode.close, (try conn.echoFrame(scratch[0..])).opcode);
+    try std.testing.expect(conn.close_received);
+    try std.testing.expect(conn.close_sent);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x01, 0x03, 'h',  'e', 'l',
+        0x80, 0x02, 'l',  'o', 0x88,
+        0x05, 0x03, 0xE8, 'b', 'y',
+        'e',
+    }, out[0..writer.end]);
 }
 
 test "applyMask is reversible across chunk boundaries and offsets" {

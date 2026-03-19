@@ -24,13 +24,19 @@ pub const acceptServerHandshake = @import("handshake.zig").acceptServerHandshake
 pub const writeServerHandshakeResponse = @import("handshake.zig").writeServerHandshakeResponse;
 pub const serverHandshake = @import("handshake.zig").serverHandshake;
 
+pub const StaticConfig = @import("conn.zig").StaticConfig;
 pub const Config = @import("conn.zig").Config;
 pub const ProtocolError = @import("conn.zig").ProtocolError;
 pub const FrameHeader = @import("conn.zig").FrameHeader;
 pub const Frame = @import("conn.zig").Frame;
 pub const Message = @import("conn.zig").Message;
 pub const CloseFrame = @import("conn.zig").CloseFrame;
-pub const Conn = @import("conn.zig").Conn;
+pub const BorrowedFrame = @import("conn.zig").BorrowedFrame;
+pub const EchoResult = @import("conn.zig").EchoResult;
+pub const ConnType = @import("conn.zig").Conn;
+pub const Conn = @import("conn.zig").Conn(.{});
+pub const ServerConn = @import("conn.zig").Conn(.{ .role = .server });
+pub const ClientConn = @import("conn.zig").Conn(.{ .role = .client });
 pub const parseClosePayload = @import("conn.zig").parseClosePayload;
 
 test {
