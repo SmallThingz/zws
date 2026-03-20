@@ -245,6 +245,7 @@ pub fn Conn(comptime static: StaticConfig) type {
                         .pong => {},
                         .close => {
                             self.close_received = true;
+                            self.recv_fragment_opcode = null;
                             const close_frame = try parseClosePayload(payload, validate_utf8);
                             if (comptime auto_reply_close) {
                                 if (!self.close_sent) try self.writeClose(close_frame.code, close_frame.reason);
@@ -260,11 +261,18 @@ pub fn Conn(comptime static: StaticConfig) type {
                     message_opcode = proto.messageOpcode(header.opcode) orelse unreachable;
                 }
 
-                if (header.payload_len > buf.len - total_len) return error.MessageTooLarge;
+                if (header.payload_len > buf.len - total_len) {
+                    try self.discardFrame();
+                    if (try self.discardRemainingMessage()) return error.ConnectionClosed;
+                    return error.MessageTooLarge;
+                }
                 const chunk = try self.readFrameAll(buf[total_len..]);
                 total_len += chunk.len;
 
-                if (total_len > self.config.max_message_payload_len) return error.MessageTooLarge;
+                if (total_len > self.config.max_message_payload_len) {
+                    if (try self.discardRemainingMessage()) return error.ConnectionClosed;
+                    return error.MessageTooLarge;
+                }
                 if (!header.fin) continue;
 
                 const final_opcode = message_opcode.?;
@@ -466,6 +474,35 @@ pub fn Conn(comptime static: StaticConfig) type {
                 .opcode = header.opcode,
                 .payload_len = payload.len,
             };
+        }
+
+        fn discardRemainingMessage(self: *Self) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!bool {
+            var control_buf: [control_payload_max_len]u8 = undefined;
+
+            while (self.recv_fragment_opcode != null) {
+                const header = try self.beginFrame();
+                if (!proto.isControl(header.opcode)) {
+                    try self.discardFrame();
+                    continue;
+                }
+
+                const payload = try self.readFrameAll(control_buf[0..]);
+                switch (header.opcode) {
+                    .ping => if (comptime auto_pong) try self.writePong(payload),
+                    .pong => {},
+                    .close => {
+                        self.close_received = true;
+                        self.recv_fragment_opcode = null;
+                        const close_frame = try parseClosePayload(payload, validate_utf8);
+                        if (comptime auto_reply_close) {
+                            if (!self.close_sent) try self.writeClose(close_frame.code, close_frame.reason);
+                        }
+                        return true;
+                    },
+                    else => unreachable,
+                }
+            }
+            return false;
         }
 
         fn writeControlFrame(self: *Self, opcode: Opcode, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
@@ -1093,6 +1130,24 @@ test "readMessage handles pong close and configured auto reply behavior" {
     }
 }
 
+test "readMessage clears fragmented receive state when a close interrupts a message" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "abc", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, "", .{ 5, 6, 7, 8 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var out: [8]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+    var buf: [8]u8 = undefined;
+
+    try std.testing.expectError(error.ConnectionClosed, conn.readMessage(buf[0..]));
+    try std.testing.expect(conn.close_received);
+    try std.testing.expect(conn.recv_fragment_opcode == null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x00 }, out[0..writer.end]);
+}
+
 test "readMessage enforces utf8 and message size limits" {
     {
         const invalid_utf8 = [_]u8{ 0xC3, 0x28 };
@@ -1118,6 +1173,76 @@ test "readMessage enforces utf8 and message size limits" {
         var buf: [8]u8 = undefined;
         try std.testing.expectError(error.MessageTooLarge, conn.readMessage(buf[0..]));
     }
+}
+
+test "readMessage drains oversized frames before returning MessageTooLarge" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "abcd", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .text, true, true, "z", .{ 5, 6, 7, 8 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+
+    var msg_buf: [3]u8 = undefined;
+    try std.testing.expectError(error.MessageTooLarge, conn.readMessage(msg_buf[0..]));
+    try std.testing.expect(!conn.recv_active);
+
+    var frame_buf: [1]u8 = undefined;
+    const next = try conn.readFrame(frame_buf[0..]);
+    try std.testing.expectEqual(Opcode.text, next.header.opcode);
+    try std.testing.expectEqualStrings("z", next.payload);
+}
+
+test "readMessage drains fragmented oversized messages and preserves next message boundary" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "abc", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .ping, true, true, "!", .{ 5, 6, 7, 8 });
+    try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, "de", .{ 9, 10, 11, 12 });
+    try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "ok", .{ 13, 14, 15, 16 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var out: [8]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+
+    var msg_buf: [2]u8 = undefined;
+    try std.testing.expectError(error.MessageTooLarge, conn.readMessage(msg_buf[0..]));
+    try std.testing.expect(!conn.recv_active);
+    try std.testing.expect(conn.recv_fragment_opcode == null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x8A, 0x01, '!' }, out[0..writer.end]);
+
+    var frame_buf: [2]u8 = undefined;
+    const next = try conn.readFrame(frame_buf[0..]);
+    try std.testing.expectEqual(Opcode.binary, next.header.opcode);
+    try std.testing.expectEqualStrings("ok", next.payload);
+}
+
+test "readMessage drains fragmented messages that exceed configured max size" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "abc", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .continuation, false, true, "de", .{ 5, 6, 7, 8 });
+    try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, "f", .{ 9, 10, 11, 12 });
+    try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "ok", .{ 13, 14, 15, 16 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{ .max_message_payload_len = 4 });
+
+    var msg_buf: [8]u8 = undefined;
+    try std.testing.expectError(error.MessageTooLarge, conn.readMessage(msg_buf[0..]));
+    try std.testing.expect(!conn.recv_active);
+    try std.testing.expect(conn.recv_fragment_opcode == null);
+
+    var frame_buf: [2]u8 = undefined;
+    const next = try conn.readFrame(frame_buf[0..]);
+    try std.testing.expectEqual(Opcode.binary, next.header.opcode);
+    try std.testing.expectEqualStrings("ok", next.payload);
 }
 
 test "writeFrame supports extended lengths and sequencing rules" {
