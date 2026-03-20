@@ -44,7 +44,10 @@ pub fn upgrade(headers: []const response.Header) response.Res;
 - route header schema for websocket handshakes
 - validating the request in the HTTP handler
 - returning the `101` response
-- creating reader/writer buffers inside `WsRunner.run(...)`
+- wrapping an existing runner with `zws.adaptZhttpRunner(...)`
+- keeping the user runner on the normal `run(...) !void` shape
+- showing that the adapter catches thrown runner errors and emits close `1011`
+- creating reader/writer buffers inside the wrapped runner
 - handing the accepted stream off to `zwebsocket`
 
 That example would make the intended integration path obvious and keep downstream adapters from diverging.

@@ -597,6 +597,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         fn inflateMessage(self: *Self, compressed_payload: []const u8, dest: []u8) ProtocolError![]u8 {
             const inflated = zlib_backend.inflateMessage(compressionAllocator(self), compressed_payload, dest) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.CounterTooLarge => return error.MessageTooLarge,
                 error.MessageTooLarge => return error.MessageTooLarge,
                 error.InflateFailed => return error.InvalidCompressedMessage,
             };
@@ -613,6 +614,7 @@ pub fn Conn(comptime static: StaticConfig) type {
                 outgoingFlushMode(static.role, pmd.negotiated),
             ) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
+                error.CounterTooLarge => return error.MessageTooLarge,
                 error.DeflateFailed => return error.InvalidCompressedMessage,
             };
         }

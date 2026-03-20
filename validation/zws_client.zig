@@ -163,15 +163,15 @@ pub fn main(init: std.process.Init) !void {
     defer init.gpa.free(request);
     const reply = try performHandshake(&sr.interface, &sw.interface, request);
 
-    const selected_compression = if (reply.selected_extensions) |header|
-        zws.offersPerMessageDeflate(header)
+    const negotiated_permessage_deflate = if (reply.selected_extensions) |header|
+        try zws.parsePerMessageDeflate(header)
     else
-        false;
+        null;
     const conn_cfg: zws.Config = .{
-        .permessage_deflate = if (selected_compression)
+        .permessage_deflate = if (negotiated_permessage_deflate) |pmd|
             .{
                 .allocator = init.gpa,
-                .negotiated = .{},
+                .negotiated = pmd,
             }
         else
             null,

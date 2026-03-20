@@ -15,7 +15,7 @@ Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame ho
 - 🧠 **Strict protocol checks**: rejects malformed control frames, invalid close payloads, bad UTF-8, bad mask bits, and non-minimal extended lengths.
 - 🗜 **`permessage-deflate`**: handshake negotiation plus compressed message read/write support, with `server_no_context_takeover` and `client_no_context_takeover`.
 - 🔁 **Convenience helpers**: `readMessage`, `echoFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, and `writeClose`.
-- 🪝 **`zhttp` helpers**: accept websocket upgrade requests from `zhttp` handlers and build `101 Switching Protocols` responses without re-parsing raw headers.
+- 🪝 **`zhttp` helpers**: accept websocket upgrade requests from `zhttp` handlers, build `101 Switching Protocols` responses, and adapt upgrade runners so thrown errors become websocket close `1011`.
 - 🧪 **Validation stack**: unit tests, fuzz/property tests, a cross-library interop matrix, soak runners, and benchmarks live alongside the library.
 
 ## 🚀 Quick Start
@@ -93,6 +93,14 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
 - `zws.zhttpRequest(req)` converts a `zhttp` upgrade request into `ServerHandshakeRequest`.
 - `zws.acceptZhttpUpgrade(req, opts)` validates the websocket handshake directly from a `zhttp` request.
 - `zws.fillZhttpResponseHeaders(...)` and `zws.makeZhttpUpgradeResponse(...)` build the `101` response header set.
+- `zws.adaptZhttpRunner(AppRunner, .{})` wraps an existing upgrade runner type and turns thrown runner errors into a best-effort websocket close `1011`.
+
+The integration is still two-phase:
+
+- the HTTP upgrade handler validates the request and returns the `101 Switching Protocols` response
+- the websocket runner owns the upgraded stream after takeover
+
+If you want thrown runner errors to become websocket close `1011`, wrap the runner type with `zws.adaptZhttpRunner(...)` and keep the runner body written as normal `!void`.
 
 Example handler shape:
 
@@ -121,6 +129,35 @@ fn upgrade(req: anytype) !zhttp.Res {
 ```
 
 The route must declare those websocket headers in its `zhttp` `.headers` schema so `req.header(...)` is available.
+
+Wrap the upgrade runner instead of changing its shape:
+
+```zig
+const AppRunner = struct {
+    pub const Data = struct {
+        compression: bool = false,
+    };
+
+    pub fn run(io: std.Io, _: std.mem.Allocator, stream: std.Io.net.Stream, data: *const Data) !void {
+        var owned_stream = stream;
+        var read_buf: [4096]u8 = undefined;
+        var write_buf: [4096]u8 = undefined;
+        var reader = owned_stream.reader(io, &read_buf);
+        var writer = owned_stream.writer(io, &write_buf);
+        var conn = zws.ServerConn.init(&reader.interface, &writer.interface, .{});
+        _ = data;
+
+        while (true) {
+            _ = try conn.echoFrame(read_buf[0..]);
+            try conn.flush();
+        }
+    }
+};
+
+const WsRunner = zws.adaptZhttpRunner(AppRunner, .{});
+```
+
+`WsRunner` is the type you hand to `zhttp` as `.upgrade = WsRunner`. If `AppRunner.run(...)` throws, the adapter catches it and best-effort writes close `1011` on the upgraded stream before returning.
 
 ## 📚 Docs
 

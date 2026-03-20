@@ -8,12 +8,14 @@ const c = @cImport({
 pub const DeflateError = error{
     OutOfMemory,
     DeflateFailed,
+    CounterTooLarge,
 };
 
 pub const InflateError = error{
     OutOfMemory,
     InflateFailed,
     MessageTooLarge,
+    CounterTooLarge,
 };
 
 pub const sync_flush = c.Z_SYNC_FLUSH;
@@ -26,6 +28,10 @@ fn zalloc(_: ?*anyopaque, items: c_uint, size: c_uint) callconv(.c) ?*anyopaque 
 
 fn zfree(_: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
     c.free(ptr);
+}
+
+fn zlibCounter(n: usize) error{CounterTooLarge}!c_uint {
+    return std.math.cast(c_uint, n) orelse error.CounterTooLarge;
 }
 
 pub fn deflateMessage(
@@ -54,12 +60,12 @@ pub fn deflateMessage(
     errdefer out.deinit(allocator);
 
     stream.next_in = if (payload.len == 0) null else @ptrCast(@constCast(payload.ptr));
-    stream.avail_in = @as(c_uint, @intCast(payload.len));
+    stream.avail_in = zlibCounter(payload.len) catch return error.CounterTooLarge;
 
     var chunk: [1024]u8 = undefined;
     while (true) {
         stream.next_out = @ptrCast(&chunk[0]);
-        stream.avail_out = @as(c_uint, @intCast(chunk.len));
+        stream.avail_out = zlibCounter(chunk.len) catch unreachable;
 
         const rc = c.deflate(&stream, @intCast(flush_mode));
         if (rc != c.Z_OK) return error.DeflateFailed;
@@ -92,9 +98,9 @@ pub fn inflateMessage(
     defer _ = c.inflateEnd(&stream);
 
     stream.next_in = if (compressed_payload.len == 0) null else @ptrCast(@constCast(compressed_payload.ptr));
-    stream.avail_in = @as(c_uint, @intCast(compressed_payload.len));
+    stream.avail_in = zlibCounter(compressed_payload.len) catch return error.CounterTooLarge;
     stream.next_out = if (dest.len == 0) null else @ptrCast(dest.ptr);
-    stream.avail_out = @as(c_uint, @intCast(dest.len));
+    stream.avail_out = zlibCounter(dest.len) catch return error.CounterTooLarge;
 
     while (true) {
         const prev_in = stream.avail_in;
@@ -130,4 +136,9 @@ test "zlib permessage-deflate helpers roundtrip sync and full flush payloads" {
         const inflated = try inflateMessage(std.testing.allocator, compressed, out[0..]);
         try std.testing.expectEqualStrings(payload, inflated);
     }
+}
+
+test "zlibCounter rejects lengths that do not fit zlib counters" {
+    try std.testing.expectEqual(@as(c_uint, 123), try zlibCounter(123));
+    try std.testing.expectError(error.CounterTooLarge, zlibCounter(@as(usize, std.math.maxInt(c_uint)) + 1));
 }

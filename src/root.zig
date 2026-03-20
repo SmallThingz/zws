@@ -4,7 +4,7 @@
 //! - low-level frame streaming (`beginFrame`, `readFrameChunk`, `readFrameAll`, `discardFrame`)
 //! - convenience helpers (`readFrame`, `readMessage`, `writeFrame`, `writeText`, `writeBinary`)
 //! - strict server handshake validation (`acceptServerHandshake`, `writeServerHandshakeResponse`)
-//! - `zhttp` compatibility helpers for upgrade routes and `101` response construction
+//! - `zhttp` compatibility helpers for upgrade routes, `101` response construction, and runner adaptation
 //!
 //! `ConnType` exposes the comptime-specialized connection type constructor.
 //! `Conn`, `ServerConn`, and `ClientConn` are convenient aliases for common
@@ -32,12 +32,14 @@ pub const ServerHandshakeResponse = handshake.ServerHandshakeResponse;
 pub const HandshakeError = handshake.HandshakeError;
 pub const PerMessageDeflate = extensions.PerMessageDeflate;
 pub const offersPerMessageDeflate = extensions.offersPerMessageDeflate;
+pub const parsePerMessageDeflate = extensions.parsePerMessageDeflate;
 pub const computeAcceptKey = handshake.computeAcceptKey;
 pub const acceptServerHandshake = handshake.acceptServerHandshake;
 pub const writeServerHandshakeResponse = handshake.writeServerHandshakeResponse;
 pub const serverHandshake = handshake.serverHandshake;
 
 pub const ZhttpCompatError = zhttp_compat.CompatError;
+pub const ZhttpRunnerAdapterOptions = zhttp_compat.RunnerAdapterOptions;
 pub const ZhttpUpgradeHeaders = zhttp_compat.UpgradeHeaders;
 pub const zhttpRequestFromHeaders = zhttp_compat.requestFromHeaders;
 pub const zhttpRequest = zhttp_compat.requestFromZhttp;
@@ -45,6 +47,7 @@ pub const acceptZhttpUpgrade = zhttp_compat.acceptZhttpUpgrade;
 pub const zhttpResponseHeaderCount = zhttp_compat.responseHeaderCount;
 pub const fillZhttpResponseHeaders = zhttp_compat.fillResponseHeaders;
 pub const makeZhttpUpgradeResponse = zhttp_compat.makeUpgradeResponse;
+pub const adaptZhttpRunner = zhttp_compat.adaptZhttpRunner;
 
 pub const StaticConfig = conn.StaticConfig;
 pub const Config = conn.Config;
