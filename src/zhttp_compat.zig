@@ -1,0 +1,329 @@
+const std = @import("std");
+
+const handshake = @import("handshake.zig");
+
+pub const CompatError = error{HeaderBufferTooSmall};
+
+pub const UpgradeHeaders = struct {
+    connection: ?[]const u8 = null,
+    upgrade: ?[]const u8 = null,
+    sec_websocket_key: ?[]const u8 = null,
+    sec_websocket_version: ?[]const u8 = null,
+    sec_websocket_protocol: ?[]const u8 = null,
+    sec_websocket_extensions: ?[]const u8 = null,
+    origin: ?[]const u8 = null,
+    host: ?[]const u8 = null,
+};
+
+pub fn requestFromHeaders(
+    method: []const u8,
+    is_http_11: bool,
+    headers: UpgradeHeaders,
+) handshake.ServerHandshakeRequest {
+    return .{
+        .method = method,
+        .is_http_11 = is_http_11,
+        .connection = headers.connection,
+        .upgrade = headers.upgrade,
+        .sec_websocket_key = headers.sec_websocket_key,
+        .sec_websocket_version = headers.sec_websocket_version,
+        .sec_websocket_protocol = headers.sec_websocket_protocol,
+        .sec_websocket_extensions = headers.sec_websocket_extensions,
+        .origin = headers.origin,
+        .host = headers.host,
+    };
+}
+
+pub fn requestFromZhttp(req: anytype) handshake.ServerHandshakeRequest {
+    const req_ptr = switch (@typeInfo(@TypeOf(req))) {
+        .pointer => req,
+        else => &req,
+    };
+    return requestFromHeaders(req_ptr.method, req_ptr.base.version == .http11, .{
+        .connection = req_ptr.header(.connection),
+        .upgrade = req_ptr.header(.upgrade),
+        .sec_websocket_key = req_ptr.header(.sec_websocket_key),
+        .sec_websocket_version = req_ptr.header(.sec_websocket_version),
+        .sec_websocket_protocol = req_ptr.header(.sec_websocket_protocol),
+        .sec_websocket_extensions = req_ptr.header(.sec_websocket_extensions),
+        .origin = req_ptr.header(.origin),
+        .host = req_ptr.header(.host),
+    });
+}
+
+pub fn acceptZhttpUpgrade(
+    req: anytype,
+    opts: handshake.ServerHandshakeOptions,
+) handshake.HandshakeError!handshake.ServerHandshakeResponse {
+    return handshake.acceptServerHandshake(requestFromZhttp(req), opts);
+}
+
+pub fn responseHeaderCount(response: handshake.ServerHandshakeResponse) usize {
+    return 3 + @as(usize, @intFromBool(response.selected_subprotocol != null)) + response.extra_headers.len;
+}
+
+pub fn fillResponseHeaders(
+    comptime HeaderT: type,
+    dest: []HeaderT,
+    response: handshake.ServerHandshakeResponse,
+) CompatError![]const HeaderT {
+    const needed = responseHeaderCount(response);
+    if (dest.len < needed) return error.HeaderBufferTooSmall;
+
+    var len: usize = 0;
+    dest[len] = .{ .name = "connection", .value = "Upgrade" };
+    len += 1;
+    dest[len] = .{ .name = "upgrade", .value = "websocket" };
+    len += 1;
+    dest[len] = .{ .name = "sec-websocket-accept", .value = response.accept_key[0..] };
+    len += 1;
+
+    if (response.selected_subprotocol) |subprotocol| {
+        dest[len] = .{ .name = "sec-websocket-protocol", .value = subprotocol };
+        len += 1;
+    }
+
+    for (response.extra_headers) |header| {
+        dest[len] = .{ .name = header.name, .value = header.value };
+        len += 1;
+    }
+
+    return dest[0..len];
+}
+
+pub fn makeUpgradeResponse(
+    comptime ResT: type,
+    comptime HeaderT: type,
+    dest: []HeaderT,
+    response: handshake.ServerHandshakeResponse,
+) CompatError!ResT {
+    return .{
+        .status = .switching_protocols,
+        .headers = try fillResponseHeaders(HeaderT, dest, response),
+    };
+}
+
+test "requestFromHeaders maps zhttp header captures into a handshake request" {
+    const req = requestFromHeaders("GET", true, .{
+        .connection = "Upgrade",
+        .upgrade = "websocket",
+        .sec_websocket_key = "dGhlIHNhbXBsZSBub25jZQ==",
+        .sec_websocket_version = "13",
+        .sec_websocket_protocol = "chat",
+        .origin = "https://example.com",
+    });
+
+    try std.testing.expectEqualStrings("GET", req.method);
+    try std.testing.expect(req.is_http_11);
+    try std.testing.expectEqualStrings("Upgrade", req.connection.?);
+    try std.testing.expectEqualStrings("websocket", req.upgrade.?);
+    try std.testing.expectEqualStrings("chat", req.sec_websocket_protocol.?);
+    try std.testing.expectEqualStrings("https://example.com", req.origin.?);
+}
+
+test "requestFromHeaders preserves http version flag and missing optional headers" {
+    const req = requestFromHeaders("GET", false, .{});
+
+    try std.testing.expectEqualStrings("GET", req.method);
+    try std.testing.expect(!req.is_http_11);
+    try std.testing.expect(req.connection == null);
+    try std.testing.expect(req.upgrade == null);
+    try std.testing.expect(req.sec_websocket_key == null);
+}
+
+test "requestFromZhttp accepts value and pointer request shapes" {
+    const FakeReq = struct {
+        method: []const u8,
+        base: struct { version: enum { http10, http11 } },
+        connection: ?[]const u8 = null,
+        upgrade: ?[]const u8 = null,
+        sec_websocket_key: ?[]const u8 = null,
+        sec_websocket_version: ?[]const u8 = null,
+
+        pub fn header(self: *const @This(), comptime field: @EnumLiteral()) ?[]const u8 {
+            return switch (field) {
+                .connection => self.connection,
+                .upgrade => self.upgrade,
+                .sec_websocket_key => self.sec_websocket_key,
+                .sec_websocket_version => self.sec_websocket_version,
+                .sec_websocket_protocol, .sec_websocket_extensions, .origin, .host => null,
+                else => unreachable,
+            };
+        }
+    };
+
+    const req: FakeReq = .{
+        .method = "GET",
+        .base = .{ .version = .http11 },
+        .connection = "Upgrade",
+        .upgrade = "websocket",
+        .sec_websocket_key = "dGhlIHNhbXBsZSBub25jZQ==",
+        .sec_websocket_version = "13",
+    };
+
+    const from_value = requestFromZhttp(req);
+    const from_ptr = requestFromZhttp(&req);
+
+    try std.testing.expectEqualStrings("GET", from_value.method);
+    try std.testing.expect(from_value.is_http_11);
+    try std.testing.expectEqualStrings(from_value.sec_websocket_key.?, from_ptr.sec_websocket_key.?);
+}
+
+test "acceptZhttpUpgrade and makeUpgradeResponse match zhttp route needs" {
+    const FakeReq = struct {
+        method: []const u8,
+        base: struct { version: enum { http10, http11 } },
+        connection: ?[]const u8 = null,
+        upgrade: ?[]const u8 = null,
+        sec_websocket_key: ?[]const u8 = null,
+        sec_websocket_version: ?[]const u8 = null,
+        sec_websocket_protocol: ?[]const u8 = null,
+
+        pub fn header(self: *const @This(), comptime field: @EnumLiteral()) ?[]const u8 {
+            return switch (field) {
+                .connection => self.connection,
+                .upgrade => self.upgrade,
+                .sec_websocket_key => self.sec_websocket_key,
+                .sec_websocket_version => self.sec_websocket_version,
+                .sec_websocket_protocol => self.sec_websocket_protocol,
+                .sec_websocket_extensions, .origin, .host => null,
+                else => unreachable,
+            };
+        }
+    };
+    const FakeHeader = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+    const FakeRes = struct {
+        status: std.http.Status = .ok,
+        headers: []const FakeHeader = &.{},
+        body: []const u8 = "",
+        close: bool = false,
+    };
+
+    const req: FakeReq = .{
+        .method = "GET",
+        .base = .{ .version = .http11 },
+        .connection = "keep-alive, Upgrade",
+        .upgrade = "websocket",
+        .sec_websocket_key = "dGhlIHNhbXBsZSBub25jZQ==",
+        .sec_websocket_version = "13",
+        .sec_websocket_protocol = "chat, superchat",
+    };
+
+    const accepted = try acceptZhttpUpgrade(req, .{
+        .selected_subprotocol = "chat",
+        .extra_headers = &.{
+            .{ .name = "x-trace-id", .value = "abc123" },
+        },
+    });
+    var headers: [5]FakeHeader = undefined;
+    const res = try makeUpgradeResponse(FakeRes, FakeHeader, headers[0..], accepted);
+
+    try std.testing.expectEqual(std.http.Status.switching_protocols, res.status);
+    try std.testing.expectEqual(@as(usize, 5), res.headers.len);
+    try std.testing.expectEqualStrings("connection", res.headers[0].name);
+    try std.testing.expectEqualStrings("Upgrade", res.headers[0].value);
+    try std.testing.expectEqualStrings("upgrade", res.headers[1].name);
+    try std.testing.expectEqualStrings("websocket", res.headers[1].value);
+    try std.testing.expectEqualStrings("sec-websocket-accept", res.headers[2].name);
+    try std.testing.expectEqualStrings("sec-websocket-protocol", res.headers[3].name);
+    try std.testing.expectEqualStrings("chat", res.headers[3].value);
+    try std.testing.expectEqualStrings("x-trace-id", res.headers[4].name);
+    try std.testing.expectEqualStrings("abc123", res.headers[4].value);
+}
+
+test "responseHeaderCount and fillResponseHeaders handle optional headers being absent" {
+    const Header = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+    const response: handshake.ServerHandshakeResponse = .{
+        .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
+        .selected_subprotocol = null,
+        .extra_headers = &.{},
+    };
+    var headers: [3]Header = undefined;
+
+    try std.testing.expectEqual(@as(usize, 3), responseHeaderCount(response));
+    const filled = try fillResponseHeaders(Header, headers[0..], response);
+    try std.testing.expectEqual(@as(usize, 3), filled.len);
+    try std.testing.expectEqualStrings("connection", filled[0].name);
+    try std.testing.expectEqualStrings("upgrade", filled[1].name);
+    try std.testing.expectEqualStrings("sec-websocket-accept", filled[2].name);
+}
+
+test "acceptZhttpUpgrade propagates handshake validation errors" {
+    const FakeReq = struct {
+        method: []const u8,
+        base: struct { version: enum { http10, http11 } },
+        connection: ?[]const u8 = null,
+        upgrade: ?[]const u8 = null,
+        sec_websocket_key: ?[]const u8 = null,
+        sec_websocket_version: ?[]const u8 = null,
+
+        pub fn header(self: *const @This(), comptime field: @EnumLiteral()) ?[]const u8 {
+            return switch (field) {
+                .connection => self.connection,
+                .upgrade => self.upgrade,
+                .sec_websocket_key => self.sec_websocket_key,
+                .sec_websocket_version => self.sec_websocket_version,
+                .sec_websocket_protocol, .sec_websocket_extensions, .origin, .host => null,
+                else => unreachable,
+            };
+        }
+    };
+    const req: FakeReq = .{
+        .method = "POST",
+        .base = .{ .version = .http11 },
+        .connection = "Upgrade",
+        .upgrade = "websocket",
+        .sec_websocket_key = "dGhlIHNhbXBsZSBub25jZQ==",
+        .sec_websocket_version = "13",
+    };
+
+    try std.testing.expectError(error.MethodNotGet, acceptZhttpUpgrade(req, .{}));
+}
+
+test "fillResponseHeaders rejects too-small header buffers" {
+    var headers: [3]struct {
+        name: []const u8,
+        value: []const u8,
+    } = undefined;
+
+    try std.testing.expectError(error.HeaderBufferTooSmall, fillResponseHeaders(
+        @TypeOf(headers[0]),
+        headers[0..],
+        .{
+            .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
+            .selected_subprotocol = "chat",
+            .extra_headers = &.{},
+        },
+    ));
+}
+
+test "makeUpgradeResponse propagates header buffer sizing errors" {
+    const Header = struct {
+        name: []const u8,
+        value: []const u8,
+    };
+    const Res = struct {
+        status: std.http.Status = .ok,
+        headers: []const Header = &.{},
+        body: []const u8 = "",
+        close: bool = false,
+    };
+    var headers: [3]Header = undefined;
+
+    try std.testing.expectError(error.HeaderBufferTooSmall, makeUpgradeResponse(
+        Res,
+        Header,
+        headers[0..],
+        .{
+            .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
+            .selected_subprotocol = "chat",
+            .extra_headers = &.{},
+        },
+    ));
+}
