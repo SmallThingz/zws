@@ -464,6 +464,7 @@ pub fn Conn(comptime static: StaticConfig) type {
                 .pong => {},
                 .close => {
                     self.close_received = true;
+                    self.recv_fragment_opcode = null;
                     const close_frame = try parseClosePayload(payload, validate_utf8);
                     if (!self.close_sent) {
                         try self.writeClose(close_frame.code, close_frame.reason);
@@ -1507,6 +1508,29 @@ test "echoFrame validates close payload even after local close was sent" {
 
     var scratch: [8]u8 = undefined;
     try std.testing.expectError(error.InvalidClosePayload, conn.echoFrame(scratch[0..]));
+}
+
+test "echoFrame clears fragmented receive state when a close interrupts a message" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "abc", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, "", .{ 5, 6, 7, 8 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var out: [8]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+    var scratch: [8]u8 = undefined;
+
+    try std.testing.expectEqual(Opcode.text, (try conn.echoFrame(scratch[0..])).opcode);
+    try std.testing.expect(conn.recv_fragment_opcode != null);
+    try std.testing.expectEqual(Opcode.close, (try conn.echoFrame(scratch[0..])).opcode);
+    try std.testing.expect(conn.close_received);
+    try std.testing.expect(conn.recv_fragment_opcode == null);
+    try std.testing.expectEqualSlices(u8, &.{
+        0x01, 0x03, 'a', 'b', 'c',
+        0x88, 0x00,
+    }, out[0..writer.end]);
 }
 
 test "readMessage accepts empty text messages" {
