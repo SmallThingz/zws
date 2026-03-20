@@ -12,7 +12,10 @@
 const proto = @import("protocol.zig");
 const handshake = @import("handshake.zig");
 const conn = @import("conn.zig");
+const extensions = @import("extensions.zig");
 const zhttp_compat = @import("zhttp_compat.zig");
+const std = @import("std");
+const builtin = @import("builtin");
 
 pub const Role = proto.Role;
 pub const Opcode = proto.Opcode;
@@ -27,6 +30,8 @@ pub const ServerHandshakeRequest = handshake.ServerHandshakeRequest;
 pub const ServerHandshakeOptions = handshake.ServerHandshakeOptions;
 pub const ServerHandshakeResponse = handshake.ServerHandshakeResponse;
 pub const HandshakeError = handshake.HandshakeError;
+pub const PerMessageDeflate = extensions.PerMessageDeflate;
+pub const offersPerMessageDeflate = extensions.offersPerMessageDeflate;
 pub const computeAcceptKey = handshake.computeAcceptKey;
 pub const acceptServerHandshake = handshake.acceptServerHandshake;
 pub const writeServerHandshakeResponse = handshake.writeServerHandshakeResponse;
@@ -43,6 +48,7 @@ pub const makeZhttpUpgradeResponse = zhttp_compat.makeUpgradeResponse;
 
 pub const StaticConfig = conn.StaticConfig;
 pub const Config = conn.Config;
+pub const PerMessageDeflateConfig = conn.PerMessageDeflateConfig;
 pub const ProtocolError = conn.ProtocolError;
 pub const FrameHeader = conn.FrameHeader;
 pub const Frame = conn.Frame;
@@ -56,9 +62,74 @@ pub const ServerConn = conn.Conn(.{ .role = .server });
 pub const ClientConn = conn.Conn(.{ .role = .client });
 pub const parseClosePayload = conn.parseClosePayload;
 
+pub fn fuzz(
+    context: anytype,
+    comptime testOne: fn (context: @TypeOf(context), smith: *std.testing.Smith) anyerror!void,
+    fuzz_opts: std.testing.FuzzInputOptions,
+) anyerror!void {
+    if (comptime builtin.fuzz) {
+        return fuzzBuiltin(context, testOne, fuzz_opts);
+    }
+
+    if (fuzz_opts.corpus.len == 0) {
+        var smith: std.testing.Smith = .{ .in = "" };
+        return testOne(context, &smith);
+    }
+
+    for (fuzz_opts.corpus) |input| {
+        var smith: std.testing.Smith = .{ .in = input };
+        try testOne(context, &smith);
+    }
+}
+
+fn fuzzBuiltin(
+    context: anytype,
+    comptime testOne: fn (context: @TypeOf(context), smith: *std.testing.Smith) anyerror!void,
+    fuzz_opts: std.testing.FuzzInputOptions,
+) anyerror!void {
+    const fuzz_abi = std.Build.abi.fuzz;
+    const Smith = std.testing.Smith;
+    const Ctx = @TypeOf(context);
+
+    const Wrapper = struct {
+        var ctx: Ctx = undefined;
+        pub fn testOneC() callconv(.c) void {
+            var smith: Smith = .{ .in = null };
+            testOne(ctx, &smith) catch {};
+        }
+    };
+
+    Wrapper.ctx = context;
+
+    var cache_dir: []const u8 = ".";
+    var map_opt: ?std.process.Environ.Map = null;
+    if (std.testing.environ.createMap(std.testing.allocator)) |map| {
+        map_opt = map;
+        if (map.get("ZIG_CACHE_DIR")) |v| {
+            cache_dir = v;
+        } else if (map.get("ZIG_GLOBAL_CACHE_DIR")) |v| {
+            cache_dir = v;
+        }
+    } else |_| {}
+    defer if (map_opt) |*map| map.deinit();
+
+    fuzz_abi.fuzzer_init(.fromSlice(cache_dir));
+
+    const test_name = @typeName(@TypeOf(testOne));
+    fuzz_abi.fuzzer_set_test(Wrapper.testOneC, .fromSlice(test_name));
+
+    for (fuzz_opts.corpus) |input| {
+        fuzz_abi.fuzzer_add_input(.fromSlice(input));
+    }
+    fuzz_abi.fuzzer_run();
+}
+
 test {
+    _ = @import("extensions.zig");
     _ = @import("protocol.zig");
     _ = @import("handshake.zig");
     _ = @import("conn.zig");
+    _ = @import("zlib_backend.zig");
     _ = @import("zhttp_compat.zig");
+    _ = @import("validation_tests.zig");
 }

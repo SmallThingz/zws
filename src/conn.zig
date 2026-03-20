@@ -2,6 +2,8 @@ const std = @import("std");
 const Io = std.Io;
 
 const proto = @import("protocol.zig");
+const extensions = @import("extensions.zig");
+const zlib_backend = @import("zlib_backend.zig");
 
 const control_payload_max_len = 125;
 const frame_header_max_len = 14;
@@ -27,9 +29,11 @@ pub const ProtocolError = error{
     InvalidClosePayload,
     InvalidCloseCode,
     InvalidUtf8,
+    InvalidCompressedMessage,
     ConnectionClosed,
     FragmentWriteInProgress,
     UnexpectedContinuationWrite,
+    OutOfMemory,
 };
 
 pub const StaticConfig = struct {
@@ -42,11 +46,19 @@ pub const StaticConfig = struct {
 pub const Config = struct {
     max_frame_payload_len: u64 = std.math.maxInt(u64),
     max_message_payload_len: usize = std.math.maxInt(usize),
+    permessage_deflate: ?PerMessageDeflateConfig = null,
+};
+
+pub const PerMessageDeflateConfig = struct {
+    allocator: std.mem.Allocator,
+    negotiated: extensions.PerMessageDeflate = .{},
+    compression_level: i32 = 1,
 };
 
 pub const FrameHeader = struct {
     fin: bool,
     masked: bool,
+    compressed: bool = false,
     opcode: Opcode,
     payload_len: u64,
 };
@@ -103,6 +115,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         recv_mask: [mask_len]u8 = .{0} ** mask_len,
         recv_mask_offset: usize = 0,
         recv_fragment_opcode: ?MessageOpcode = null,
+        recv_fragment_compressed: bool = false,
 
         send_fragment_opcode: ?MessageOpcode = null,
         close_sent: bool = false,
@@ -234,6 +247,9 @@ pub fn Conn(comptime static: StaticConfig) type {
         pub fn readMessage(self: *Self, buf: []u8) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!Message {
             var total_len: usize = 0;
             var message_opcode: ?MessageOpcode = self.recv_fragment_opcode;
+            var message_compressed = self.recv_fragment_compressed;
+            var compressed_payload: ?std.ArrayList(u8) = null;
+            defer if (compressed_payload) |*list| list.deinit(compressionAllocator(self));
             var control_buf: [control_payload_max_len]u8 = undefined;
 
             while (true) {
@@ -241,11 +257,14 @@ pub fn Conn(comptime static: StaticConfig) type {
                 if (proto.isControl(header.opcode)) {
                     const payload = try self.readFrameAll(control_buf[0..]);
                     switch (header.opcode) {
-                        .ping => if (comptime auto_pong) try self.writePong(payload),
+                        .ping => if (comptime auto_pong) {
+                            if (!self.close_sent) try self.writePong(payload);
+                        },
                         .pong => {},
                         .close => {
                             self.close_received = true;
                             self.recv_fragment_opcode = null;
+                            self.recv_fragment_compressed = false;
                             const close_frame = try parseClosePayload(payload, validate_utf8);
                             if (comptime auto_reply_close) {
                                 if (!self.close_sent) try self.writeClose(close_frame.code, close_frame.reason);
@@ -259,6 +278,38 @@ pub fn Conn(comptime static: StaticConfig) type {
 
                 if (message_opcode == null) {
                     message_opcode = proto.messageOpcode(header.opcode) orelse unreachable;
+                    message_compressed = header.compressed;
+                }
+
+                if (message_compressed) {
+                    var list = if (compressed_payload) |*existing|
+                        existing
+                    else blk: {
+                        compressed_payload = .empty;
+                        break :blk &(compressed_payload.?);
+                    };
+
+                    const frame_len = std.math.cast(usize, header.payload_len) orelse {
+                        try self.discardFrame();
+                        if (try self.discardRemainingMessage()) return error.ConnectionClosed;
+                        return error.MessageTooLarge;
+                    };
+                    const start = list.items.len;
+                    list.resize(compressionAllocator(self), start + frame_len) catch return error.OutOfMemory;
+                    errdefer list.shrinkRetainingCapacity(start);
+                    _ = try self.readFrameAll(list.items[start .. start + frame_len]);
+
+                    if (!header.fin) continue;
+
+                    const inflated = try self.inflateMessage(list.items, buf);
+                    const final_opcode = message_opcode.?;
+                    if (comptime validate_utf8) {
+                        if (final_opcode == .text and !std.unicode.utf8ValidateSlice(inflated)) return error.InvalidUtf8;
+                    }
+                    return .{
+                        .opcode = final_opcode,
+                        .payload = inflated,
+                    };
                 }
 
                 if (header.payload_len > buf.len - total_len) {
@@ -300,14 +351,26 @@ pub fn Conn(comptime static: StaticConfig) type {
             payload: []const u8,
             fin: bool,
         ) (ProtocolError || Io.Writer.Error)!void {
+            try self.writeFrameInternal(opcode, payload, fin, false);
+        }
+
+        fn writeFrameInternal(
+            self: *Self,
+            opcode: Opcode,
+            payload: []const u8,
+            fin: bool,
+            compressed: bool,
+        ) (ProtocolError || Io.Writer.Error)!void {
             if (proto.isControl(opcode) and payload.len > control_payload_max_len) return error.ControlFrameTooLarge;
+            if (proto.isControl(opcode) and compressed) return error.ReservedBitsSet;
             try self.validateOutgoingSequence(opcode, fin);
 
             var header_buf: [frame_header_max_len]u8 = undefined;
             var header_len: usize = 0;
 
             const fin_bit: u8 = if (fin) 0x80 else 0;
-            header_buf[header_len] = @as(u8, @intFromEnum(opcode)) | fin_bit;
+            const compressed_bit: u8 = if (compressed) 0x40 else 0;
+            header_buf[header_len] = @as(u8, @intFromEnum(opcode)) | fin_bit | compressed_bit;
             header_len += 1;
 
             if (payload.len <= control_payload_max_len) {
@@ -353,11 +416,22 @@ pub fn Conn(comptime static: StaticConfig) type {
 
         pub fn writeText(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
             try validateUtf8IfEnabled(validate_utf8, payload);
-            try self.writeFrame(.text, payload, true);
+            try self.writeMessage(.text, payload);
         }
 
         pub fn writeBinary(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
-            try self.writeFrame(.binary, payload, true);
+            try self.writeMessage(.binary, payload);
+        }
+
+        fn writeMessage(self: *Self, opcode: Opcode, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
+            if (self.config.permessage_deflate == null or payload.len == 0) {
+                try self.writeFrameInternal(opcode, payload, true, false);
+                return;
+            }
+
+            const compressed_payload = try self.deflateMessage(payload);
+            defer compressionAllocator(self).free(compressed_payload);
+            try self.writeFrameInternal(opcode, compressed_payload, true, true);
         }
 
         pub fn writePing(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
@@ -394,7 +468,9 @@ pub fn Conn(comptime static: StaticConfig) type {
 
         fn parseHeaderBytes(self: *Self, bytes: []const u8) ProtocolError!?ParsedHeader {
             if (bytes.len < 2) return null;
-            if ((bytes[0] & 0x70) != 0) return error.ReservedBitsSet;
+            const compressed = (bytes[0] & 0x40) != 0;
+            if ((bytes[0] & 0x30) != 0) return error.ReservedBitsSet;
+            if (compressed and self.config.permessage_deflate == null) return error.ReservedBitsSet;
 
             const opcode: Opcode = switch (@as(u4, @truncate(bytes[0]))) {
                 0x0 => .continuation,
@@ -429,9 +505,11 @@ pub fn Conn(comptime static: StaticConfig) type {
 
             if (proto.isControl(opcode)) {
                 if (!fin) return error.ControlFrameFragmented;
+                if (compressed) return error.ReservedBitsSet;
                 if (payload_len > control_payload_max_len) return error.ControlFrameTooLarge;
             } else switch (opcode) {
                 .continuation => {
+                    if (compressed) return error.ReservedBitsSet;
                     if (self.recv_fragment_opcode == null) return error.UnexpectedContinuation;
                 },
                 .text, .binary => {
@@ -449,6 +527,7 @@ pub fn Conn(comptime static: StaticConfig) type {
                 .header = .{
                     .fin = fin,
                     .masked = masked,
+                    .compressed = compressed,
                     .opcode = opcode,
                     .payload_len = payload_len,
                 },
@@ -459,12 +538,13 @@ pub fn Conn(comptime static: StaticConfig) type {
 
         fn echoFramePayload(self: *Self, header: FrameHeader, payload: []const u8) (ProtocolError || Io.Writer.Error)!EchoResult {
             switch (header.opcode) {
-                .continuation, .text, .binary => try self.writeFrame(header.opcode, payload, header.fin),
-                .ping => try self.writeControlFrame(.pong, payload),
+                .continuation, .text, .binary => try self.writeFrameInternal(header.opcode, payload, header.fin, header.compressed),
+                .ping => if (!self.close_sent) try self.writeControlFrame(.pong, payload),
                 .pong => {},
                 .close => {
                     self.close_received = true;
                     self.recv_fragment_opcode = null;
+                    self.recv_fragment_compressed = false;
                     const close_frame = try parseClosePayload(payload, validate_utf8);
                     if (!self.close_sent) {
                         try self.writeClose(close_frame.code, close_frame.reason);
@@ -489,11 +569,14 @@ pub fn Conn(comptime static: StaticConfig) type {
 
                 const payload = try self.readFrameAll(control_buf[0..]);
                 switch (header.opcode) {
-                    .ping => if (comptime auto_pong) try self.writePong(payload),
+                    .ping => if (comptime auto_pong) {
+                        if (!self.close_sent) try self.writePong(payload);
+                    },
                     .pong => {},
                     .close => {
                         self.close_received = true;
                         self.recv_fragment_opcode = null;
+                        self.recv_fragment_compressed = false;
                         const close_frame = try parseClosePayload(payload, validate_utf8);
                         if (comptime auto_reply_close) {
                             if (!self.close_sent) try self.writeClose(close_frame.code, close_frame.reason);
@@ -511,7 +594,36 @@ pub fn Conn(comptime static: StaticConfig) type {
             try self.writeFrame(opcode, payload, true);
         }
 
+        fn inflateMessage(self: *Self, compressed_payload: []const u8, dest: []u8) ProtocolError![]u8 {
+            const inflated = zlib_backend.inflateMessage(compressionAllocator(self), compressed_payload, dest) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.MessageTooLarge => return error.MessageTooLarge,
+                error.InflateFailed => return error.InvalidCompressedMessage,
+            };
+            if (inflated.len > self.config.max_message_payload_len) return error.MessageTooLarge;
+            return inflated;
+        }
+
+        fn deflateMessage(self: *Self, payload: []const u8) ProtocolError![]u8 {
+            const pmd = self.config.permessage_deflate.?;
+            return zlib_backend.deflateMessage(
+                pmd.allocator,
+                payload,
+                pmd.compression_level,
+                outgoingFlushMode(static.role, pmd.negotiated),
+            ) catch |err| switch (err) {
+                error.OutOfMemory => return error.OutOfMemory,
+                error.DeflateFailed => return error.InvalidCompressedMessage,
+            };
+        }
+
+        fn compressionAllocator(self: *const Self) std.mem.Allocator {
+            return self.config.permessage_deflate.?.allocator;
+        }
+
         fn validateOutgoingSequence(self: *Self, opcode: Opcode, fin: bool) ProtocolError!void {
+            if (self.close_sent) return error.ConnectionClosed;
+
             if (proto.isControl(opcode)) {
                 if (!fin) return error.ControlFrameFragmented;
                 return;
@@ -534,11 +646,15 @@ pub fn Conn(comptime static: StaticConfig) type {
             if (!header.fin) {
                 if (proto.messageOpcode(header.opcode)) |message_opcode| {
                     self.recv_fragment_opcode = message_opcode;
+                    self.recv_fragment_compressed = header.compressed;
                 }
                 return;
             }
             if (header.opcode == .continuation) {
                 self.recv_fragment_opcode = null;
+                self.recv_fragment_compressed = false;
+            } else if (proto.isData(header.opcode)) {
+                self.recv_fragment_compressed = false;
             }
         }
 
@@ -556,6 +672,14 @@ fn validateUtf8IfEnabled(comptime enabled: bool, payload: []const u8) ProtocolEr
     if (comptime enabled) {
         if (!std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
     }
+}
+
+fn outgoingFlushMode(comptime role: Role, negotiated: extensions.PerMessageDeflate) i32 {
+    const no_context_takeover = switch (role) {
+        .server => negotiated.server_no_context_takeover,
+        .client => negotiated.client_no_context_takeover,
+    };
+    return if (no_context_takeover) zlib_backend.full_flush else zlib_backend.sync_flush;
 }
 
 pub fn parseClosePayload(payload: []const u8, validate_utf8: bool) ProtocolError!CloseFrame {
@@ -1056,6 +1180,25 @@ test "readFrameChunk zero length does not consume payload and discardFrame drain
     try std.testing.expectEqualStrings("z", next.payload);
 }
 
+test "readFrameChunk unmasks correctly across multiple chunk reads" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "hello", .{ 1, 2, 3, 4 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+
+    _ = try conn.beginFrame();
+    var first: [2]u8 = undefined;
+    var second: [3]u8 = undefined;
+    try std.testing.expectEqualStrings("he", try conn.readFrameChunk(first[0..]));
+    try std.testing.expect(conn.recv_active);
+    try std.testing.expectEqualStrings("llo", try conn.readFrameChunk(second[0..]));
+    try std.testing.expect(!conn.recv_active);
+}
+
 test "readFrameAll rejects destination that is too small and zero payload frames work" {
     {
         var wire: std.ArrayList(u8) = .empty;
@@ -1146,6 +1289,24 @@ test "readMessage clears fragmented receive state when a close interrupts a mess
     try std.testing.expectError(error.ConnectionClosed, conn.readMessage(buf[0..]));
     try std.testing.expect(conn.close_received);
     try std.testing.expect(conn.recv_fragment_opcode == null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x00 }, out[0..writer.end]);
+}
+
+test "readMessage ignores ping frames after a local close has already been sent" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .ping, true, true, "!", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, "", .{ 5, 6, 7, 8 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var out: [8]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+    try conn.writeClose(null, "");
+
+    var buf: [1]u8 = undefined;
+    try std.testing.expectError(error.ConnectionClosed, conn.readMessage(buf[0..]));
+    try std.testing.expect(conn.close_received);
     try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x00 }, out[0..writer.end]);
 }
 
@@ -1301,6 +1462,20 @@ test "writeFrame supports extended lengths and sequencing rules" {
         try std.testing.expectError(error.UnexpectedContinuationWrite, conn.writeFrame(.continuation, "x", true));
         try std.testing.expectError(error.ControlFrameFragmented, conn.writeFrame(.ping, "", false));
     }
+    {
+        var payload: [126]u8 = undefined;
+        @memset(payload[0..], 'm');
+        var out: [256]u8 = undefined;
+        var writer = Io.Writer.fixed(out[0..]);
+        var reader = Io.Reader.fixed(""[0..]);
+        var conn = Conn(.{ .role = .client }).init(&reader, &writer, .{});
+        try conn.writeBinary(payload[0..]);
+        try std.testing.expectEqual(@as(u8, 0x82), out[0]);
+        try std.testing.expectEqual(@as(u8, 0xFE), out[1]);
+        try std.testing.expectEqual(@as(u8, 0), out[2]);
+        try std.testing.expectEqual(@as(u8, 126), out[3]);
+        try std.testing.expectEqual(@as(usize, 4 + 4 + 126), writer.end);
+    }
 }
 
 test "writeText writePing writePong and writeClose validate inputs" {
@@ -1339,6 +1514,19 @@ test "writeText writePing writePong and writeClose validate inputs" {
         try std.testing.expect(conn.close_sent);
         try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x00 }, out[0..writer.end]);
     }
+    {
+        var out: [64]u8 = undefined;
+        var writer = Io.Writer.fixed(out[0..]);
+        var reader = Io.Reader.fixed(""[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
+        try conn.writeClose(null, "");
+        try std.testing.expectError(error.ConnectionClosed, conn.writeText("x"));
+        try std.testing.expectError(error.ConnectionClosed, conn.writeBinary("x"));
+        try std.testing.expectError(error.ConnectionClosed, conn.writePing(""));
+        try std.testing.expectError(error.ConnectionClosed, conn.writePong(""));
+        try std.testing.expectError(error.ConnectionClosed, conn.writeClose(null, ""));
+        try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x00 }, out[0..writer.end]);
+    }
 }
 
 test "client control writers emit masked frames" {
@@ -1367,6 +1555,11 @@ test "parseClosePayload covers empty invalid code and utf8-disabled behavior" {
     }
     try std.testing.expectError(error.InvalidClosePayload, parseClosePayload(&[_]u8{0x03}, true));
     try std.testing.expectError(error.InvalidCloseCode, parseClosePayload(&[_]u8{ 0x03, 0xED }, true));
+    {
+        const close = try parseClosePayload(&[_]u8{ 0x03, 0xE8 }, true);
+        try std.testing.expectEqual(@as(?u16, 1000), close.code);
+        try std.testing.expectEqual(@as(usize, 0), close.reason.len);
+    }
     {
         const payload = [_]u8{ 0x03, 0xE8, 0xC3, 0x28 };
         const close = try parseClosePayload(payload[0..], false);
@@ -1405,6 +1598,18 @@ test "readFrameBorrowed handles empty payload control frames" {
     const frame = (try conn.readFrameBorrowed()).?;
     try std.testing.expectEqual(Opcode.ping, frame.header.opcode);
     try std.testing.expectEqual(@as(usize, 0), frame.payload.len);
+}
+
+test "readFrameBorrowed supports unmasked client-role frames" {
+    const wire = [_]u8{ 0x82, 0x02, 'o', 'k' };
+    var reader = Io.Reader.fixed(wire[0..]);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{ .role = .client }).init(&reader, &writer, .{});
+
+    const frame = (try conn.readFrameBorrowed()).?;
+    try std.testing.expectEqual(Opcode.binary, frame.header.opcode);
+    try std.testing.expectEqualStrings("ok", frame.payload);
 }
 
 test "readFrameBorrowed returns null for payload sizes that cannot fit in usize" {
@@ -1533,6 +1738,24 @@ test "echoFrame clears fragmented receive state when a close interrupts a messag
     }, out[0..writer.end]);
 }
 
+test "echoFrame ignores ping frames after a local close has already been sent" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .ping, true, true, "!", .{ 1, 2, 3, 4 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var out: [8]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{});
+    try conn.writeClose(null, "");
+
+    var scratch: [4]u8 = undefined;
+    const echoed = try conn.echoFrame(scratch[0..]);
+    try std.testing.expectEqual(Opcode.ping, echoed.opcode);
+    try std.testing.expectEqual(@as(usize, 1), echoed.payload_len);
+    try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x00 }, out[0..writer.end]);
+}
+
 test "readMessage accepts empty text messages" {
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(std.testing.allocator);
@@ -1587,6 +1810,53 @@ test "readMessage resumes fragmented messages after frame-level reads" {
     const msg = try conn.readMessage(msg_buf[0..]);
     try std.testing.expectEqual(MessageOpcode.text, msg.opcode);
     try std.testing.expectEqualStrings("llo", msg.payload);
+}
+
+test "permessage-deflate client/server roundtrip preserves message payloads" {
+    const pmd_cfg: PerMessageDeflateConfig = .{
+        .allocator = std.testing.allocator,
+    };
+
+    var out: [1024]u8 = undefined;
+    var client_writer = Io.Writer.fixed(out[0..]);
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var client = Conn(.{ .role = .client }).init(&empty_reader, &client_writer, .{
+        .permessage_deflate = pmd_cfg,
+    });
+
+    const payload = "zwebsocket interop text payload with enough repetition to exercise permessage-deflate";
+    try client.writeText(payload);
+
+    var server_reader = Io.Reader.fixed(out[0..client_writer.end]);
+    var sink: [0]u8 = .{};
+    var server_writer = Io.Writer.fixed(sink[0..]);
+    var server = Conn(.{}).init(&server_reader, &server_writer, .{
+        .permessage_deflate = pmd_cfg,
+    });
+    var message_buf: [256]u8 = undefined;
+    const message = try server.readMessage(message_buf[0..]);
+    try std.testing.expectEqual(MessageOpcode.text, message.opcode);
+    try std.testing.expectEqualStrings(payload, message.payload);
+}
+
+test "beginFrame rejects compressed control frames even when permessage-deflate is enabled" {
+    const wire = [_]u8{
+        0xC9,
+        0x80,
+        0x01,
+        0x02,
+        0x03,
+        0x04,
+    };
+    var reader = Io.Reader.fixed(wire[0..]);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{
+        .permessage_deflate = .{
+            .allocator = std.testing.allocator,
+        },
+    });
+    try std.testing.expectError(error.ReservedBitsSet, conn.beginFrame());
 }
 
 test "applyMask is reversible across chunk boundaries and offsets" {

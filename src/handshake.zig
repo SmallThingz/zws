@@ -1,5 +1,6 @@
 const std = @import("std");
 const Io = std.Io;
+const extensions = @import("extensions.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -22,12 +23,16 @@ pub const ServerHandshakeRequest = struct {
 pub const ServerHandshakeOptions = struct {
     selected_subprotocol: ?[]const u8 = null,
     reject_extensions: bool = false,
+    enable_permessage_deflate: bool = false,
+    permessage_deflate: extensions.PerMessageDeflate = .{},
     extra_headers: []const Header = &.{},
 };
 
 pub const ServerHandshakeResponse = struct {
     accept_key: [28]u8,
     selected_subprotocol: ?[]const u8,
+    selected_extensions: ?[]const u8 = null,
+    permessage_deflate: ?extensions.PerMessageDeflate = null,
     extra_headers: []const Header,
 };
 
@@ -115,6 +120,15 @@ pub fn acceptServerHandshake(
         return error.ExtensionsNotSupported;
     }
 
+    var negotiated_permessage_deflate: ?extensions.PerMessageDeflate = null;
+    if (opts.enable_permessage_deflate) {
+        if (req.sec_websocket_extensions) |header_value| {
+            if (extensions.offersPerMessageDeflate(header_value)) {
+                negotiated_permessage_deflate = opts.permessage_deflate;
+            }
+        }
+    }
+
     if (opts.selected_subprotocol) |selected| {
         const offered = req.sec_websocket_protocol orelse return error.SubprotocolNotOffered;
         if (!subprotocolWasOffered(offered, selected)) return error.SubprotocolNotOffered;
@@ -123,6 +137,8 @@ pub fn acceptServerHandshake(
     return .{
         .accept_key = try computeAcceptKey(key),
         .selected_subprotocol = opts.selected_subprotocol,
+        .selected_extensions = if (negotiated_permessage_deflate) |pmd| pmd.responseHeaderValue() else null,
+        .permessage_deflate = negotiated_permessage_deflate,
         .extra_headers = opts.extra_headers,
     };
 }
@@ -141,6 +157,12 @@ pub fn writeServerHandshakeResponse(
     if (response.selected_subprotocol) |subprotocol| {
         try writer.writeAll("sec-websocket-protocol: ");
         try writer.writeAll(subprotocol);
+        try writer.writeAll("\r\n");
+    }
+
+    if (response.selected_extensions) |selected_extensions| {
+        try writer.writeAll("sec-websocket-extensions: ");
+        try writer.writeAll(selected_extensions);
         try writer.writeAll("\r\n");
     }
 
@@ -230,6 +252,21 @@ test "acceptServerHandshake allows extensions unless configured to reject them" 
 
     const response = try acceptServerHandshake(req, .{});
     try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", response.accept_key[0..]);
+    try std.testing.expect(response.permessage_deflate == null);
+}
+
+test "acceptServerHandshake negotiates permessage-deflate when enabled and offered" {
+    var req = validRequest();
+    req.sec_websocket_extensions = "permessage-deflate; client_max_window_bits, x-test";
+
+    const response = try acceptServerHandshake(req, .{
+        .enable_permessage_deflate = true,
+    });
+    try std.testing.expectEqualStrings(
+        "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+        response.selected_extensions.?,
+    );
+    try std.testing.expect(response.permessage_deflate != null);
 }
 
 test "acceptServerHandshake accepts connection token with extra commas and spaces" {
@@ -342,6 +379,8 @@ test "writeServerHandshakeResponse omits optional headers when absent" {
     try writeServerHandshakeResponse(&writer, .{
         .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
         .selected_subprotocol = null,
+        .selected_extensions = null,
+        .permessage_deflate = null,
         .extra_headers = &.{},
     });
 
@@ -356,11 +395,13 @@ test "writeServerHandshakeResponse omits optional headers when absent" {
 }
 
 test "writeServerHandshakeResponse preserves header order for subprotocol and extras" {
-    var out: [256]u8 = undefined;
+    var out: [384]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
     try writeServerHandshakeResponse(&writer, .{
         .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
         .selected_subprotocol = "chat",
+        .selected_extensions = "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+        .permessage_deflate = .{},
         .extra_headers = &.{
             .{ .name = "x-first", .value = "1" },
             .{ .name = "x-second", .value = "2" },
@@ -373,6 +414,7 @@ test "writeServerHandshakeResponse preserves header order for subprotocol and ex
             "connection: Upgrade\r\n" ++
             "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
             "sec-websocket-protocol: chat\r\n" ++
+            "sec-websocket-extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n" ++
             "x-first: 1\r\n" ++
             "x-second: 2\r\n" ++
             "\r\n",

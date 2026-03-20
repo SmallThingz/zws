@@ -9,6 +9,8 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    mod.linkSystemLibrary("c", .{});
+    mod.linkSystemLibrary("z", .{});
 
     const mod_tests = b.addTest(.{
         .root_module = mod,
@@ -54,6 +56,32 @@ pub fn build(b: *std.Build) void {
     });
     const install_compare = b.addInstallArtifact(compare_exe, .{});
 
+    const echo_server_exe = b.addExecutable(.{
+        .name = "zwebsocket-echo-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/echo_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zwebsocket", .module = mod },
+            },
+        }),
+    });
+    const install_echo_server = b.addInstallArtifact(echo_server_exe, .{});
+
+    const interop_client_exe = b.addExecutable(.{
+        .name = "zwebsocket-interop-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("validation/zws_client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zwebsocket", .module = mod },
+            },
+        }),
+    });
+    const install_interop_client = b.addInstallArtifact(interop_client_exe, .{});
+
     const test_step = b.step("test", "Run zwebsocket tests");
     test_step.dependOn(&run_mod_tests.step);
 
@@ -73,4 +101,42 @@ pub fn build(b: *std.Build) void {
 
     const bench_server_step = b.step("bench-server", "Build the standalone websocket benchmark server");
     bench_server_step.dependOn(&install_bench_server.step);
+
+    const example_server_step = b.step("example-echo-server", "Build the example websocket echo server");
+    example_server_step.dependOn(&install_echo_server.step);
+
+    const interop_client_step = b.step("interop-client", "Build the websocket interoperability client");
+    interop_client_step.dependOn(&install_interop_client.step);
+
+    const interop_run = b.addSystemCommand(&.{"python3"});
+    interop_run.step.dependOn(&install_echo_server.step);
+    interop_run.step.dependOn(&install_interop_client.step);
+    interop_run.addFileArg(b.path("validation/run_interop.py"));
+    interop_run.addArg("--server-bin");
+    interop_run.addArg(b.getInstallPath(.bin, "zwebsocket-echo-server"));
+    interop_run.addArg("--client-bin");
+    interop_run.addArg(b.getInstallPath(.bin, "zwebsocket-interop-client"));
+    const interop_step = b.step("interop", "Run the websocket interoperability matrix");
+    interop_step.dependOn(&interop_run.step);
+
+    const soak_run = b.addSystemCommand(&.{"python3"});
+    soak_run.step.dependOn(&install_echo_server.step);
+    soak_run.addFileArg(b.path("validation/soak.py"));
+    soak_run.addArg("--server-bin");
+    soak_run.addArg(b.getInstallPath(.bin, "zwebsocket-echo-server"));
+    const soak_compressed = b.addSystemCommand(&.{"python3"});
+    soak_compressed.step.dependOn(&install_echo_server.step);
+    soak_compressed.addFileArg(b.path("validation/soak.py"));
+    soak_compressed.addArg("--server-bin");
+    soak_compressed.addArg(b.getInstallPath(.bin, "zwebsocket-echo-server"));
+    soak_compressed.addArg("--compression");
+    const soak_step = b.step("soak", "Run websocket soak tests against the example server");
+    soak_step.dependOn(&soak_run.step);
+    soak_step.dependOn(&soak_compressed.step);
+
+    const validate_step = b.step("validate", "Run tests, interop, and soak validation");
+    validate_step.dependOn(&run_mod_tests.step);
+    validate_step.dependOn(&interop_run.step);
+    validate_step.dependOn(&soak_run.step);
+    validate_step.dependOn(&soak_compressed.step);
 }

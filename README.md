@@ -1,6 +1,6 @@
 # 🚀 zwebsocket
 
-Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame hot path, strict handshake validation, and `zhttp` integration helpers.
+Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame hot path, strict handshake validation, `permessage-deflate`, and `zhttp` integration helpers.
 
 ![zig](https://img.shields.io/badge/zig-0.16.0--dev-f7a41d?logo=zig&logoColor=111)
 ![protocol](https://img.shields.io/badge/protocol-rfc%206455-0f766e)
@@ -13,9 +13,10 @@ Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame ho
 - 🏎 **Tight hot path**: `Conn(comptime static)` specializes role and policy at comptime to keep runtime branches out of the core path.
 - 📦 **Low-allocation reads**: stream frames chunk-by-chunk, read full frames, or borrow buffered payload slices when they fit.
 - 🧠 **Strict protocol checks**: rejects malformed control frames, invalid close payloads, bad UTF-8, bad mask bits, and non-minimal extended lengths.
+- 🗜 **`permessage-deflate`**: handshake negotiation plus compressed message read/write support, with `server_no_context_takeover` and `client_no_context_takeover`.
 - 🔁 **Convenience helpers**: `readMessage`, `echoFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, and `writeClose`.
 - 🪝 **`zhttp` helpers**: accept websocket upgrade requests from `zhttp` handlers and build `101 Switching Protocols` responses without re-parsing raw headers.
-- 🧪 **Benchmarks + tests**: benchmark harness and an extensive in-tree test suite live alongside the library.
+- 🧪 **Validation stack**: unit tests, fuzz/property tests, a cross-library interop matrix, soak runners, and benchmarks live alongside the library.
 
 ## 🚀 Quick Start
 
@@ -44,6 +45,12 @@ For explicit handshake validation on a raw stream:
 ```zig
 const accepted = try zws.acceptServerHandshake(req, .{});
 try zws.writeServerHandshakeResponse(writer, accepted);
+```
+
+For a full standalone echo server example:
+
+```bash
+zig build example-echo-server -- --port=9001 --compression
 ```
 
 ## 📦 Installation
@@ -76,6 +83,8 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
   `writeFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, `writeClose`, `flush`.
 - Handshake path:
   `computeAcceptKey`, `acceptServerHandshake`, `writeServerHandshakeResponse`, `serverHandshake`.
+- Compression path:
+  `PerMessageDeflate`, `PerMessageDeflateConfig`, `ServerHandshakeResponse.permessage_deflate`, `Config.permessage_deflate`.
 
 ## 🪝 `zhttp` Integration
 
@@ -113,14 +122,23 @@ fn upgrade(req: anytype) !zhttp.Res {
 
 The route must declare those websocket headers in its `zhttp` `.headers` schema so `req.header(...)` is available.
 
+## 📚 Docs
+
+- [`docs/API_STABILITY.md`](./docs/API_STABILITY.md): compatibility contract and which surfaces are stable vs provisional.
+- [`docs/TRANSPORTS.md`](./docs/TRANSPORTS.md): stream/runtime expectations, `zhttp` integration shape, and deployment notes.
+- [`docs/VALIDATION.md`](./docs/VALIDATION.md): fuzz/property tests, interop matrix, soak runners, and benchmark entry points.
+
 ## 📎 In-Tree Files
 
 - `src/root.zig`: public package surface
 - `src/conn.zig`: connection state machine and frame I/O
 - `src/handshake.zig`: server handshake validation and response generation
 - `src/zhttp_compat.zig`: `zhttp` adapter helpers
+- `src/extensions.zig`: extension negotiation helpers
 - `benchmark/bench.zig`: benchmark client
 - `benchmark/zwebsocket_server.zig`: standalone benchmark server
+- `examples/echo_server.zig`: standalone echo server example
+- `validation/`: interop peers and soak runners
 
 ## 🏁 Benchmarking
 
@@ -142,6 +160,9 @@ For benchmark details, see [`benchmark/README.md`](./benchmark/README.md).
 
 ```bash
 zig build test
+zig build interop
+zig build soak
+zig build validate
 zig build bench-server
 zig build bench-compare -Doptimize=ReleaseFast
 ```
@@ -152,6 +173,7 @@ zig build bench-compare -Doptimize=ReleaseFast
 
 - Server-side RFC 6455 handshake validation is included.
 - Connection state is synchronous and stream-oriented.
-- No TLS, HTTP server, or event loop abstraction is bundled.
-- `permessage-deflate` and extension negotiation are not implemented.
+- `permessage-deflate` is implemented and negotiated when enabled.
+- No TLS or HTTP server framework is bundled; use the raw stream API, `zhttp`, or the example server as the integration point.
 - The `zhttp` adapter targets the current upgrade-route model rather than trying to wrap all of `zhttp`.
+- Compression support links against system `zlib`. If you do not enable `permessage-deflate`, the core RFC 6455 path remains pure Zig.

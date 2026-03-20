@@ -59,7 +59,10 @@ pub fn acceptZhttpUpgrade(
 }
 
 pub fn responseHeaderCount(response: handshake.ServerHandshakeResponse) usize {
-    return 3 + @as(usize, @intFromBool(response.selected_subprotocol != null)) + response.extra_headers.len;
+    return 3 +
+        @as(usize, @intFromBool(response.selected_subprotocol != null)) +
+        @as(usize, @intFromBool(response.selected_extensions != null)) +
+        response.extra_headers.len;
 }
 
 pub fn fillResponseHeaders(
@@ -80,6 +83,11 @@ pub fn fillResponseHeaders(
 
     if (response.selected_subprotocol) |subprotocol| {
         dest[len] = .{ .name = "sec-websocket-protocol", .value = subprotocol };
+        len += 1;
+    }
+
+    if (response.selected_extensions) |selected_extensions| {
+        dest[len] = .{ .name = "sec-websocket-extensions", .value = selected_extensions };
         len += 1;
     }
 
@@ -169,6 +177,55 @@ test "requestFromZhttp accepts value and pointer request shapes" {
     try std.testing.expectEqualStrings(from_value.sec_websocket_key.?, from_ptr.sec_websocket_key.?);
 }
 
+test "requestFromZhttp reads all supported header accessors and http version" {
+    const FakeReq = struct {
+        method: []const u8,
+        base: struct { version: enum { http10, http11 } },
+        connection: ?[]const u8 = null,
+        upgrade: ?[]const u8 = null,
+        sec_websocket_key: ?[]const u8 = null,
+        sec_websocket_version: ?[]const u8 = null,
+        sec_websocket_protocol: ?[]const u8 = null,
+        sec_websocket_extensions: ?[]const u8 = null,
+        origin: ?[]const u8 = null,
+        host: ?[]const u8 = null,
+
+        pub fn header(self: *const @This(), comptime field: @EnumLiteral()) ?[]const u8 {
+            return switch (field) {
+                .connection => self.connection,
+                .upgrade => self.upgrade,
+                .sec_websocket_key => self.sec_websocket_key,
+                .sec_websocket_version => self.sec_websocket_version,
+                .sec_websocket_protocol => self.sec_websocket_protocol,
+                .sec_websocket_extensions => self.sec_websocket_extensions,
+                .origin => self.origin,
+                .host => self.host,
+                else => unreachable,
+            };
+        }
+    };
+
+    const req: FakeReq = .{
+        .method = "GET",
+        .base = .{ .version = .http10 },
+        .connection = "Upgrade",
+        .upgrade = "websocket",
+        .sec_websocket_key = "dGhlIHNhbXBsZSBub25jZQ==",
+        .sec_websocket_version = "13",
+        .sec_websocket_protocol = "chat",
+        .sec_websocket_extensions = "permessage-deflate",
+        .origin = "https://example.com",
+        .host = "example.com",
+    };
+
+    const converted = requestFromZhttp(req);
+    try std.testing.expect(!converted.is_http_11);
+    try std.testing.expectEqualStrings("chat", converted.sec_websocket_protocol.?);
+    try std.testing.expectEqualStrings("permessage-deflate", converted.sec_websocket_extensions.?);
+    try std.testing.expectEqualStrings("https://example.com", converted.origin.?);
+    try std.testing.expectEqualStrings("example.com", converted.host.?);
+}
+
 test "acceptZhttpUpgrade and makeUpgradeResponse match zhttp route needs" {
     const FakeReq = struct {
         method: []const u8,
@@ -178,6 +235,7 @@ test "acceptZhttpUpgrade and makeUpgradeResponse match zhttp route needs" {
         sec_websocket_key: ?[]const u8 = null,
         sec_websocket_version: ?[]const u8 = null,
         sec_websocket_protocol: ?[]const u8 = null,
+        sec_websocket_extensions: ?[]const u8 = null,
 
         pub fn header(self: *const @This(), comptime field: @EnumLiteral()) ?[]const u8 {
             return switch (field) {
@@ -186,7 +244,8 @@ test "acceptZhttpUpgrade and makeUpgradeResponse match zhttp route needs" {
                 .sec_websocket_key => self.sec_websocket_key,
                 .sec_websocket_version => self.sec_websocket_version,
                 .sec_websocket_protocol => self.sec_websocket_protocol,
-                .sec_websocket_extensions, .origin, .host => null,
+                .sec_websocket_extensions => self.sec_websocket_extensions,
+                .origin, .host => null,
                 else => unreachable,
             };
         }
@@ -210,19 +269,21 @@ test "acceptZhttpUpgrade and makeUpgradeResponse match zhttp route needs" {
         .sec_websocket_key = "dGhlIHNhbXBsZSBub25jZQ==",
         .sec_websocket_version = "13",
         .sec_websocket_protocol = "chat, superchat",
+        .sec_websocket_extensions = "permessage-deflate",
     };
 
     const accepted = try acceptZhttpUpgrade(req, .{
         .selected_subprotocol = "chat",
+        .enable_permessage_deflate = true,
         .extra_headers = &.{
             .{ .name = "x-trace-id", .value = "abc123" },
         },
     });
-    var headers: [5]FakeHeader = undefined;
+    var headers: [6]FakeHeader = undefined;
     const res = try makeUpgradeResponse(FakeRes, FakeHeader, headers[0..], accepted);
 
     try std.testing.expectEqual(std.http.Status.switching_protocols, res.status);
-    try std.testing.expectEqual(@as(usize, 5), res.headers.len);
+    try std.testing.expectEqual(@as(usize, 6), res.headers.len);
     try std.testing.expectEqualStrings("connection", res.headers[0].name);
     try std.testing.expectEqualStrings("Upgrade", res.headers[0].value);
     try std.testing.expectEqualStrings("upgrade", res.headers[1].name);
@@ -230,8 +291,13 @@ test "acceptZhttpUpgrade and makeUpgradeResponse match zhttp route needs" {
     try std.testing.expectEqualStrings("sec-websocket-accept", res.headers[2].name);
     try std.testing.expectEqualStrings("sec-websocket-protocol", res.headers[3].name);
     try std.testing.expectEqualStrings("chat", res.headers[3].value);
-    try std.testing.expectEqualStrings("x-trace-id", res.headers[4].name);
-    try std.testing.expectEqualStrings("abc123", res.headers[4].value);
+    try std.testing.expectEqualStrings("sec-websocket-extensions", res.headers[4].name);
+    try std.testing.expectEqualStrings(
+        "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+        res.headers[4].value,
+    );
+    try std.testing.expectEqualStrings("x-trace-id", res.headers[5].name);
+    try std.testing.expectEqualStrings("abc123", res.headers[5].value);
 }
 
 test "responseHeaderCount and fillResponseHeaders handle optional headers being absent" {
@@ -242,6 +308,8 @@ test "responseHeaderCount and fillResponseHeaders handle optional headers being 
     const response: handshake.ServerHandshakeResponse = .{
         .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
         .selected_subprotocol = null,
+        .selected_extensions = null,
+        .permessage_deflate = null,
         .extra_headers = &.{},
     };
     var headers: [3]Header = undefined;
@@ -252,6 +320,19 @@ test "responseHeaderCount and fillResponseHeaders handle optional headers being 
     try std.testing.expectEqualStrings("connection", filled[0].name);
     try std.testing.expectEqualStrings("upgrade", filled[1].name);
     try std.testing.expectEqualStrings("sec-websocket-accept", filled[2].name);
+}
+
+test "responseHeaderCount includes subprotocol and extra headers" {
+    try std.testing.expectEqual(@as(usize, 7), responseHeaderCount(.{
+        .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
+        .selected_subprotocol = "chat",
+        .selected_extensions = "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+        .permessage_deflate = .{},
+        .extra_headers = &.{
+            .{ .name = "x-a", .value = "1" },
+            .{ .name = "x-b", .value = "2" },
+        },
+    }));
 }
 
 test "acceptZhttpUpgrade propagates handshake validation errors" {
@@ -298,6 +379,8 @@ test "fillResponseHeaders rejects too-small header buffers" {
         .{
             .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
             .selected_subprotocol = "chat",
+            .selected_extensions = null,
+            .permessage_deflate = null,
             .extra_headers = &.{},
         },
     ));
@@ -323,6 +406,8 @@ test "makeUpgradeResponse propagates header buffer sizing errors" {
         .{
             .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
             .selected_subprotocol = "chat",
+            .selected_extensions = null,
+            .permessage_deflate = null,
             .extra_headers = &.{},
         },
     ));
