@@ -69,6 +69,32 @@ pub fn build(b: *std.Build) void {
     });
     const install_echo_server = b.addInstallArtifact(echo_server_exe, .{});
 
+    const frame_echo_server_exe = b.addExecutable(.{
+        .name = "zwebsocket-frame-echo-server",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/frame_echo_server.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zwebsocket", .module = mod },
+            },
+        }),
+    });
+    const install_frame_echo_server = b.addInstallArtifact(frame_echo_server_exe, .{});
+
+    const client_exe = b.addExecutable(.{
+        .name = "zwebsocket-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("examples/ws_client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zwebsocket", .module = mod },
+            },
+        }),
+    });
+    const install_client = b.addInstallArtifact(client_exe, .{});
+
     const interop_client_exe = b.addExecutable(.{
         .name = "zwebsocket-interop-client",
         .root_module = b.createModule(.{
@@ -77,6 +103,14 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws_example_common", .module = b.createModule(.{
+                    .root_source_file = b.path("examples/common.zig"),
+                    .target = target,
+                    .optimize = optimize,
+                    .imports = &.{
+                        .{ .name = "zwebsocket", .module = mod },
+                    },
+                }) },
             },
         }),
     });
@@ -104,6 +138,17 @@ pub fn build(b: *std.Build) void {
 
     const example_server_step = b.step("example-echo-server", "Build the example websocket echo server");
     example_server_step.dependOn(&install_echo_server.step);
+
+    const example_frame_server_step = b.step("example-frame-echo-server", "Build the frame-oriented websocket echo server example");
+    example_frame_server_step.dependOn(&install_frame_echo_server.step);
+
+    const example_client_step = b.step("example-client", "Build the websocket client example");
+    example_client_step.dependOn(&install_client.step);
+
+    const examples_step = b.step("examples", "Build all zwebsocket examples");
+    examples_step.dependOn(&install_echo_server.step);
+    examples_step.dependOn(&install_frame_echo_server.step);
+    examples_step.dependOn(&install_client.step);
 
     const interop_client_step = b.step("interop-client", "Build the websocket interoperability client");
     interop_client_step.dependOn(&install_interop_client.step);

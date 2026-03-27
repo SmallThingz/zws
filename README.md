@@ -53,6 +53,18 @@ For a full standalone echo server example:
 zig build example-echo-server -- --port=9001 --compression
 ```
 
+For a frame-oriented echo server that stays on `echoFrame(...)`:
+
+```bash
+zig build example-frame-echo-server -- --port=9002
+```
+
+For a simple websocket client that performs the HTTP upgrade and then uses `zws.ClientConn`:
+
+```bash
+zig build example-client -- --host=127.0.0.1 --port=9001 --message=hello
+```
+
 ## 📦 Installation
 
 Add as a dependency:
@@ -175,6 +187,8 @@ const WsRunner = zws.adaptZhttpRunner(AppRunner, .{});
 - `benchmark/bench.zig`: benchmark client
 - `benchmark/zwebsocket_server.zig`: standalone benchmark server
 - `examples/echo_server.zig`: standalone echo server example
+- `examples/frame_echo_server.zig`: frame-level echo server example using `echoFrame`
+- `examples/ws_client.zig`: standalone client example with manual HTTP upgrade
 - `validation/`: interop peers and soak runners
 
 ## 🏁 Benchmarking
@@ -200,6 +214,7 @@ zig build test
 zig build interop
 zig build soak
 zig build validate
+zig build examples
 zig build bench-server
 zig build bench-compare -Doptimize=ReleaseFast
 ```

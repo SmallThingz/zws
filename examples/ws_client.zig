@@ -1,6 +1,6 @@
 const std = @import("std");
 const zws = @import("zwebsocket");
-const common = @import("zws_example_common");
+const common = @import("common.zig");
 
 const Io = common.Io;
 
@@ -9,21 +9,26 @@ const Config = struct {
     port: u16 = 9001,
     path: []const u8 = "/",
     compression: bool = false,
+    message: []const u8 = "hello from zwebsocket",
 };
 
 fn usage() void {
     std.debug.print(
-        \\zwebsocket-interop-client
+        \\zwebsocket-client
         \\
         \\Usage:
-        \\  zig build interop-client -- [options]
+        \\  zig build example-client -- [options]
         \\
         \\Options:
         \\  --host=127.0.0.1
         \\  --port=9001
         \\  --path=/
+        \\  --message=hello
         \\  --compression
         \\  --help
+        \\
+        \\This example performs the HTTP websocket client handshake manually and
+        \\then switches to `zws.ClientConn` for frame/message I/O.
         \\
     , .{});
 }
@@ -52,6 +57,8 @@ pub fn main(init: std.process.Init) !void {
                 cfg.port = try std.fmt.parseInt(u16, kv.val, 10);
             } else if (std.mem.eql(u8, kv.key, "path")) {
                 cfg.path = kv.val;
+            } else if (std.mem.eql(u8, kv.key, "message")) {
+                cfg.message = kv.val;
             } else {
                 return error.UnknownArg;
             }
@@ -78,7 +85,7 @@ pub fn main(init: std.process.Init) !void {
         try zws.parsePerMessageDeflate(header)
     else
         null;
-    const conn_cfg: zws.Config = .{
+    var conn = zws.ClientConn.init(&sr.interface, &sw.interface, .{
         .permessage_deflate = if (negotiated_permessage_deflate) |pmd|
             .{
                 .allocator = init.gpa,
@@ -86,32 +93,23 @@ pub fn main(init: std.process.Init) !void {
             }
         else
             null,
-    };
-    var conn = zws.ClientConn.init(&sr.interface, &sw.interface, conn_cfg);
+    });
 
-    const text_payload =
-        "zwebsocket interop text payload with enough repetition to exercise permessage-deflate";
-    try conn.writeText(text_payload);
+    try conn.writeText(cfg.message);
     try sw.interface.flush();
 
     var message_buf: [128 * 1024]u8 = undefined;
-    {
-        const message = try conn.readMessage(message_buf[0..]);
-        if (message.opcode != .text) return error.UnexpectedOpcode;
-        if (!std.mem.eql(u8, text_payload, message.payload)) return error.BadEcho;
-    }
+    const echoed = try conn.readMessage(message_buf[0..]);
+    if (echoed.opcode != .text) return error.UnexpectedOpcode;
+    std.debug.print("echoed text: {s}\n", .{echoed.payload});
 
-    var binary_payload: [256]u8 = undefined;
-    for (&binary_payload, 0..) |*b, i| b.* = @truncate((i * 13 + 7) & 0xff);
-    try conn.writeBinary(binary_payload[0..]);
+    try conn.writePing("demo");
     try sw.interface.flush();
-    {
-        const message = try conn.readMessage(message_buf[0..]);
-        if (message.opcode != .binary) return error.UnexpectedOpcode;
-        if (!std.mem.eql(u8, binary_payload[0..], message.payload)) return error.BadEcho;
-    }
+    const pong = try conn.readFrame(message_buf[0..]);
+    if (pong.header.opcode != .pong) return error.UnexpectedOpcode;
+    std.debug.print("pong payload: {s}\n", .{pong.payload});
 
-    try conn.writeClose(1000, "");
+    try conn.writeClose(1000, "done");
     try sw.interface.flush();
     _ = conn.readMessage(message_buf[0..]) catch {};
 }

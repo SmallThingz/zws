@@ -133,6 +133,18 @@ pub fn adaptZhttpRunner(comptime Runner: type, comptime opts: RunnerAdapterOptio
     if (opts.write_buffer_len == 0) @compileError("RunnerAdapterOptions.write_buffer_len must be > 0");
 
     const RunnerData = if (@hasDecl(Runner, "Data")) Runner.Data else void;
+    const DataHooks = if (@hasDecl(Runner, "Data")) struct {
+        pub const Data = Runner.Data;
+
+        pub fn initData() Data {
+            if (@hasDecl(Runner, "initData")) return Runner.initData();
+            return std.mem.zeroInit(Data, .{});
+        }
+
+        pub fn deinitData(gpa: Allocator, data: *Data) void {
+            if (@hasDecl(Runner, "deinitData")) Runner.deinitData(gpa, data);
+        }
+    } else struct {};
 
     const Common = struct {
         fn callAndHandle(io: Io, stream: Stream, result: anytype) void {
@@ -170,16 +182,9 @@ pub fn adaptZhttpRunner(comptime Runner: type, comptime opts: RunnerAdapterOptio
             const p0 = params[0].type orelse @compileError(@typeName(Runner) ++ ".run first param must be typed");
             const p3 = params[3].type orelse @compileError(@typeName(Runner) ++ ".run fourth param must be typed");
             if (p0 == Io) break :blk struct {
-                pub const Data = Runner.Data;
-
-                pub fn initData() Data {
-                    if (@hasDecl(Runner, "initData")) return Runner.initData();
-                    return std.mem.zeroInit(Data, .{});
-                }
-
-                pub fn deinitData(gpa: Allocator, data: *Data) void {
-                    if (@hasDecl(Runner, "deinitData")) Runner.deinitData(gpa, data);
-                }
+                pub const Data = DataHooks.Data;
+                pub const initData = DataHooks.initData;
+                pub const deinitData = DataHooks.deinitData;
 
                 pub fn run(io: Io, gpa: Allocator, stream: Stream, data: p3) void {
                     Common.callAndHandle(io, stream, @call(.auto, Runner.run, .{ io, gpa, stream, data }));
@@ -196,16 +201,9 @@ pub fn adaptZhttpRunner(comptime Runner: type, comptime opts: RunnerAdapterOptio
             const p4 = params[4].type orelse @compileError(@typeName(Runner) ++ ".run fifth param must be typed");
             _ = RunnerData;
             break :blk struct {
-                pub const Data = Runner.Data;
-
-                pub fn initData() Data {
-                    if (@hasDecl(Runner, "initData")) return Runner.initData();
-                    return std.mem.zeroInit(Data, .{});
-                }
-
-                pub fn deinitData(gpa: Allocator, data: *Data) void {
-                    if (@hasDecl(Runner, "deinitData")) Runner.deinitData(gpa, data);
-                }
+                pub const Data = DataHooks.Data;
+                pub const initData = DataHooks.initData;
+                pub const deinitData = DataHooks.deinitData;
 
                 pub fn run(ctx: p0, io: Io, gpa: Allocator, stream: Stream, data: p4) void {
                     Common.callAndHandle(io, stream, @call(.auto, Runner.run, .{ ctx, io, gpa, stream, data }));
@@ -218,12 +216,12 @@ pub fn adaptZhttpRunner(comptime Runner: type, comptime opts: RunnerAdapterOptio
 
 fn openLoopbackPair(io: std.Io) !struct { client: std.Io.net.Stream, server: std.Io.net.Stream } {
     const addr0: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(0) };
-    var listener = try std.Io.net.IpAddress.listen(addr0, io, .{ .reuse_address = true });
+    var listener = try std.Io.net.IpAddress.listen(&addr0, io, .{ .reuse_address = true });
     defer listener.deinit(io);
 
     const port: u16 = listener.socket.address.getPort();
     const addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(port) };
-    const client = try std.Io.net.IpAddress.connect(addr, io, .{ .mode = .stream });
+    const client = try std.Io.net.IpAddress.connect(&addr, io, .{ .mode = .stream });
     errdefer client.close(io);
     const server = try listener.accept(io);
     return .{ .client = client, .server = server };

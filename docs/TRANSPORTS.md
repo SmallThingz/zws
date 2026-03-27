@@ -52,7 +52,9 @@ That keeps the runtime model simple and avoids cross-message compressor state.
 
 For a real integration reference, use:
 
-- `examples/echo_server.zig` for a standalone raw-stream server
+- `examples/echo_server.zig` for a message-oriented raw-stream server
+- `examples/frame_echo_server.zig` for a frame-oriented raw-stream server
+- `examples/ws_client.zig` for a client-side handshake plus `ClientConn` flow
 - `src/zhttp_compat.zig` plus the README example for `zhttp`
 
 Production callers should still decide their own:

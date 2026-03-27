@@ -22,7 +22,7 @@ pub const sync_flush = c.Z_SYNC_FLUSH;
 pub const full_flush = c.Z_FULL_FLUSH;
 
 fn zalloc(_: ?*anyopaque, items: c_uint, size: c_uint) callconv(.c) ?*anyopaque {
-    const total = @as(usize, items) * @as(usize, size);
+    const total = std.math.mul(usize, @as(usize, items), @as(usize, size)) catch return null;
     return c.malloc(total);
 }
 
@@ -65,7 +65,7 @@ pub fn deflateMessage(
     var chunk: [1024]u8 = undefined;
     while (true) {
         stream.next_out = @ptrCast(&chunk[0]);
-        stream.avail_out = zlibCounter(chunk.len) catch unreachable;
+        stream.avail_out = @as(c_uint, @intCast(chunk.len));
 
         const rc = c.deflate(&stream, @intCast(flush_mode));
         if (rc != c.Z_OK) return error.DeflateFailed;

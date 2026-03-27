@@ -5,25 +5,26 @@ const common = @import("common.zig");
 const Io = common.Io;
 
 const Config = struct {
-    port: u16 = 9001,
+    port: u16 = 9002,
     compression: bool = false,
-    max_frame_payload_len: u64 = 1024 * 1024,
-    max_message_payload_len: usize = 1024 * 1024,
+    max_frame_payload_len: u64 = 128 * 1024,
 };
 
 fn usage() void {
     std.debug.print(
-        \\zwebsocket-echo-server
+        \\zwebsocket-frame-echo-server
         \\
         \\Usage:
-        \\  zig build example-echo-server -- [options]
+        \\  zig build example-frame-echo-server -- [options]
         \\
         \\Options:
-        \\  --port=9001
+        \\  --port=9002
         \\  --compression
-        \\  --max-frame=1048576
-        \\  --max-message=1048576
+        \\  --max-frame=131072
         \\  --help
+        \\
+        \\This example stays on the frame API and uses `echoFrame(...)` instead of
+        \\reassembling full messages with `readMessage(...)`.
         \\
     , .{});
 }
@@ -34,6 +35,7 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void
 
     var read_buf: [64 * 1024]u8 = undefined;
     var write_buf: [16 * 1024]u8 = undefined;
+    var scratch: [128 * 1024]u8 = undefined;
 
     var sr = stream.reader(io, &read_buf);
     var sw = stream.writer(io, &write_buf);
@@ -42,35 +44,21 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void
     const accepted = zws.serverHandshake(&sw.interface, req, .{
         .enable_permessage_deflate = cfg.compression,
     }) catch return;
+    _ = accepted;
     sw.interface.flush() catch return;
 
-    const conn_cfg: zws.Config = .{
+    var conn = zws.ServerConn.init(&sr.interface, &sw.interface, .{
         .max_frame_payload_len = cfg.max_frame_payload_len,
-        .max_message_payload_len = cfg.max_message_payload_len,
-        .permessage_deflate = if (accepted.permessage_deflate) |pmd|
-            .{
-                .allocator = std.heap.page_allocator,
-                .negotiated = pmd,
-            }
-        else
-            null,
-    };
-    var conn = zws.ServerConn.init(&sr.interface, &sw.interface, conn_cfg);
-    var message_buf: [128 * 1024]u8 = undefined;
+    });
 
     while (true) {
-        const message = conn.readMessage(message_buf[0..]) catch |err| switch (err) {
+        _ = conn.echoFrame(scratch[0..]) catch |err| switch (err) {
             error.EndOfStream, error.ConnectionClosed => return,
             else => {
                 common.closeForProtocolError(&conn, &sw.interface, err);
                 return;
             },
         };
-
-        switch (message.opcode) {
-            .text => conn.writeText(message.payload) catch return,
-            .binary => conn.writeBinary(message.payload) catch return,
-        }
         sw.interface.flush() catch return;
     }
 }
@@ -97,8 +85,6 @@ pub fn main(init: std.process.Init) !void {
                 cfg.port = try std.fmt.parseInt(u16, kv.val, 10);
             } else if (std.mem.eql(u8, kv.key, "max-frame")) {
                 cfg.max_frame_payload_len = try std.fmt.parseInt(u64, kv.val, 10);
-            } else if (std.mem.eql(u8, kv.key, "max-message")) {
-                cfg.max_message_payload_len = try std.fmt.parseInt(usize, kv.val, 10);
             } else {
                 return error.UnknownArg;
             }
