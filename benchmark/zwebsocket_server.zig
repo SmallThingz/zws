@@ -159,7 +159,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     const addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(port) };
-    var listener = try std.Io.net.IpAddress.listen(addr, init.io, .{ .reuse_address = true });
+    var listener = try std.Io.net.IpAddress.listen(&addr, init.io, .{ .reuse_address = true });
     defer listener.deinit(init.io);
 
     var group: Io.Group = .init;

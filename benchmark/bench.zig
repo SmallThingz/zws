@@ -212,7 +212,7 @@ fn connectAndWarmup(
     for (states) |*st| {
         st.read_buf = try a.alloc(u8, 64 * 1024);
         st.write_buf = try a.alloc(u8, 4096);
-        st.stream = try std.Io.net.IpAddress.connect(address, io, .{ .mode = .stream });
+        st.stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
         setTcpNoDelay(&st.stream);
         try warmConnection(io, st, handshake_request, frame_bytes, response_bytes, warmup);
     }
