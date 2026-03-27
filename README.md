@@ -99,9 +99,7 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
 
 ## 📚 Docs
 
-- [`docs/API_STABILITY.md`](./docs/API_STABILITY.md): compatibility contract and which surfaces are stable vs provisional.
-- [`docs/TRANSPORTS.md`](./docs/TRANSPORTS.md): stream/runtime expectations and deployment notes.
-- [`docs/VALIDATION.md`](./docs/VALIDATION.md): fuzz/property tests, interop matrix, soak runners, and benchmark entry points.
+- [`DOCUMENTATION.md`](./DOCUMENTATION.md): API stability, transport/runtime expectations, deployment notes, and validation entry points.
 
 ## 📎 In-Tree Files
 
