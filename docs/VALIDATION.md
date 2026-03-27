@@ -8,7 +8,7 @@
 zig build test
 ```
 
-This covers protocol parsing, close handling, masking, fragmentation, handshake validation, `zhttp` adapter behavior, and compression helpers.
+This covers protocol parsing, close handling, masking, fragmentation, handshake validation, and compression helpers.
 
 ## 2. Fuzz + Property Tests
 

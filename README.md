@@ -1,6 +1,6 @@
 # 🚀 zwebsocket
 
-Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame hot path, strict handshake validation, `permessage-deflate`, and `zhttp` integration helpers.
+Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame hot path, strict handshake validation, and `permessage-deflate`.
 
 ![zig](https://img.shields.io/badge/zig-0.16.0--dev-f7a41d?logo=zig&logoColor=111)
 ![protocol](https://img.shields.io/badge/protocol-rfc%206455-0f766e)
@@ -15,7 +15,6 @@ Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame ho
 - 🧠 **Strict protocol checks**: rejects malformed control frames, invalid close payloads, bad UTF-8, bad mask bits, and non-minimal extended lengths.
 - 🗜 **`permessage-deflate`**: handshake negotiation plus compressed message read/write support, with `server_no_context_takeover` and `client_no_context_takeover`.
 - 🔁 **Convenience helpers**: `readMessage`, `echoFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, and `writeClose`.
-- 🪝 **`zhttp` helpers**: accept websocket upgrade requests from `zhttp` handlers, build `101 Switching Protocols` responses, and adapt upgrade runners so thrown errors become websocket close `1011`.
 - 🧪 **Validation stack**: unit tests, fuzz/property tests, a cross-library interop matrix, soak runners, and benchmarks live alongside the library.
 
 ## 🚀 Quick Start
@@ -98,83 +97,10 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
 - Compression path:
   `PerMessageDeflate`, `PerMessageDeflateConfig`, `ServerHandshakeResponse.permessage_deflate`, `Config.permessage_deflate`.
 
-## 🪝 `zhttp` Integration
-
-`zhttp` already provides the raw stream handoff needed for websocket upgrades. `zwebsocket` includes helpers for the current `zhttp` model:
-
-- `zws.zhttpRequest(req)` converts a `zhttp` upgrade request into `ServerHandshakeRequest`.
-- `zws.acceptZhttpUpgrade(req, opts)` validates the websocket handshake directly from a `zhttp` request.
-- `zws.fillZhttpResponseHeaders(...)` and `zws.makeZhttpUpgradeResponse(...)` build the `101` response header set.
-- `zws.adaptZhttpRunner(AppRunner, .{})` wraps an existing upgrade runner type and turns thrown runner errors into a best-effort websocket close `1011`.
-
-The integration is still two-phase:
-
-- the HTTP upgrade handler validates the request and returns the `101 Switching Protocols` response
-- the websocket runner owns the upgraded stream after takeover
-
-If you want thrown runner errors to become websocket close `1011`, wrap the runner type with `zws.adaptZhttpRunner(...)` and keep the runner body written as normal `!void`.
-
-Example handler shape:
-
-```zig
-const std = @import("std");
-const zhttp = @import("zhttp");
-const zws = @import("zwebsocket");
-
-const WsHeaders = struct {
-    connection: zhttp.parse.Optional(zhttp.parse.String),
-    upgrade: zhttp.parse.Optional(zhttp.parse.String),
-    sec_websocket_key: zhttp.parse.Optional(zhttp.parse.String),
-    sec_websocket_version: zhttp.parse.Optional(zhttp.parse.String),
-    sec_websocket_protocol: zhttp.parse.Optional(zhttp.parse.String),
-    sec_websocket_extensions: zhttp.parse.Optional(zhttp.parse.String),
-    origin: zhttp.parse.Optional(zhttp.parse.String),
-    host: zhttp.parse.Optional(zhttp.parse.String),
-};
-
-fn upgrade(req: anytype) !zhttp.Res {
-    const accepted = try zws.acceptZhttpUpgrade(req, .{});
-    const ZhttpHeader = std.meta.Child(@FieldType(zhttp.Res, "headers"));
-    var headers: [4]ZhttpHeader = undefined;
-    return try zws.makeZhttpUpgradeResponse(zhttp.Res, ZhttpHeader, headers[0..], accepted);
-}
-```
-
-The route must declare those websocket headers in its `zhttp` `.headers` schema so `req.header(...)` is available.
-
-Wrap the upgrade runner instead of changing its shape:
-
-```zig
-const AppRunner = struct {
-    pub const Data = struct {
-        compression: bool = false,
-    };
-
-    pub fn run(io: std.Io, _: std.mem.Allocator, stream: std.Io.net.Stream, data: *const Data) !void {
-        var owned_stream = stream;
-        var read_buf: [4096]u8 = undefined;
-        var write_buf: [4096]u8 = undefined;
-        var reader = owned_stream.reader(io, &read_buf);
-        var writer = owned_stream.writer(io, &write_buf);
-        var conn = zws.ServerConn.init(&reader.interface, &writer.interface, .{});
-        _ = data;
-
-        while (true) {
-            _ = try conn.echoFrame(read_buf[0..]);
-            try conn.flush();
-        }
-    }
-};
-
-const WsRunner = zws.adaptZhttpRunner(AppRunner, .{});
-```
-
-`WsRunner` is the type you hand to `zhttp` as `.upgrade = WsRunner`. If `AppRunner.run(...)` throws, the adapter catches it and best-effort writes close `1011` on the upgraded stream before returning.
-
 ## 📚 Docs
 
 - [`docs/API_STABILITY.md`](./docs/API_STABILITY.md): compatibility contract and which surfaces are stable vs provisional.
-- [`docs/TRANSPORTS.md`](./docs/TRANSPORTS.md): stream/runtime expectations, `zhttp` integration shape, and deployment notes.
+- [`docs/TRANSPORTS.md`](./docs/TRANSPORTS.md): stream/runtime expectations and deployment notes.
 - [`docs/VALIDATION.md`](./docs/VALIDATION.md): fuzz/property tests, interop matrix, soak runners, and benchmark entry points.
 
 ## 📎 In-Tree Files
@@ -182,7 +108,6 @@ const WsRunner = zws.adaptZhttpRunner(AppRunner, .{});
 - `src/root.zig`: public package surface
 - `src/conn.zig`: connection state machine and frame I/O
 - `src/handshake.zig`: server handshake validation and response generation
-- `src/zhttp_compat.zig`: `zhttp` adapter helpers
 - `src/extensions.zig`: extension negotiation helpers
 - `benchmark/bench.zig`: benchmark client
 - `benchmark/zwebsocket_server.zig`: standalone benchmark server
@@ -226,6 +151,5 @@ zig build bench-compare -Doptimize=ReleaseFast
 - Server-side RFC 6455 handshake validation is included.
 - Connection state is synchronous and stream-oriented.
 - `permessage-deflate` is implemented and negotiated when enabled.
-- No TLS or HTTP server framework is bundled; use the raw stream API, `zhttp`, or the example server as the integration point.
-- The `zhttp` adapter targets the current upgrade-route model rather than trying to wrap all of `zhttp`.
+- No TLS or HTTP server framework is bundled; use the raw stream API or the example server as the integration point.
 - Compression support links against system `zlib`. If you do not enable `permessage-deflate`, the core RFC 6455 path remains pure Zig.

@@ -13,15 +13,7 @@ The library expects:
 That makes it fit three common models:
 
 - raw `std.Io.net.Stream`
-- `zhttp` upgrade routes
 - custom runtimes that can hand over borrowed reader/writer pairs
-
-For `zhttp`, treat the integration as two distinct phases:
-
-- the HTTP handler validates the upgrade request and returns the `101 Switching Protocols` response
-- the upgrade runner owns the upgraded websocket stream after takeover
-
-If you want thrown upgrade-runner errors to become websocket close `1011`, wrap the runner type with `zws.adaptZhttpRunner(...)`. That preserves the runner's existing `run(...) !void` shape and moves the close-on-error handling into the adapter.
 
 ## Buffering
 
@@ -55,7 +47,6 @@ For a real integration reference, use:
 - `examples/echo_server.zig` for a message-oriented raw-stream server
 - `examples/frame_echo_server.zig` for a frame-oriented raw-stream server
 - `examples/ws_client.zig` for a client-side handshake plus `ClientConn` flow
-- `src/zhttp_compat.zig` plus the README example for `zhttp`
 
 Production callers should still decide their own:
 
@@ -64,4 +55,3 @@ Production callers should still decide their own:
 - timeouts and idle handling
 - logging and metrics
 - TLS termination
-- whether they want the default `adaptZhttpRunner(...)` error-to-`1011` behavior or a custom wrapper

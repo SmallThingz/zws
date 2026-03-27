@@ -10,7 +10,6 @@ The public exports in `src/root.zig` are the supported package API:
 - `ConnType`, `Conn`, `ServerConn`, `ClientConn`
 - frame/message read and write helpers
 - `PerMessageDeflate` and `PerMessageDeflateConfig`
-- `zhttp` compatibility helpers
 
 Within a patch release, those symbols and their documented semantics should not break.
 
@@ -21,7 +20,6 @@ These areas are still allowed to evolve more aggressively before `1.0`:
 - the exact shape of `Config` and `StaticConfig` if a feature needs another field
 - compression tuning knobs beyond the negotiated `permessage-deflate` parameters
 - validation/build helper steps under `zig build`
-- the `zhttp` adapter if `zhttp` itself changes its upgrade request surface
 
 If a breaking change lands in a provisional area, it should come with a migration note in the changelog or commit message.
 
