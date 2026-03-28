@@ -153,6 +153,14 @@ test "parsePerMessageDeflate parses negotiated parameters and rejects malformed 
     );
 }
 
+test "parseWindowBits accepts RFC range only" {
+    try std.testing.expectEqual(@as(u8, 8), try parseWindowBits("8"));
+    try std.testing.expectEqual(@as(u8, 15), try parseWindowBits("15"));
+    try std.testing.expectError(error.InvalidWindowBits, parseWindowBits("7"));
+    try std.testing.expectError(error.InvalidWindowBits, parseWindowBits("16"));
+    try std.testing.expectError(error.InvalidWindowBits, parseWindowBits("abc"));
+}
+
 test "PerMessageDeflate responseHeaderValue covers the supported parameter combinations" {
     const both = PerMessageDeflate{ .server_no_context_takeover = true, .client_no_context_takeover = true };
     const server_only = PerMessageDeflate{ .client_no_context_takeover = false };

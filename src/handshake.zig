@@ -125,7 +125,10 @@ pub fn acceptServerHandshake(
     var negotiated_permessage_deflate: ?extensions.PerMessageDeflate = null;
     if (opts.enable_permessage_deflate) {
         if (req.sec_websocket_extensions) |header_value| {
-            if (extensions.offersPerMessageDeflate(header_value)) {
+            const offered = extensions.parsePerMessageDeflate(header_value) catch {
+                return rejectHandshake(opts.observer, error.ExtensionsNotSupported);
+            };
+            if (offered != null) {
                 negotiated_permessage_deflate = opts.permessage_deflate;
             }
         }
@@ -290,6 +293,15 @@ test "acceptServerHandshake negotiates permessage-deflate when enabled and offer
     try std.testing.expect(response.permessage_deflate != null);
 }
 
+test "acceptServerHandshake rejects malformed permessage-deflate offers when negotiation is enabled" {
+    var req = validRequest();
+    req.sec_websocket_extensions = "permessage-deflate; server_max_window_bits=99";
+
+    try std.testing.expectError(error.ExtensionsNotSupported, acceptServerHandshake(req, .{
+        .enable_permessage_deflate = true,
+    }));
+}
+
 test "acceptServerHandshake accepts connection token with extra commas and spaces" {
     var req = validRequest();
     req.connection = "keep-alive, , Upgrade ,";
@@ -447,6 +459,28 @@ test "serverHandshake propagates writer errors" {
     var out: [8]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
     try std.testing.expectError(error.WriteFailed, serverHandshake(&writer, validRequest(), .{}));
+}
+
+test "rejectHandshake emits through the observer and returns the original error" {
+    const State = struct {
+        event: ?observe.Event = null,
+
+        fn onEvent(ctx: ?*anyopaque, event: observe.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.event = event;
+        }
+    };
+
+    var state: State = .{};
+    const observer: observe.Observer = .{
+        .ctx = &state,
+        .on_event_fn = State.onEvent,
+    };
+    try std.testing.expectEqual(error.ExtensionsNotSupported, rejectHandshake(observer, error.ExtensionsNotSupported));
+    switch (state.event.?) {
+        .handshake_rejected => |event| try std.testing.expectEqualStrings("ExtensionsNotSupported", event.name),
+        else => return error.TestExpectedEqual,
+    }
 }
 
 test "handshake observer sees accepted and rejected outcomes" {

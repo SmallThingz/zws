@@ -355,6 +355,43 @@ test "takeover helpers roundtrip multiple messages through shared compression st
     try std.testing.expectEqualStrings(m2, got2);
 }
 
+test "optionsFromLevel maps compression levels onto std.flate presets" {
+    try std.testing.expectEqual(flate.Compress.Options.fastest, optionsFromLevel(-1));
+    try std.testing.expectEqual(flate.Compress.Options.fastest, optionsFromLevel(1));
+    try std.testing.expectEqual(flate.Compress.Options.level_2, optionsFromLevel(2));
+    try std.testing.expectEqual(flate.Compress.Options.level_8, optionsFromLevel(8));
+    try std.testing.expectEqual(flate.Compress.Options.best, optionsFromLevel(9));
+}
+
+test "zalloc and zfree roundtrip raw allocations" {
+    const ptr = zalloc(null, 4, 8) orelse return error.OutOfMemory;
+    defer zfree(null, ptr);
+
+    const bytes: [*]u8 = @ptrCast(ptr);
+    for (0..32) |i| bytes[i] = @intCast(i);
+    for (0..32) |i| try std.testing.expectEqual(@as(u8, @intCast(i)), bytes[i]);
+}
+
+test "deflate and inflate helpers handle empty payloads across takeover and zlib paths" {
+    const compressed = try deflateMessage(std.testing.allocator, "", 1, sync_flush);
+    defer std.testing.allocator.free(compressed);
+    var out: [8]u8 = undefined;
+    const inflated = try inflateMessage(std.testing.allocator, compressed, out[0..]);
+    try std.testing.expectEqual(@as(usize, 0), inflated.len);
+
+    var deflater: TakeoverDeflater = undefined;
+    try deflater.init(std.testing.allocator, 1);
+    defer deflater.deinit();
+    var inflater: TakeoverInflater = undefined;
+    inflater.init();
+    defer inflater.deinit();
+
+    const takeover_compressed = try deflater.deflateMessage("");
+    defer std.testing.allocator.free(takeover_compressed);
+    const takeover_inflated = try inflater.inflateMessage(std.testing.allocator, takeover_compressed, out[0..]);
+    try std.testing.expectEqual(@as(usize, 0), takeover_inflated.len);
+}
+
 test "flateCounter rejects lengths that do not fit 32-bit counters" {
     try std.testing.expectEqual(@as(u32, 123), try flateCounter(123));
     try std.testing.expectError(error.CounterTooLarge, flateCounter(@as(usize, std.math.maxInt(u32)) + 1));

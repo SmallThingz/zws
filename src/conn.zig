@@ -1065,11 +1065,6 @@ fn appendTestFrame(
     try test_support.appendTestFrame(Opcode, out, a, opcode, fin, masked, payload, mask);
 }
 
-fn appendMalformedHeader(out: *std.ArrayList(u8), a: std.mem.Allocator, first: u8, second: u8) !void {
-    try out.append(a, first);
-    try out.append(a, second);
-}
-
 const test_small_binary_payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x42, 0x99, 0x01 };
 
 test "validateUtf8IfEnabled enforces comptime-enabled validation only" {
@@ -2390,6 +2385,177 @@ test "applyMask is reversible across chunk boundaries and offsets" {
     applyMask(payload[0..3], mask, 0);
     applyMask(payload[3..], mask, 3);
     try std.testing.expectEqualSlices(u8, original[0..], payload[0..]);
+}
+
+test "internal role and compression helpers follow negotiated takeover policy" {
+    const negotiated_takeover: extensions.PerMessageDeflate = .{
+        .server_no_context_takeover = false,
+        .client_no_context_takeover = false,
+    };
+    const negotiated_no_takeover: extensions.PerMessageDeflate = .{};
+
+    try std.testing.expectEqual(@as(i32, flate_backend.sync_flush), outgoingFlushMode(.client, negotiated_takeover));
+    try std.testing.expectEqual(@as(i32, flate_backend.full_flush), outgoingFlushMode(.client, negotiated_no_takeover));
+    try std.testing.expect(!outgoingNoContextTakeover(.client, negotiated_takeover));
+    try std.testing.expect(outgoingNoContextTakeover(.server, negotiated_no_takeover));
+    try std.testing.expect(!incomingNoContextTakeover(.server, negotiated_takeover));
+    try std.testing.expect(incomingNoContextTakeover(.client, negotiated_no_takeover));
+
+    const TakeoverConn = Conn(.{
+        .role = .client,
+        .permessage_deflate_context_takeover = true,
+        .permessage_deflate_min_payload_len = 1,
+        .permessage_deflate_require_compression_gain = false,
+    });
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var out: [256]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = TakeoverConn.init(&empty_reader, &writer, .{
+        .permessage_deflate = .{
+            .allocator = std.testing.allocator,
+            .negotiated = negotiated_takeover,
+            .compress_outgoing = true,
+        },
+    });
+
+    try std.testing.expect(conn.shouldUseOutgoingContextTakeover());
+    try std.testing.expect(conn.shouldUseIncomingContextTakeover());
+
+    const PlainConn = Conn(.{
+        .role = .client,
+        .permessage_deflate_context_takeover = true,
+        .permessage_deflate_min_payload_len = 1,
+        .permessage_deflate_require_compression_gain = false,
+    });
+    var plain_writer = Io.Writer.fixed(out[0..]);
+    var plain_conn = PlainConn.init(&empty_reader, &plain_writer, .{
+        .permessage_deflate = .{
+            .allocator = std.testing.allocator,
+            .negotiated = negotiated_no_takeover,
+            .compress_outgoing = true,
+        },
+    });
+    const compressed = try plain_conn.deflateMessage("hello hello hello again");
+    defer std.testing.allocator.free(compressed);
+    var inflated_buf: [64]u8 = undefined;
+    const inflated = try plain_conn.inflateMessage(compressed, inflated_buf[0..]);
+    try std.testing.expectEqualStrings("hello hello hello again", inflated);
+
+    plain_conn.deinit();
+    try std.testing.expect(plain_conn.send_takeover == null);
+    try std.testing.expect(plain_conn.recv_takeover == null);
+}
+
+test "internal header parsing and fragment bookkeeping helpers behave directly" {
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{}).init(&empty_reader, &writer, .{});
+
+    try std.testing.expect((try conn.parseHeaderBytes(&.{0x81})) == null);
+    try std.testing.expectError(error.ReservedBitsSet, conn.parseHeaderBytes(&.{ 0xC1, 0x80, 1, 2, 3, 4 }));
+
+    var compressed_conn = Conn(.{}).init(&empty_reader, &writer, .{
+        .permessage_deflate = .{
+            .allocator = std.testing.allocator,
+        },
+    });
+    const parsed = (try compressed_conn.parseHeaderBytes(&.{ 0xC1, 0x80, 1, 2, 3, 4 })).?;
+    try std.testing.expect(parsed.header.compressed);
+    try std.testing.expectEqual(Opcode.text, parsed.header.opcode);
+    try std.testing.expectEqual(@as(usize, 6), parsed.header_len);
+    try std.testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4 }, parsed.mask[0..]);
+
+    try conn.validateOutgoingSequence(.text, false);
+    try std.testing.expectEqual(MessageOpcode.text, conn.send_fragment_opcode.?);
+    try conn.validateOutgoingSequence(.continuation, true);
+    try std.testing.expect(conn.send_fragment_opcode == null);
+
+    conn.recv_active = true;
+    conn.recv_header = .{
+        .fin = false,
+        .masked = true,
+        .opcode = .text,
+        .payload_len = 2,
+    };
+    conn.recv_remaining = 0;
+    conn.finishActiveFrame();
+    try std.testing.expect(!conn.recv_active);
+    try std.testing.expectEqual(MessageOpcode.text, conn.recv_fragment_opcode.?);
+
+    conn.recv_active = true;
+    conn.recv_header = .{
+        .fin = true,
+        .masked = true,
+        .opcode = .continuation,
+        .payload_len = 1,
+    };
+    conn.recv_remaining = 0;
+    conn.finishActiveFrame();
+    try std.testing.expect(conn.recv_fragment_opcode == null);
+    try std.testing.expect(!conn.recv_fragment_compressed);
+}
+
+test "internal observer and discard helpers cover control flow directly" {
+    var observer_state: TestObserverState = .{};
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var out: [64]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&empty_reader, &writer, .{
+        .observer = observer_state.observer(),
+    });
+
+    conn.observeFrameRead(.{
+        .fin = true,
+        .masked = true,
+        .compressed = false,
+        .opcode = .binary,
+        .payload_len = 3,
+    }, true);
+    conn.observeFrameWrite(.text, 2, false, true);
+    conn.observeMessageRead(.binary, 7, false);
+    conn.observeControlReceived(.ping, "!");
+    conn.observeControlReceived(.pong, "?");
+    conn.observeControlReceived(.close, &.{ 0x03, 0xE8, 'o', 'k' });
+    conn.observeCloseSent(1000, 4);
+    conn.observeProtocolError(error.InvalidUtf8);
+
+    try std.testing.expectEqual(@as(usize, 8), observer_state.len);
+    switch (observer_state.events[0]) {
+        .frame_read => |event| try std.testing.expect(event.borrowed),
+        else => return error.TestExpectedEqual,
+    }
+    switch (observer_state.events[5]) {
+        .close_received => |event| try std.testing.expectEqual(@as(?u16, 1000), event.code),
+        else => return error.TestExpectedEqual,
+    }
+    switch (observer_state.events[7]) {
+        .protocol_error => |event| try std.testing.expectEqualStrings("InvalidUtf8", event.name),
+        else => return error.TestExpectedEqual,
+    }
+
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .ping, true, true, "!", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, "ok", .{ 5, 6, 7, 8 });
+    var reader = Io.Reader.fixed(wire.items);
+    var drain_out: [8]u8 = undefined;
+    var drain_writer = Io.Writer.fixed(drain_out[0..]);
+    var draining_conn = Conn(.{}).init(&reader, &drain_writer, .{});
+    draining_conn.recv_fragment_opcode = .text;
+    try std.testing.expect(!(try draining_conn.discardRemainingMessage()));
+    try std.testing.expect(draining_conn.recv_fragment_opcode == null);
+    try std.testing.expectEqualSlices(u8, &.{ 0x8A, 0x01, '!' }, drain_out[0..drain_writer.end]);
+
+    wire.clearRetainingCapacity();
+    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, "", .{ 9, 10, 11, 12 });
+    reader = Io.Reader.fixed(wire.items);
+    drain_writer = Io.Writer.fixed(drain_out[0..]);
+    draining_conn = Conn(.{}).init(&reader, &drain_writer, .{});
+    draining_conn.recv_fragment_opcode = .binary;
+    try std.testing.expect(try draining_conn.discardRemainingMessage());
+    try std.testing.expect(draining_conn.close_received);
+    try std.testing.expect(draining_conn.recv_fragment_opcode == null);
 }
 
 const TestObserverState = struct {
