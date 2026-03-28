@@ -45,10 +45,11 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize, msg_size: usiz
         64;
     const flush_every: usize = if (pipeline > 1) pipeline else 1;
 
-    var read_buf: [4 * 1024]u8 = undefined;
+    const read_buf_len: usize = if (pipeline > 1) 4 * 1024 else 512;
+    var read_storage: [4 * 1024]u8 = undefined;
     var write_storage: [16 * 1024]u8 = undefined;
 
-    var sr = stream.reader(io, &read_buf);
+    var sr = stream.reader(io, read_storage[0..read_buf_len]);
     var sw = stream.writer(io, write_storage[0..write_buf_len]);
 
     const req = common.parseHandshakeRequest(&sr.interface) catch return;
