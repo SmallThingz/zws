@@ -1070,6 +1070,8 @@ fn appendMalformedHeader(out: *std.ArrayList(u8), a: std.mem.Allocator, first: u
     try out.append(a, second);
 }
 
+const test_small_binary_payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x42, 0x99, 0x01 };
+
 test "validateUtf8IfEnabled enforces comptime-enabled validation only" {
     const invalid_utf8 = [_]u8{ 0xC3, 0x28 };
     try validateUtf8IfEnabled(false, invalid_utf8[0..]);
@@ -2253,8 +2255,6 @@ test "writeMessage skips non-beneficial compression when gain is required" {
         .permessage_deflate_min_payload_len = 1,
         .permessage_deflate_require_compression_gain = true,
     });
-    const payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x42, 0x99, 0x01 };
-
     var wire: [256]u8 = undefined;
     var writer = Io.Writer.fixed(wire[0..]);
     var empty_reader = Io.Reader.fixed(""[0..]);
@@ -2265,7 +2265,7 @@ test "writeMessage skips non-beneficial compression when gain is required" {
         },
     });
 
-    try conn.writeBinary(payload[0..]);
+    try conn.writeBinary(test_small_binary_payload[0..]);
     try std.testing.expectEqual(@as(u8, 0x82), wire[0]);
 }
 
@@ -2276,8 +2276,6 @@ test "writeMessage keeps compressed output when takeover mutates compressor stat
         .permessage_deflate_min_payload_len = 1,
         .permessage_deflate_require_compression_gain = true,
     });
-    const payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x42, 0x99, 0x01 };
-
     var wire: [256]u8 = undefined;
     var writer = Io.Writer.fixed(wire[0..]);
     var empty_reader = Io.Reader.fixed(""[0..]);
@@ -2293,7 +2291,7 @@ test "writeMessage keeps compressed output when takeover mutates compressor stat
     });
     defer conn.deinit();
 
-    try conn.writeBinary(payload[0..]);
+    try conn.writeBinary(test_small_binary_payload[0..]);
     try std.testing.expectEqual(@as(u8, 0xC2), wire[0]);
 }
 
@@ -2304,8 +2302,6 @@ test "writeMessage still applies gain-based fallback when takeover is negotiated
         .permessage_deflate_min_payload_len = 1,
         .permessage_deflate_require_compression_gain = true,
     });
-    const payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x42, 0x99, 0x01 };
-
     var wire: [256]u8 = undefined;
     var writer = Io.Writer.fixed(wire[0..]);
     var empty_reader = Io.Reader.fixed(""[0..]);
@@ -2321,7 +2317,7 @@ test "writeMessage still applies gain-based fallback when takeover is negotiated
     });
     defer conn.deinit();
 
-    try conn.writeBinary(payload[0..]);
+    try conn.writeBinary(test_small_binary_payload[0..]);
     try std.testing.expectEqual(@as(u8, 0x82), wire[0]);
 }
 
@@ -2330,8 +2326,6 @@ test "writeMessage can force compression even without size gain" {
         .permessage_deflate_min_payload_len = 1,
         .permessage_deflate_require_compression_gain = false,
     });
-    const payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x42, 0x99, 0x01 };
-
     var wire: [256]u8 = undefined;
     var writer = Io.Writer.fixed(wire[0..]);
     var empty_reader = Io.Reader.fixed(""[0..]);
@@ -2342,8 +2336,29 @@ test "writeMessage can force compression even without size gain" {
         },
     });
 
-    try conn.writeBinary(payload[0..]);
+    try conn.writeBinary(test_small_binary_payload[0..]);
     try std.testing.expectEqual(@as(u8, 0xC2), wire[0]);
+}
+
+test "writeMessage does not compress by default even when permessage-deflate is configured" {
+    const TunedConn = Conn(.{
+        .permessage_deflate_min_payload_len = 1,
+        .permessage_deflate_require_compression_gain = false,
+    });
+    const payload = "this payload is large enough to benefit from compression";
+
+    var wire: [512]u8 = undefined;
+    var writer = Io.Writer.fixed(wire[0..]);
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var conn = TunedConn.init(&empty_reader, &writer, .{
+        .permessage_deflate = .{
+            .allocator = std.testing.allocator,
+            // `compress_outgoing` defaults to false.
+        },
+    });
+
+    try conn.writeText(payload);
+    try std.testing.expectEqual(@as(u8, 0x81), wire[0]);
 }
 
 test "beginFrame rejects compressed control frames even when permessage-deflate is enabled" {

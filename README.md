@@ -156,6 +156,7 @@ zig build bench-compare -Doptimize=ReleaseFast
 - Connection state is synchronous and stream-oriented.
 - `permessage-deflate` is implemented and negotiated when enabled.
 - Compression is disabled by default (`Config.permessage_deflate = null`).
+- Even when negotiated, outgoing compression is opt-in (`PerMessageDeflateConfig.compress_outgoing = false` by default).
 - Context takeover support is disabled by default (`StaticConfig.permessage_deflate_context_takeover = false`).
 - When enabled, `StaticConfig` defaults (`permessage_deflate_min_payload_len = 64`, `permessage_deflate_require_compression_gain = true`) skip tiny messages and avoid non-beneficial compression.
 - No TLS or HTTP server framework is bundled; use the raw stream API or the example server as the integration point.
