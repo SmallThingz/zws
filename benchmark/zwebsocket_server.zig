@@ -45,7 +45,7 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize, msg_size: usiz
         64;
     const flush_every: usize = if (pipeline > 1) pipeline else 1;
 
-    const read_buf_len: usize = if (pipeline > 1) 4 * 1024 else 512;
+    const read_buf_len: usize = if (pipeline > 1) 4 * 1024 else 256;
     var read_storage: [4 * 1024]u8 = undefined;
     var write_storage: [16 * 1024]u8 = undefined;
 
