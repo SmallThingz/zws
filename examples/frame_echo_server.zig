@@ -44,11 +44,17 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void
     const accepted = zws.serverHandshake(&sw.interface, req, .{
         .enable_permessage_deflate = cfg.compression,
     }) catch return;
-    _ = accepted;
     sw.interface.flush() catch return;
 
     var conn = zws.ServerConn.init(&sr.interface, &sw.interface, .{
         .max_frame_payload_len = cfg.max_frame_payload_len,
+        .permessage_deflate = if (accepted.permessage_deflate) |pmd|
+            .{
+                .allocator = std.heap.page_allocator,
+                .negotiated = pmd,
+            }
+        else
+            null,
     });
 
     while (true) {

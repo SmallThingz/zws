@@ -66,6 +66,7 @@ pub const PerMessageDeflateConfig = struct {
     allocator: std.mem.Allocator,
     negotiated: extensions.PerMessageDeflate = .{},
     compression_level: i32 = 1,
+    compress_outgoing: bool = false,
 };
 
 pub const FrameHeader = struct {
@@ -631,7 +632,8 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn writeMessage(self: *Self, opcode: Opcode, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
-            if (self.config.permessage_deflate == null or payload.len == 0) {
+            const pmd = self.config.permessage_deflate;
+            if (pmd == null or payload.len == 0 or !pmd.?.compress_outgoing) {
                 try self.writeFrameInternal(opcode, payload, true, false);
                 return;
             }
@@ -645,7 +647,15 @@ pub fn Conn(comptime static: StaticConfig) type {
             defer compressionAllocator(self).free(compressed_payload);
 
             if (comptime permessage_deflate_require_compression_gain) {
-                if (compressed_payload.len >= payload.len) {
+                var can_skip_by_gain = true;
+                if (comptime permessage_deflate_context_takeover) {
+                    if (self.shouldUseOutgoingContextTakeover()) {
+                        // Takeover mode mutates compressor state per message, so once we compress
+                        // we must emit the compressed payload to keep both peers in sync.
+                        can_skip_by_gain = false;
+                    }
+                }
+                if (can_skip_by_gain and compressed_payload.len >= payload.len) {
                     try self.writeFrameInternal(opcode, payload, true, false);
                     return;
                 }
@@ -2107,6 +2117,7 @@ test "readMessage resumes fragmented messages after frame-level reads" {
 test "permessage-deflate client/server roundtrip preserves message payloads" {
     const pmd_cfg: PerMessageDeflateConfig = .{
         .allocator = std.testing.allocator,
+        .compress_outgoing = true,
     };
 
     var out: [1024]u8 = undefined;
@@ -2131,6 +2142,37 @@ test "permessage-deflate client/server roundtrip preserves message payloads" {
     try std.testing.expectEqualStrings(payload, message.payload);
 }
 
+test "permessage-deflate roundtrip preserves incompressible binary payloads" {
+    const pmd_cfg: PerMessageDeflateConfig = .{
+        .allocator = std.testing.allocator,
+        .compress_outgoing = true,
+    };
+
+    var binary_payload: [512]u8 = undefined;
+    for (&binary_payload, 0..) |*b, i| {
+        b.* = @truncate((i * 29 + 11) & 0xff);
+    }
+
+    var out: [4096]u8 = undefined;
+    var client_writer = Io.Writer.fixed(out[0..]);
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var client = Conn(.{ .role = .client }).init(&empty_reader, &client_writer, .{
+        .permessage_deflate = pmd_cfg,
+    });
+    try client.writeBinary(binary_payload[0..]);
+
+    var server_reader = Io.Reader.fixed(out[0..client_writer.end]);
+    var sink: [0]u8 = .{};
+    var server_writer = Io.Writer.fixed(sink[0..]);
+    var server = Conn(.{}).init(&server_reader, &server_writer, .{
+        .permessage_deflate = pmd_cfg,
+    });
+    var message_buf: [1024]u8 = undefined;
+    const message = try server.readMessage(message_buf[0..]);
+    try std.testing.expectEqual(MessageOpcode.binary, message.opcode);
+    try std.testing.expectEqualSlices(u8, binary_payload[0..], message.payload);
+}
+
 test "permessage-deflate context takeover roundtrip across multiple messages" {
     const TakeoverClient = Conn(.{
         .role = .client,
@@ -2151,6 +2193,7 @@ test "permessage-deflate context takeover roundtrip across multiple messages" {
     const pmd_cfg: PerMessageDeflateConfig = .{
         .allocator = std.testing.allocator,
         .negotiated = negotiated,
+        .compress_outgoing = true,
     };
 
     var wire: [2048]u8 = undefined;
@@ -2195,6 +2238,7 @@ test "writeMessage skips compression below configured payload threshold" {
     var conn = TunedConn.init(&empty_reader, &writer, .{
         .permessage_deflate = .{
             .allocator = std.testing.allocator,
+            .compress_outgoing = true,
         },
     });
 
@@ -2217,8 +2261,65 @@ test "writeMessage skips non-beneficial compression when gain is required" {
     var conn = TunedConn.init(&empty_reader, &writer, .{
         .permessage_deflate = .{
             .allocator = std.testing.allocator,
+            .compress_outgoing = true,
         },
     });
+
+    try conn.writeBinary(payload[0..]);
+    try std.testing.expectEqual(@as(u8, 0x82), wire[0]);
+}
+
+test "writeMessage keeps compressed output when takeover mutates compressor state" {
+    const TakeoverConn = Conn(.{
+        .role = .client,
+        .permessage_deflate_context_takeover = true,
+        .permessage_deflate_min_payload_len = 1,
+        .permessage_deflate_require_compression_gain = true,
+    });
+    const payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x42, 0x99, 0x01 };
+
+    var wire: [256]u8 = undefined;
+    var writer = Io.Writer.fixed(wire[0..]);
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var conn = TakeoverConn.init(&empty_reader, &writer, .{
+        .permessage_deflate = .{
+            .allocator = std.testing.allocator,
+            .negotiated = .{
+                .server_no_context_takeover = false,
+                .client_no_context_takeover = false,
+            },
+            .compress_outgoing = true,
+        },
+    });
+    defer conn.deinit();
+
+    try conn.writeBinary(payload[0..]);
+    try std.testing.expectEqual(@as(u8, 0xC2), wire[0]);
+}
+
+test "writeMessage still applies gain-based fallback when takeover is negotiated off" {
+    const TakeoverConn = Conn(.{
+        .role = .client,
+        .permessage_deflate_context_takeover = true,
+        .permessage_deflate_min_payload_len = 1,
+        .permessage_deflate_require_compression_gain = true,
+    });
+    const payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x42, 0x99, 0x01 };
+
+    var wire: [256]u8 = undefined;
+    var writer = Io.Writer.fixed(wire[0..]);
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var conn = TakeoverConn.init(&empty_reader, &writer, .{
+        .permessage_deflate = .{
+            .allocator = std.testing.allocator,
+            .negotiated = .{
+                .server_no_context_takeover = true,
+                .client_no_context_takeover = true,
+            },
+            .compress_outgoing = true,
+        },
+    });
+    defer conn.deinit();
 
     try conn.writeBinary(payload[0..]);
     try std.testing.expectEqual(@as(u8, 0x82), wire[0]);
@@ -2237,6 +2338,7 @@ test "writeMessage can force compression even without size gain" {
     var conn = TunedConn.init(&empty_reader, &writer, .{
         .permessage_deflate = .{
             .allocator = std.testing.allocator,
+            .compress_outgoing = true,
         },
     });
 

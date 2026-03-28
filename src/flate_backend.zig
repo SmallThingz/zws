@@ -71,9 +71,6 @@ pub const TakeoverDeflater = struct {
         self.compressor.writer.flush() catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
         };
-        self.compressor.writer.flush() catch |err| switch (err) {
-            error.WriteFailed => return error.OutOfMemory,
-        };
 
         const encoded = self.output.toOwnedSlice() catch return error.OutOfMemory;
         errdefer self.allocator.free(encoded);
@@ -86,12 +83,10 @@ pub const TakeoverInflater = struct {
     input_reader: std.Io.Reader = std.Io.Reader.fixed(""[0..]),
     decompressor: flate.Decompress = undefined,
     inflate_buf: [flate.max_window_len]u8 = undefined,
-    initialized: bool = false,
 
     pub fn init(self: *@This()) void {
         self.input_reader = std.Io.Reader.fixed(""[0..]);
         self.decompressor = .init(&self.input_reader, .raw, self.inflate_buf[0..]);
-        self.initialized = true;
     }
 
     pub fn deinit(_: *@This()) void {}
@@ -111,7 +106,7 @@ pub const TakeoverInflater = struct {
 
         var writer = std.Io.Writer.fixed(dest);
         while (true) {
-            const n = self.decompressor.reader.stream(&writer, .unlimited) catch |err| switch (err) {
+            _ = self.decompressor.reader.stream(&writer, .unlimited) catch |err| switch (err) {
                 error.WriteFailed => return error.MessageTooLarge,
                 error.EndOfStream => return error.InflateFailed,
                 error.ReadFailed => {
@@ -133,7 +128,6 @@ pub const TakeoverInflater = struct {
                     return error.InflateFailed;
                 },
             };
-            _ = n;
         }
     }
 };
@@ -168,7 +162,6 @@ pub fn deflateMessage(
     compressor.finish() catch |err| switch (err) {
         error.WriteFailed => return error.OutOfMemory,
     };
-
     return out.toOwnedSlice() catch return error.OutOfMemory;
 }
 
@@ -177,22 +170,39 @@ pub fn inflateMessage(
     compressed_payload: []const u8,
     dest: []u8,
 ) InflateError![]u8 {
-    _ = flateCounter(compressed_payload.len) catch return error.CounterTooLarge;
-    _ = flateCounter(dest.len) catch return error.CounterTooLarge;
-
-    // Accept RFC7692-style payloads that omit Z_SYNC_FLUSH tail by appending:
-    // - the stripped sync marker
-    // - a final empty stored block
     const compat_suffix = [_]u8{
         0x00, 0x00, 0xff, 0xff,
         0x01, 0x00, 0x00, 0xff,
         0xff,
     };
-    const input_len = std.math.add(usize, compressed_payload.len, compat_suffix.len) catch return error.CounterTooLarge;
+
+    // First attempt: RFC7692-style payloads that omit Z_SYNC_FLUSH tail.
+    const with_suffix = inflateWithSuffix(allocator, compressed_payload, dest, compat_suffix[0..]) catch |err| switch (err) {
+        error.InflateFailed => null,
+        else => return err,
+    };
+    if (with_suffix) |inflated| {
+        if (inflated.len != 0 or compressed_payload.len == 0) return inflated;
+    }
+
+    // Fallback for peers that emit complete raw-deflate streams per message.
+    return inflateWithSuffix(allocator, compressed_payload, dest, ""[0..]);
+}
+
+fn inflateWithSuffix(
+    allocator: std.mem.Allocator,
+    compressed_payload: []const u8,
+    dest: []u8,
+    suffix: []const u8,
+) InflateError![]u8 {
+    _ = flateCounter(compressed_payload.len) catch return error.CounterTooLarge;
+    _ = flateCounter(dest.len) catch return error.CounterTooLarge;
+
+    const input_len = std.math.add(usize, compressed_payload.len, suffix.len) catch return error.CounterTooLarge;
     const input = allocator.alloc(u8, input_len) catch return error.OutOfMemory;
     defer allocator.free(input);
     @memcpy(input[0..compressed_payload.len], compressed_payload);
-    @memcpy(input[compressed_payload.len..], compat_suffix[0..]);
+    @memcpy(input[compressed_payload.len..], suffix);
 
     var reader = std.Io.Reader.fixed(input);
     var inflate_buf: [flate.max_window_len]u8 = undefined;
@@ -217,6 +227,21 @@ test "flate permessage-deflate helpers roundtrip sync and full flush payloads" {
         const inflated = try inflateMessage(std.testing.allocator, compressed, out[0..]);
         try std.testing.expectEqualStrings(payload, inflated);
     }
+}
+
+test "deflateMessage and inflateMessage roundtrip binary data" {
+    var payload: [512]u8 = undefined;
+    for (&payload, 0..) |*b, i| {
+        b.* = @truncate((i * 29 + 11) & 0xff);
+    }
+
+    const compressed = try deflateMessage(std.testing.allocator, payload[0..], 1, sync_flush);
+    defer std.testing.allocator.free(compressed);
+    try std.testing.expect(compressed.len > 0);
+
+    var out: [1024]u8 = undefined;
+    const inflated = try inflateMessage(std.testing.allocator, compressed, out[0..]);
+    try std.testing.expectEqualSlices(u8, payload[0..], inflated);
 }
 
 test "inflateMessage accepts RFC7692 stripped sync-flush payloads" {
