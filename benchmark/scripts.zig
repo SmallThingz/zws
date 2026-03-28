@@ -87,9 +87,11 @@ pub fn runZwebsocketExternal(io: std.Io, allocator: std.mem.Allocator, cfg: Benc
 
     var port_buf: [16]u8 = undefined;
     var pipeline_buf: [32]u8 = undefined;
+    var size_buf: [32]u8 = undefined;
     const port_arg = try std.fmt.bufPrint(&port_buf, "--port={d}", .{cfg.port});
     const pipeline_arg = try std.fmt.bufPrint(&pipeline_buf, "--pipeline={d}", .{cfg.pipeline});
-    var server = try spawnBackground(io, &.{ server_path, port_arg, pipeline_arg }, root);
+    const size_arg = try std.fmt.bufPrint(&size_buf, "--msg-size={d}", .{cfg.msg_size});
+    var server = try spawnBackground(io, &.{ server_path, port_arg, pipeline_arg, size_arg }, root);
     defer terminateChild(io, &server);
 
     try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(200), .awake);

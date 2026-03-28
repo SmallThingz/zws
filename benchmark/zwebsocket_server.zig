@@ -16,7 +16,7 @@ fn usage() void {
         \\zwebsocket-bench-server
         \\
         \\Usage:
-        \\  zwebsocket-bench-server [--port=9001] [--pipeline=1]
+        \\  zwebsocket-bench-server [--port=9001] [--pipeline=1] [--msg-size=16]
         \\
     , .{});
 }
@@ -25,15 +25,28 @@ fn flushIfBuffered(w: *Io.Writer) Io.Writer.Error!void {
     if (w.buffered().len != 0) try w.flush();
 }
 
-fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize) Io.Cancelable!void {
+fn responseFrameLen(payload_len: usize) usize {
+    const header_len: usize = if (payload_len <= 125)
+        2
+    else if (payload_len <= std.math.maxInt(u16))
+        4
+    else
+        10;
+    return header_len + payload_len;
+}
+
+fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize, msg_size: usize) Io.Cancelable!void {
     defer stream.close(io);
     common.setTcpNoDelay(&stream);
 
-    const write_buf_len: usize = if (pipeline > 1) 4 * 1024 else 64;
+    const write_buf_len: usize = if (pipeline > 1)
+        @min(@max(responseFrameLen(msg_size) * pipeline, @as(usize, 64)), @as(usize, 16 * 1024))
+    else
+        64;
     const flush_every: usize = if (pipeline > 1) pipeline else 1;
 
     var read_buf: [4 * 1024]u8 = undefined;
-    var write_storage: [4 * 1024]u8 = undefined;
+    var write_storage: [16 * 1024]u8 = undefined;
 
     var sr = stream.reader(io, &read_buf);
     var sw = stream.writer(io, write_storage[0..write_buf_len]);
@@ -66,6 +79,7 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize) Io.Cancelable!
 pub fn main(init: std.process.Init) !void {
     var port: u16 = 9001;
     var pipeline: usize = 1;
+    var msg_size: usize = 16;
 
     var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer it.deinit();
@@ -82,6 +96,8 @@ pub fn main(init: std.process.Init) !void {
                 port = try std.fmt.parseInt(u16, kv.val, 10);
             } else if (std.mem.eql(u8, kv.key, "pipeline")) {
                 pipeline = try std.fmt.parseInt(usize, kv.val, 10);
+            } else if (std.mem.eql(u8, kv.key, "msg-size")) {
+                msg_size = try std.fmt.parseInt(usize, kv.val, 10);
             } else {
                 return error.UnknownArg;
             }
@@ -104,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
             error.Canceled => return,
             else => return,
         };
-        group.concurrent(init.io, handleConn, .{ init.io, stream, pipeline }) catch {
+        group.concurrent(init.io, handleConn, .{ init.io, stream, pipeline, msg_size }) catch {
             stream.close(init.io);
         };
     }
