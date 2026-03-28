@@ -3,6 +3,7 @@ const Io = std.Io;
 
 const proto = @import("protocol.zig");
 const extensions = @import("extensions.zig");
+const observe = @import("observe.zig");
 const zlib_backend = @import("zlib_backend.zig");
 
 const control_payload_max_len = 125;
@@ -31,6 +32,7 @@ pub const ProtocolError = error{
     InvalidUtf8,
     InvalidCompressedMessage,
     ConnectionClosed,
+    Timeout,
     FragmentWriteInProgress,
     UnexpectedContinuationWrite,
     OutOfMemory,
@@ -47,6 +49,8 @@ pub const Config = struct {
     max_frame_payload_len: u64 = std.math.maxInt(u64),
     max_message_payload_len: usize = std.math.maxInt(usize),
     permessage_deflate: ?PerMessageDeflateConfig = null,
+    timeouts: observe.TimeoutConfig = .{},
+    observer: ?observe.Observer = null,
 };
 
 pub const PerMessageDeflateConfig = struct {
@@ -123,6 +127,11 @@ pub fn Conn(comptime static: StaticConfig) type {
 
         const Self = @This();
         const masked_write_scratch_len = 4096;
+        const TimedOp = struct {
+            phase: observe.IoPhase,
+            start_ns: u64,
+            budget_ns: u64,
+        };
 
         pub fn init(reader: *Io.Reader, writer: *Io.Writer, config: Config) Self {
             const seed = nextMaskSeed() ^
@@ -144,18 +153,158 @@ pub fn Conn(comptime static: StaticConfig) type {
             return Seed.value;
         }
 
-        pub fn flush(self: *Self) Io.Writer.Error!void {
+        pub fn flush(self: *Self) (ProtocolError || Io.Writer.Error)!void {
+            try self.flushTimed();
+        }
+
+        fn emit(self: *const Self, event: observe.Event) void {
+            if (self.config.observer) |observer| observer.emit(event);
+        }
+
+        fn beginTimedOp(self: *const Self, phase: observe.IoPhase) ?TimedOp {
+            const budget_ns = switch (phase) {
+                .read => self.config.timeouts.read_ns,
+                .write => self.config.timeouts.write_ns,
+                .flush => self.config.timeouts.flush_ns,
+            } orelse return null;
+
+            const start_ns = self.config.timeouts.clock.nowNs();
+            const deadline_ns = std.math.add(u64, start_ns, budget_ns) catch std.math.maxInt(u64);
+            if (self.config.timeouts.deadlines) |deadlines| switch (phase) {
+                .read => deadlines.setReadDeadlineNs(deadline_ns),
+                .write => deadlines.setWriteDeadlineNs(deadline_ns),
+                .flush => deadlines.setFlushDeadlineNs(deadline_ns),
+            };
+
+            return .{
+                .phase = phase,
+                .start_ns = start_ns,
+                .budget_ns = budget_ns,
+            };
+        }
+
+        fn clearTimedOp(self: *const Self, phase: observe.IoPhase) void {
+            if (self.config.timeouts.deadlines) |deadlines| switch (phase) {
+                .read => deadlines.setReadDeadlineNs(null),
+                .write => deadlines.setWriteDeadlineNs(null),
+                .flush => deadlines.setFlushDeadlineNs(null),
+            };
+        }
+
+        fn finishTimedOp(self: *const Self, timed: ?TimedOp) ProtocolError!void {
+            const op = timed orelse return;
+            const elapsed_ns = self.config.timeouts.clock.nowNs() -| op.start_ns;
+            if (elapsed_ns > op.budget_ns) {
+                self.emit(.{ .timeout = .{
+                    .phase = op.phase,
+                    .budget_ns = op.budget_ns,
+                    .elapsed_ns = elapsed_ns,
+                } });
+                return error.Timeout;
+            }
+        }
+
+        fn peekGreedyTimed(self: *Self, n: usize) (ProtocolError || Io.Reader.Error)![]const u8 {
+            const timed = self.beginTimedOp(.read);
+            defer self.clearTimedOp(.read);
+            const out = try self.reader.peekGreedy(n);
+            try self.finishTimedOp(timed);
+            return out;
+        }
+
+        fn peekTimed(self: *Self, n: usize) (ProtocolError || Io.Reader.Error)![]const u8 {
+            const timed = self.beginTimedOp(.read);
+            defer self.clearTimedOp(.read);
+            const out = try self.reader.peek(n);
+            try self.finishTimedOp(timed);
+            return out;
+        }
+
+        fn readSliceAllTimed(self: *Self, dest: []u8) (ProtocolError || Io.Reader.Error)!void {
+            const timed = self.beginTimedOp(.read);
+            defer self.clearTimedOp(.read);
+            try self.reader.readSliceAll(dest);
+            try self.finishTimedOp(timed);
+        }
+
+        fn writeAllTimed(self: *Self, bytes: []const u8) (ProtocolError || Io.Writer.Error)!void {
+            const timed = self.beginTimedOp(.write);
+            defer self.clearTimedOp(.write);
+            try self.writer.writeAll(bytes);
+            try self.finishTimedOp(timed);
+        }
+
+        fn flushTimed(self: *Self) (ProtocolError || Io.Writer.Error)!void {
+            const timed = self.beginTimedOp(.flush);
+            defer self.clearTimedOp(.flush);
             try self.writer.flush();
+            try self.finishTimedOp(timed);
+        }
+
+        fn observeFrameRead(self: *const Self, header: FrameHeader, borrowed: bool) void {
+            self.emit(.{ .frame_read = .{
+                .opcode = header.opcode,
+                .payload_len = header.payload_len,
+                .fin = header.fin,
+                .compressed = header.compressed,
+                .borrowed = borrowed,
+            } });
+        }
+
+        fn observeFrameWrite(self: *const Self, opcode: Opcode, payload_len: usize, fin: bool, compressed: bool) void {
+            self.emit(.{ .frame_write = .{
+                .opcode = opcode,
+                .payload_len = payload_len,
+                .fin = fin,
+                .compressed = compressed,
+            } });
+        }
+
+        fn observeMessageRead(self: *const Self, opcode: MessageOpcode, payload_len: usize, compressed: bool) void {
+            self.emit(.{ .message_read = .{
+                .opcode = opcode,
+                .payload_len = payload_len,
+                .compressed = compressed,
+            } });
+        }
+
+        fn observeControlReceived(self: *const Self, opcode: Opcode, payload: []const u8) void {
+            switch (opcode) {
+                .ping => self.emit(.{ .ping_received = .{ .payload_len = payload.len } }),
+                .pong => self.emit(.{ .pong_received = .{ .payload_len = payload.len } }),
+                .close => {
+                    const close_frame: CloseFrame = parseClosePayload(payload, validate_utf8) catch .{};
+                    self.emit(.{ .close_received = .{
+                        .code = close_frame.code,
+                        .payload_len = payload.len,
+                    } });
+                },
+                else => {},
+            }
+        }
+
+        fn observeCloseSent(self: *const Self, code: ?u16, payload_len: usize) void {
+            self.emit(.{ .close_sent = .{
+                .code = code,
+                .payload_len = payload_len,
+            } });
+        }
+
+        fn observeProtocolError(self: *const Self, err: ProtocolError) void {
+            self.emit(.{ .protocol_error = .{ .name = @errorName(err) } });
         }
 
         pub fn beginFrame(self: *Self) (ProtocolError || Io.Reader.Error)!FrameHeader {
             if (self.recv_active) return error.FrameActive;
 
-            const available = try self.reader.peekGreedy(2);
-            const prefix = if (available.len >= 2) available else try self.reader.peek(2);
+            const available = try self.peekGreedyTimed(2);
+            const prefix = if (available.len >= 2) available else try self.peekTimed(2);
             const header_need = neededHeaderLen(prefix[1]);
-            const header_bytes = if (prefix.len >= header_need) prefix else try self.reader.peek(header_need);
-            const parsed = (try self.parseHeaderBytes(header_bytes)).?;
+            const header_bytes = if (prefix.len >= header_need) prefix else try self.peekTimed(header_need);
+            const parsed = (self.parseHeaderBytes(header_bytes) catch |err| {
+                self.observeProtocolError(err);
+                return err;
+            }).?;
 
             self.reader.toss(parsed.header_len);
             self.recv_active = true;
@@ -169,22 +318,26 @@ pub fn Conn(comptime static: StaticConfig) type {
         pub fn beginFrameBorrowed(self: *Self) (ProtocolError || Io.Reader.Error)!?BorrowedFrame {
             if (self.recv_active) return error.FrameActive;
 
-            const available = try self.reader.peekGreedy(2);
-            const prefix = if (available.len >= 2) available else try self.reader.peek(2);
+            const available = try self.peekGreedyTimed(2);
+            const prefix = if (available.len >= 2) available else try self.peekTimed(2);
             const header_need = neededHeaderLen(prefix[1]);
             if (header_need > self.reader.buffer.len) return null;
 
-            const header_bytes = if (prefix.len >= header_need) prefix else try self.reader.peek(header_need);
-            const parsed = (try self.parseHeaderBytes(header_bytes)).?;
+            const header_bytes = if (prefix.len >= header_need) prefix else try self.peekTimed(header_need);
+            const parsed = (self.parseHeaderBytes(header_bytes) catch |err| {
+                self.observeProtocolError(err);
+                return err;
+            }).?;
             const payload_len: usize = std.math.cast(usize, parsed.header.payload_len) orelse return null;
             const total_len = std.math.add(usize, parsed.header_len, payload_len) catch return null;
             if (total_len > self.reader.buffer.len) return null;
 
-            const frame_bytes = try self.reader.peek(total_len);
-            const payload = frame_bytes[parsed.header_len..][0..payload_len];
+            const frame_bytes = try self.peekTimed(total_len);
+            const payload: []u8 = @constCast(frame_bytes[parsed.header_len..][0..payload_len]);
             if (parsed.header.masked) applyMask(payload, parsed.mask, 0);
             self.reader.toss(total_len);
             self.noteConsumedFrame(parsed.header);
+            self.observeFrameRead(parsed.header, true);
 
             return .{
                 .header = parsed.header,
@@ -206,7 +359,7 @@ pub fn Conn(comptime static: StaticConfig) type {
 
             const remaining = std.math.cast(usize, self.recv_remaining) orelse std.math.maxInt(usize);
             const n: usize = @min(dest.len, remaining);
-            try self.reader.readSliceAll(dest[0..n]);
+            try self.readSliceAllTimed(dest[0..n]);
             if (self.recv_header.masked) applyMask(dest[0..n], self.recv_mask, self.recv_mask_offset);
 
             self.recv_remaining -= n;
@@ -256,9 +409,13 @@ pub fn Conn(comptime static: StaticConfig) type {
                 const header = try self.beginFrame();
                 if (proto.isControl(header.opcode)) {
                     const payload = try self.readFrameAll(control_buf[0..]);
+                    self.observeControlReceived(header.opcode, payload);
                     switch (header.opcode) {
                         .ping => if (comptime auto_pong) {
-                            if (!self.close_sent) try self.writePong(payload);
+                            if (!self.close_sent) {
+                                try self.writePong(payload);
+                                self.emit(.{ .auto_pong_sent = .{ .payload_len = payload.len } });
+                            }
                         },
                         .pong => {},
                         .close => {
@@ -306,6 +463,7 @@ pub fn Conn(comptime static: StaticConfig) type {
                     if (comptime validate_utf8) {
                         if (final_opcode == .text and !std.unicode.utf8ValidateSlice(inflated)) return error.InvalidUtf8;
                     }
+                    self.observeMessageRead(final_opcode, inflated.len, true);
                     return .{
                         .opcode = final_opcode,
                         .payload = inflated,
@@ -330,6 +488,7 @@ pub fn Conn(comptime static: StaticConfig) type {
                 if (comptime validate_utf8) {
                     if (final_opcode == .text and !std.unicode.utf8ValidateSlice(buf[0..total_len])) return error.InvalidUtf8;
                 }
+                self.observeMessageRead(final_opcode, total_len, false);
                 return .{
                     .opcode = final_opcode,
                     .payload = buf[0..total_len],
@@ -363,7 +522,10 @@ pub fn Conn(comptime static: StaticConfig) type {
         ) (ProtocolError || Io.Writer.Error)!void {
             if (proto.isControl(opcode) and payload.len > control_payload_max_len) return error.ControlFrameTooLarge;
             if (proto.isControl(opcode) and compressed) return error.ReservedBitsSet;
-            try self.validateOutgoingSequence(opcode, fin);
+            self.validateOutgoingSequence(opcode, fin) catch |err| {
+                self.observeProtocolError(err);
+                return err;
+            };
 
             var header_buf: [frame_header_max_len]u8 = undefined;
             var header_len: usize = 0;
@@ -396,7 +558,7 @@ pub fn Conn(comptime static: StaticConfig) type {
                 self.mask_prng.random().bytes(mask[0..]);
                 @memcpy(header_buf[header_len..][0..4], mask[0..]);
                 header_len += 4;
-                try self.writer.writeAll(header_buf[0..header_len]);
+                try self.writeAllTimed(header_buf[0..header_len]);
 
                 var scratch: [masked_write_scratch_len]u8 = undefined;
                 var offset: usize = 0;
@@ -404,14 +566,16 @@ pub fn Conn(comptime static: StaticConfig) type {
                     const n = @min(masked_write_scratch_len, payload.len - offset);
                     @memcpy(scratch[0..n], payload[offset..][0..n]);
                     applyMask(scratch[0..n], mask, offset);
-                    try self.writer.writeAll(scratch[0..n]);
+                    try self.writeAllTimed(scratch[0..n]);
                     offset += n;
                 }
+                self.observeFrameWrite(opcode, payload.len, fin, compressed);
                 return;
             }
 
-            try self.writer.writeAll(header_buf[0..header_len]);
-            try self.writer.writeAll(payload);
+            try self.writeAllTimed(header_buf[0..header_len]);
+            try self.writeAllTimed(payload);
+            self.observeFrameWrite(opcode, payload.len, fin, compressed);
         }
 
         pub fn writeText(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
@@ -464,6 +628,7 @@ pub fn Conn(comptime static: StaticConfig) type {
 
             try self.writeControlFrame(.close, payload[0..len]);
             self.close_sent = true;
+            self.observeCloseSent(code, len);
         }
 
         fn parseHeaderBytes(self: *Self, bytes: []const u8) ProtocolError!?ParsedHeader {
@@ -537,14 +702,19 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn echoFramePayload(self: *Self, header: FrameHeader, payload: []const u8) (ProtocolError || Io.Writer.Error)!EchoResult {
+            if (proto.isControl(header.opcode)) self.observeControlReceived(header.opcode, payload);
             switch (header.opcode) {
                 .continuation, .text, .binary => try self.writeFrameInternal(header.opcode, payload, header.fin, header.compressed),
-                .ping => if (!self.close_sent) try self.writeControlFrame(.pong, payload),
+                .ping => if (!self.close_sent) {
+                    try self.writeControlFrame(.pong, payload);
+                    self.emit(.{ .auto_pong_sent = .{ .payload_len = payload.len } });
+                },
                 .pong => {},
                 .close => {
                     self.close_received = true;
                     self.recv_fragment_opcode = null;
                     self.recv_fragment_compressed = false;
+                    self.observeControlReceived(.close, payload);
                     const close_frame = try parseClosePayload(payload, validate_utf8);
                     if (!self.close_sent) {
                         try self.writeClose(close_frame.code, close_frame.reason);
@@ -568,9 +738,13 @@ pub fn Conn(comptime static: StaticConfig) type {
                 }
 
                 const payload = try self.readFrameAll(control_buf[0..]);
+                self.observeControlReceived(header.opcode, payload);
                 switch (header.opcode) {
                     .ping => if (comptime auto_pong) {
-                        if (!self.close_sent) try self.writePong(payload);
+                        if (!self.close_sent) {
+                            try self.writePong(payload);
+                            self.emit(.{ .auto_pong_sent = .{ .payload_len = payload.len } });
+                        }
                     },
                     .pong => {},
                     .close => {
@@ -666,6 +840,7 @@ pub fn Conn(comptime static: StaticConfig) type {
             self.recv_remaining = 0;
             self.recv_mask_offset = 0;
             self.noteConsumedFrame(header);
+            self.observeFrameRead(header, false);
         }
     };
 }
@@ -1870,4 +2045,179 @@ test "applyMask is reversible across chunk boundaries and offsets" {
     applyMask(payload[0..3], mask, 0);
     applyMask(payload[3..], mask, 3);
     try std.testing.expectEqualSlices(u8, original[0..], payload[0..]);
+}
+
+const TestObserverState = struct {
+    events: [16]observe.Event = undefined,
+    len: usize = 0,
+
+    fn onEvent(ctx: ?*anyopaque, event: observe.Event) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.events[self.len] = event;
+        self.len += 1;
+    }
+
+    fn observer(self: *@This()) observe.Observer {
+        return .{
+            .ctx = self,
+            .on_event_fn = onEvent,
+        };
+    }
+};
+
+const TestClockState = struct {
+    now_ns: u64 = 0,
+    step_ns: u64,
+
+    fn now(ctx: ?*anyopaque) u64 {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        const current = self.now_ns;
+        self.now_ns += self.step_ns;
+        return current;
+    }
+};
+
+const TestDeadlineState = struct {
+    read_calls: [8]?u64 = [_]?u64{null} ** 8,
+    read_len: usize = 0,
+    write_calls: [8]?u64 = [_]?u64{null} ** 8,
+    write_len: usize = 0,
+
+    fn setRead(ctx: ?*anyopaque, deadline_ns: ?u64) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.read_calls[self.read_len] = deadline_ns;
+        self.read_len += 1;
+    }
+
+    fn setWrite(ctx: ?*anyopaque, deadline_ns: ?u64) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.write_calls[self.write_len] = deadline_ns;
+        self.write_len += 1;
+    }
+};
+
+test "observer records frame reads and writes" {
+    var state: TestObserverState = .{};
+
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var write_buf: [32]u8 = undefined;
+    var write_writer = Io.Writer.fixed(write_buf[0..]);
+    var write_conn = Conn(.{}).init(&empty_reader, &write_writer, .{
+        .observer = state.observer(),
+    });
+    try write_conn.writeBinary("abc");
+
+    const wire = [_]u8{ 0x81, 0x02, 'O', 'K' };
+    var read_reader = Io.Reader.fixed(wire[0..]);
+    var read_sink: [0]u8 = .{};
+    var read_writer = Io.Writer.fixed(read_sink[0..]);
+    var read_conn = Conn(.{ .role = .client }).init(&read_reader, &read_writer, .{
+        .observer = state.observer(),
+    });
+    var frame_buf: [8]u8 = undefined;
+    _ = try read_conn.readFrame(frame_buf[0..]);
+
+    try std.testing.expectEqual(@as(usize, 2), state.len);
+    switch (state.events[0]) {
+        .frame_write => |event| {
+            try std.testing.expectEqual(Opcode.binary, event.opcode);
+            try std.testing.expectEqual(@as(u64, 3), event.payload_len);
+            try std.testing.expect(event.fin);
+        },
+        else => try std.testing.expect(false),
+    }
+    switch (state.events[1]) {
+        .frame_read => |event| {
+            try std.testing.expectEqual(Opcode.text, event.opcode);
+            try std.testing.expectEqual(@as(u64, 2), event.payload_len);
+            try std.testing.expect(!event.borrowed);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "read timeout returns Timeout and emits a timeout event" {
+    var observer_state: TestObserverState = .{};
+    var clock_state: TestClockState = .{
+        .step_ns = 5,
+    };
+    const wire = [_]u8{ 0x81, 0x00 };
+    var reader = Io.Reader.fixed(wire[0..]);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    var conn = Conn(.{ .role = .client }).init(&reader, &writer, .{
+        .timeouts = .{
+            .clock = .{
+                .ctx = &clock_state,
+                .now_ns_fn = TestClockState.now,
+            },
+            .read_ns = 1,
+        },
+        .observer = observer_state.observer(),
+    });
+
+    try std.testing.expectError(error.Timeout, conn.beginFrame());
+    try std.testing.expectEqual(@as(usize, 1), observer_state.len);
+    switch (observer_state.events[0]) {
+        .timeout => |event| {
+            try std.testing.expectEqual(observe.IoPhase.read, event.phase);
+            try std.testing.expectEqual(@as(u64, 1), event.budget_ns);
+            try std.testing.expect(event.elapsed_ns > event.budget_ns);
+        },
+        else => try std.testing.expect(false),
+    }
+}
+
+test "deadline controller is set and cleared around timed reads and writes" {
+    const StaticClock = struct {
+        fn now(_: ?*anyopaque) u64 {
+            return 10;
+        }
+    };
+
+    var deadline_state: TestDeadlineState = .{};
+
+    const read_wire = [_]u8{ 0x81, 0x01, 'x' };
+    var reader = Io.Reader.fixed(read_wire[0..]);
+    var read_sink: [0]u8 = .{};
+    var read_writer = Io.Writer.fixed(read_sink[0..]);
+    var read_conn = Conn(.{ .role = .client }).init(&reader, &read_writer, .{
+        .timeouts = .{
+            .clock = .{
+                .now_ns_fn = StaticClock.now,
+            },
+            .read_ns = 20,
+            .deadlines = .{
+                .ctx = &deadline_state,
+                .set_read_deadline_ns_fn = TestDeadlineState.setRead,
+            },
+        },
+    });
+    var read_buf: [4]u8 = undefined;
+    _ = try read_conn.readFrame(read_buf[0..]);
+
+    try std.testing.expect(deadline_state.read_len >= 2);
+    try std.testing.expectEqual(@as(?u64, 30), deadline_state.read_calls[0]);
+    try std.testing.expectEqual(@as(?u64, null), deadline_state.read_calls[deadline_state.read_len - 1]);
+
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var out: [16]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var write_conn = Conn(.{}).init(&empty_reader, &writer, .{
+        .timeouts = .{
+            .clock = .{
+                .now_ns_fn = StaticClock.now,
+            },
+            .write_ns = 20,
+            .deadlines = .{
+                .ctx = &deadline_state,
+                .set_write_deadline_ns_fn = TestDeadlineState.setWrite,
+            },
+        },
+    });
+    try write_conn.writeBinary("y");
+
+    try std.testing.expect(deadline_state.write_len >= 2);
+    try std.testing.expectEqual(@as(?u64, 30), deadline_state.write_calls[0]);
+    try std.testing.expectEqual(@as(?u64, null), deadline_state.write_calls[deadline_state.write_len - 1]);
 }

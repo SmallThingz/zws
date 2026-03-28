@@ -14,6 +14,8 @@ Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame ho
 - 📦 **Low-allocation reads**: stream frames chunk-by-chunk, read full frames, or borrow buffered payload slices when they fit.
 - 🧠 **Strict protocol checks**: rejects malformed control frames, invalid close payloads, bad UTF-8, bad mask bits, and non-minimal extended lengths.
 - 🗜 **`permessage-deflate`**: handshake negotiation plus compressed message read/write support, with `server_no_context_takeover` and `client_no_context_takeover`.
+- ⏱ **Timeout hooks**: optional read, write, and flush time budgets with pluggable deadline callbacks for framework-owned transports.
+- 👀 **Observability hooks**: optional event stream for handshakes, frame/message flow, control frames, protocol failures, and timeout events.
 - 🔁 **Convenience helpers**: `readMessage`, `echoFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, and `writeClose`.
 - 🧪 **Validation stack**: unit tests, fuzz/property tests, a cross-library interop matrix, soak runners, and benchmarks live alongside the library.
 
@@ -96,6 +98,8 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
   `computeAcceptKey`, `acceptServerHandshake`, `writeServerHandshakeResponse`, `serverHandshake`.
 - Compression path:
   `PerMessageDeflate`, `PerMessageDeflateConfig`, `ServerHandshakeResponse.permessage_deflate`, `Config.permessage_deflate`.
+- Runtime hooks:
+  `TimeoutConfig`, `Clock`, `DeadlineController`, `Observer`, `ObserveEvent`.
 
 ## 📚 Docs
 

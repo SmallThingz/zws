@@ -108,8 +108,8 @@ fn handleConn(io: Io, stream: std.Io.net.Stream) Io.Cancelable!void {
     defer stream.close(io);
     setTcpNoDelay(&stream);
 
-    var read_buf: [8 * 1024]u8 = undefined;
-    var write_buf: [512]u8 = undefined;
+    var read_buf: [4 * 1024]u8 = undefined;
+    var write_buf: [64]u8 = undefined;
 
     var sr = stream.reader(io, &read_buf);
     var sw = stream.writer(io, &write_buf);

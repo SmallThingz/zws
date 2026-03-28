@@ -1,6 +1,7 @@
 const std = @import("std");
 const Io = std.Io;
 const extensions = @import("extensions.zig");
+const observe = @import("observe.zig");
 
 pub const Header = struct {
     name: []const u8,
@@ -26,6 +27,7 @@ pub const ServerHandshakeOptions = struct {
     enable_permessage_deflate: bool = false,
     permessage_deflate: extensions.PerMessageDeflate = .{},
     extra_headers: []const Header = &.{},
+    observer: ?observe.Observer = null,
 };
 
 pub const ServerHandshakeResponse = struct {
@@ -99,25 +101,25 @@ pub fn acceptServerHandshake(
     req: ServerHandshakeRequest,
     opts: ServerHandshakeOptions,
 ) HandshakeError!ServerHandshakeResponse {
-    if (!std.mem.eql(u8, req.method, "GET")) return error.MethodNotGet;
-    if (!req.is_http_11) return error.HttpVersionNotSupported;
+    if (!std.mem.eql(u8, req.method, "GET")) return rejectHandshake(opts.observer, error.MethodNotGet);
+    if (!req.is_http_11) return rejectHandshake(opts.observer, error.HttpVersionNotSupported);
 
-    const connection = req.connection orelse return error.MissingConnectionHeader;
-    if (!containsTokenIgnoreCase(connection, "upgrade")) return error.InvalidConnectionHeader;
+    const connection = req.connection orelse return rejectHandshake(opts.observer, error.MissingConnectionHeader);
+    if (!containsTokenIgnoreCase(connection, "upgrade")) return rejectHandshake(opts.observer, error.InvalidConnectionHeader);
 
-    const upgrade = req.upgrade orelse return error.MissingUpgradeHeader;
+    const upgrade = req.upgrade orelse return rejectHandshake(opts.observer, error.MissingUpgradeHeader);
     if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, upgrade, " \t"), "websocket")) {
-        return error.InvalidUpgradeHeader;
+        return rejectHandshake(opts.observer, error.InvalidUpgradeHeader);
     }
 
-    const key = std.mem.trim(u8, req.sec_websocket_key orelse return error.MissingWebSocketKey, " \t");
-    const version = req.sec_websocket_version orelse return error.MissingWebSocketVersion;
+    const key = std.mem.trim(u8, req.sec_websocket_key orelse return rejectHandshake(opts.observer, error.MissingWebSocketKey), " \t");
+    const version = req.sec_websocket_version orelse return rejectHandshake(opts.observer, error.MissingWebSocketVersion);
     if (!std.mem.eql(u8, std.mem.trim(u8, version, " \t"), "13")) {
-        return error.UnsupportedWebSocketVersion;
+        return rejectHandshake(opts.observer, error.UnsupportedWebSocketVersion);
     }
 
     if (opts.reject_extensions and req.sec_websocket_extensions != null) {
-        return error.ExtensionsNotSupported;
+        return rejectHandshake(opts.observer, error.ExtensionsNotSupported);
     }
 
     var negotiated_permessage_deflate: ?extensions.PerMessageDeflate = null;
@@ -130,17 +132,29 @@ pub fn acceptServerHandshake(
     }
 
     if (opts.selected_subprotocol) |selected| {
-        const offered = req.sec_websocket_protocol orelse return error.SubprotocolNotOffered;
-        if (!subprotocolWasOffered(offered, selected)) return error.SubprotocolNotOffered;
+        const offered = req.sec_websocket_protocol orelse return rejectHandshake(opts.observer, error.SubprotocolNotOffered);
+        if (!subprotocolWasOffered(offered, selected)) return rejectHandshake(opts.observer, error.SubprotocolNotOffered);
     }
 
-    return .{
-        .accept_key = try computeAcceptKey(key),
+    const accept_key = computeAcceptKey(key) catch |err| {
+        return rejectHandshake(opts.observer, err);
+    };
+
+    const response: ServerHandshakeResponse = .{
+        .accept_key = accept_key,
         .selected_subprotocol = opts.selected_subprotocol,
         .selected_extensions = if (negotiated_permessage_deflate) |pmd| pmd.responseHeaderValue() else null,
         .permessage_deflate = negotiated_permessage_deflate,
         .extra_headers = opts.extra_headers,
     };
+    if (opts.observer) |observer| {
+        observer.emit(.{ .handshake_accepted = .{
+            .selected_subprotocol = response.selected_subprotocol != null,
+            .permessage_deflate = response.permessage_deflate != null,
+            .extra_headers_len = response.extra_headers.len,
+        } });
+    }
+    return response;
 }
 
 pub fn writeServerHandshakeResponse(
@@ -184,6 +198,13 @@ pub fn serverHandshake(
     const response = try acceptServerHandshake(req, opts);
     try writeServerHandshakeResponse(writer, response);
     return response;
+}
+
+fn rejectHandshake(observer: ?observe.Observer, err: HandshakeError) HandshakeError {
+    if (observer) |o| {
+        o.emit(.{ .handshake_rejected = .{ .name = @errorName(err) } });
+    }
+    return err;
 }
 
 fn validRequest() ServerHandshakeRequest {
@@ -426,4 +447,49 @@ test "serverHandshake propagates writer errors" {
     var out: [8]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
     try std.testing.expectError(error.WriteFailed, serverHandshake(&writer, validRequest(), .{}));
+}
+
+test "handshake observer sees accepted and rejected outcomes" {
+    const State = struct {
+        events: [2]observe.Event = undefined,
+        len: usize = 0,
+
+        fn onEvent(ctx: ?*anyopaque, event: observe.Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.events[self.len] = event;
+            self.len += 1;
+        }
+    };
+
+    var accepted_state: State = .{};
+    _ = try acceptServerHandshake(validRequest(), .{
+        .observer = .{
+            .ctx = &accepted_state,
+            .on_event_fn = State.onEvent,
+        },
+    });
+    try std.testing.expectEqual(@as(usize, 1), accepted_state.len);
+    switch (accepted_state.events[0]) {
+        .handshake_accepted => |event| {
+            try std.testing.expect(!event.selected_subprotocol);
+            try std.testing.expect(!event.permessage_deflate);
+            try std.testing.expectEqual(@as(usize, 0), event.extra_headers_len);
+        },
+        else => return error.TestExpectedEqual,
+    }
+
+    var rejected_req = validRequest();
+    rejected_req.method = "POST";
+    var rejected_state: State = .{};
+    try std.testing.expectError(error.MethodNotGet, acceptServerHandshake(rejected_req, .{
+        .observer = .{
+            .ctx = &rejected_state,
+            .on_event_fn = State.onEvent,
+        },
+    }));
+    try std.testing.expectEqual(@as(usize, 1), rejected_state.len);
+    switch (rejected_state.events[0]) {
+        .handshake_rejected => |event| try std.testing.expectEqualStrings("MethodNotGet", event.name),
+        else => return error.TestExpectedEqual,
+    }
 }

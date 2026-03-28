@@ -12,6 +12,7 @@ const proto = @import("protocol.zig");
 const handshake = @import("handshake.zig");
 const conn = @import("conn.zig");
 const extensions = @import("extensions.zig");
+const observe = @import("observe.zig");
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -28,6 +29,19 @@ pub const ServerHandshakeRequest = handshake.ServerHandshakeRequest;
 pub const ServerHandshakeOptions = handshake.ServerHandshakeOptions;
 pub const ServerHandshakeResponse = handshake.ServerHandshakeResponse;
 pub const HandshakeError = handshake.HandshakeError;
+pub const Clock = observe.Clock;
+pub const DeadlineController = observe.DeadlineController;
+pub const TimeoutConfig = observe.TimeoutConfig;
+pub const IoPhase = observe.IoPhase;
+pub const Observer = observe.Observer;
+pub const ObserveEvent = observe.Event;
+pub const ObserveFrameEvent = observe.FrameEvent;
+pub const ObserveMessageEvent = observe.MessageEvent;
+pub const ObservePayloadEvent = observe.PayloadEvent;
+pub const ObserveCloseEvent = observe.CloseEvent;
+pub const ObserveTimeoutEvent = observe.TimeoutEvent;
+pub const ObserveErrorEvent = observe.ErrorEvent;
+pub const ObserveHandshakeAcceptedEvent = observe.HandshakeAcceptedEvent;
 pub const PerMessageDeflate = extensions.PerMessageDeflate;
 pub const offersPerMessageDeflate = extensions.offersPerMessageDeflate;
 pub const parsePerMessageDeflate = extensions.parsePerMessageDeflate;
@@ -115,6 +129,7 @@ fn fuzzBuiltin(
 }
 
 test {
+    _ = @import("observe.zig");
     _ = @import("extensions.zig");
     _ = @import("protocol.zig");
     _ = @import("handshake.zig");

@@ -12,6 +12,7 @@ The public exports in `src/root.zig` are the supported package API:
 - `ConnType`, `Conn`, `ServerConn`, `ClientConn`
 - frame/message read and write helpers
 - `PerMessageDeflate` and `PerMessageDeflateConfig`
+- timeout and observer types (`TimeoutConfig`, `Clock`, `DeadlineController`, `Observer`, `ObserveEvent`)
 
 Within a patch release, those symbols and their documented semantics should not break.
 
@@ -60,6 +61,30 @@ The connection API assumes buffered I/O.
 - frame and message helpers operate correctly without borrowing, but may copy into caller buffers
 - write batching is left to the caller’s writer buffering and flush policy
 
+### Timeouts
+
+Timeouts are configured per connection through `Config.timeouts`.
+
+- `read_ns`, `write_ns`, and `flush_ns` bound individual blocking operations
+- `clock` provides the elapsed-time source
+- `deadlines` lets the embedding framework translate those budgets into transport-level deadlines
+
+Without a `DeadlineController`, timeout enforcement is cooperative: the library can detect an operation ran longer than budget once that operation returns. With a `DeadlineController`, the framework can map the same budget into socket or runtime deadlines so blocking I/O can fail promptly.
+
+### Observability
+
+The library exposes an optional event stream through `Config.observer` and `ServerHandshakeOptions.observer`.
+
+Current event coverage includes:
+
+- handshake acceptance and rejection
+- frame reads and writes
+- completed message reads
+- ping, pong, and close reception
+- auto-pong emission
+- timeout detection
+- surfaced protocol errors from core sequencing and frame validation paths
+
 ### Compression
 
 `permessage-deflate` is optional.
@@ -89,8 +114,8 @@ Production callers should still decide their own:
 
 - accept loop / task model
 - connection limits
-- timeouts and idle handling
-- logging and metrics
+- timeout budgets and idle handling policy
+- how to export observer events into logs, metrics, or traces
 - TLS termination
 
 ## Validation
