@@ -72,6 +72,15 @@ pub fn build(b: *std.Build) void {
     });
     const install_compare = b.addInstallArtifact(compare_exe, .{});
 
+    const bench_ab_exe = b.addExecutable(.{
+        .name = "zwebsocket-bench-ab",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmark/run_ab.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
     const echo_server_exe = b.addExecutable(.{
         .name = "zwebsocket-echo-server",
         .root_module = b.createModule(.{
@@ -128,6 +137,52 @@ pub fn build(b: *std.Build) void {
     });
     const install_interop_client = b.addInstallArtifact(interop_client_exe, .{});
 
+    const repeated_offer_client_exe = b.addExecutable(.{
+        .name = "zwebsocket-repeated-pmd-offer-client",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("validation/repeated_pmd_offer_client.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws_support_common", .module = support_common },
+            },
+        }),
+    });
+    const install_repeated_offer_client = b.addInstallArtifact(repeated_offer_client_exe, .{});
+
+    const interop_runner_exe = b.addExecutable(.{
+        .name = "zwebsocket-interop-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("validation/run_interop.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    const soak_runner_exe = b.addExecutable(.{
+        .name = "zwebsocket-soak-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("validation/soak.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws_support_common", .module = support_common },
+            },
+        }),
+    });
+
+    const install_step = b.getInstallStep();
+    install_step.dependOn(&install_bench.step);
+    install_step.dependOn(&install_bench_server.step);
+    install_step.dependOn(&install_compare.step);
+    install_step.dependOn(&install_echo_server.step);
+    install_step.dependOn(&install_frame_echo_server.step);
+    install_step.dependOn(&install_client.step);
+    install_step.dependOn(&install_interop_client.step);
+    install_step.dependOn(&install_repeated_offer_client.step);
+
     const test_step = b.step("test", "Run zwebsocket tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_support_tests.step);
@@ -146,7 +201,7 @@ pub fn build(b: *std.Build) void {
     const compare_step = b.step("bench-compare", "Compare zwebsocket and uWebSockets");
     compare_step.dependOn(&compare_run.step);
 
-    const bench_ab_run = b.addSystemCommand(&.{b.pathFromRoot("benchmark/run_ab.sh")});
+    const bench_ab_run = b.addRunArtifact(bench_ab_exe);
     const bench_ab_step = b.step("bench-ab", "Run low-noise interleaved zwebsocket vs uWebSockets benchmark rounds");
     bench_ab_step.dependOn(&bench_ab_run.step);
 
@@ -170,27 +225,25 @@ pub fn build(b: *std.Build) void {
     const interop_client_step = b.step("interop-client", "Build the websocket interoperability client");
     interop_client_step.dependOn(&install_interop_client.step);
 
-    const interop_run = b.addSystemCommand(&.{"python3"});
+    const repeated_offer_client_step = b.step("interop-repeated-offer-client", "Build the repeated permessage-deflate offer regression client");
+    repeated_offer_client_step.dependOn(&install_repeated_offer_client.step);
+
+    const interop_run = b.addRunArtifact(interop_runner_exe);
     interop_run.step.dependOn(&install_echo_server.step);
     interop_run.step.dependOn(&install_interop_client.step);
-    interop_run.addFileArg(b.path("validation/run_interop.py"));
-    interop_run.addArg("--server-bin");
-    interop_run.addArg(b.getInstallPath(.bin, "zwebsocket-echo-server"));
-    interop_run.addArg("--client-bin");
-    interop_run.addArg(b.getInstallPath(.bin, "zwebsocket-interop-client"));
+    interop_run.step.dependOn(&install_repeated_offer_client.step);
+    interop_run.addArg(b.fmt("--server-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-echo-server")}));
+    interop_run.addArg(b.fmt("--client-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-interop-client")}));
+    interop_run.addArg(b.fmt("--repeated-client-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-repeated-pmd-offer-client")}));
     const interop_step = b.step("interop", "Run the websocket interoperability matrix");
     interop_step.dependOn(&interop_run.step);
 
-    const soak_run = b.addSystemCommand(&.{"python3"});
+    const soak_run = b.addRunArtifact(soak_runner_exe);
     soak_run.step.dependOn(&install_echo_server.step);
-    soak_run.addFileArg(b.path("validation/soak.py"));
-    soak_run.addArg("--server-bin");
-    soak_run.addArg(b.getInstallPath(.bin, "zwebsocket-echo-server"));
-    const soak_compressed = b.addSystemCommand(&.{"python3"});
+    soak_run.addArg(b.fmt("--server-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-echo-server")}));
+    const soak_compressed = b.addRunArtifact(soak_runner_exe);
     soak_compressed.step.dependOn(&install_echo_server.step);
-    soak_compressed.addFileArg(b.path("validation/soak.py"));
-    soak_compressed.addArg("--server-bin");
-    soak_compressed.addArg(b.getInstallPath(.bin, "zwebsocket-echo-server"));
+    soak_compressed.addArg(b.fmt("--server-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-echo-server")}));
     soak_compressed.addArg("--compression");
     const soak_step = b.step("soak", "Run websocket soak tests against the example server");
     soak_step.dependOn(&soak_run.step);

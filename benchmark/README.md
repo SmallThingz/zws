@@ -44,7 +44,7 @@ Notes:
 For lower-variance repeated measurements, use:
 
 ```sh
-benchmark/run_ab.sh
+zig build bench-ab -Doptimize=ReleaseFast
 ```
 
 This harness:
@@ -57,6 +57,6 @@ This harness:
 Environment overrides:
 
 ```sh
-ROUNDS=6 CONNS=16 ITERS=200000 WARMUP=10000 PIPELINE=8 MSG_SIZE=16 benchmark/run_ab.sh
-ROUNDS=6 CONNS=1 ITERS=150000 WARMUP=10000 PIPELINE=1 MSG_SIZE=16 benchmark/run_ab.sh
+ROUNDS=6 CONNS=16 ITERS=200000 WARMUP=10000 PIPELINE=8 MSG_SIZE=16 zig build bench-ab -Doptimize=ReleaseFast
+ROUNDS=6 CONNS=1 ITERS=150000 WARMUP=10000 PIPELINE=1 MSG_SIZE=16 zig build bench-ab -Doptimize=ReleaseFast
 ```

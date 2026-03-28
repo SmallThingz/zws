@@ -14,6 +14,7 @@ const Config = struct {
     msg_size: usize = 16,
     quiet: bool = false,
     binary: bool = true,
+    rate_file: ?[]const u8 = null,
 };
 
 const ConnResult = struct {
@@ -46,6 +47,7 @@ fn usage() void {
         \\  --msg-size=16      Payload bytes per message
         \\  --text             Use text frames (default is binary)
         \\  --quiet            Print a single summary line
+        \\  --rate-file=PATH   Write msg/s as a single float line
         \\  --help             Show this help
         \\
     , .{});
@@ -259,6 +261,8 @@ pub fn main(init: std.process.Init) !void {
                 cfg.pipeline = try std.fmt.parseInt(usize, kv.val, 10);
             } else if (std.mem.eql(u8, kv.key, "msg-size")) {
                 cfg.msg_size = try std.fmt.parseInt(usize, kv.val, 10);
+            } else if (std.mem.eql(u8, kv.key, "rate-file")) {
+                cfg.rate_file = kv.val;
             } else {
                 return error.UnknownArg;
             }
@@ -320,5 +324,15 @@ pub fn main(init: std.process.Init) !void {
             "label={s} total_msgs={d} elapsed_ns={d} msg_per_sec={d:.2} payload_mib_per_sec={d:.2}\n",
             .{ label, total_ok, elapsed_ns, msgs_per_sec, payload_mib_per_sec },
         );
+    }
+
+    if (cfg.rate_file) |path| {
+        const file = try std.Io.Dir.createFileAbsolute(init.io, path, .{ .truncate = true });
+        defer file.close(init.io);
+
+        var buf: [64]u8 = undefined;
+        var writer = file.writer(init.io, &buf);
+        try writer.interface.print("{d:.2}\n", .{msgs_per_sec});
+        try writer.interface.flush();
     }
 }

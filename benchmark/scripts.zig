@@ -71,12 +71,6 @@ fn dirExists(io: std.Io, path: []const u8) bool {
     return true;
 }
 
-fn fileExists(io: std.Io, path: []const u8) bool {
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
-    file.close(io);
-    return true;
-}
-
 pub fn runZwebsocketExternal(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, root: []const u8, environ: std.process.Environ) !void {
     printLine(io, "== zwebsocket ==");
 
@@ -103,14 +97,30 @@ fn ensureClone(io: std.Io, cwd: []const u8, dir: []const u8, url: []const u8) !v
     try runChecked(io, &.{ "git", "clone", "--depth", "1", url, dir }, cwd, null);
 }
 
-fn buildUwsServer(io: std.Io, allocator: std.mem.Allocator, root: []const u8, uws_dir: []const u8) ![]u8 {
+pub fn buildUwsServer(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    uws_dir: []const u8,
+    environ: std.process.Environ,
+) ![]u8 {
     try ensureClone(io, root, uws_dir, "https://github.com/uNetworking/uWebSockets");
 
     const usockets_dir = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "uSockets-bench" });
     defer allocator.free(usockets_dir);
     try ensureClone(io, root, usockets_dir, "https://github.com/uNetworking/uSockets");
 
-    try runChecked(io, &.{ "make", "WITH_ZLIB=0" }, usockets_dir, null);
+    const tmp_dir = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "tmp" });
+    defer allocator.free(tmp_dir);
+    try runChecked(io, &.{ "mkdir", "-p", tmp_dir }, root, null);
+
+    var env = try std.process.Environ.createMap(environ, allocator);
+    defer env.deinit();
+    try env.put("TMPDIR", tmp_dir);
+    try env.put("TMP", tmp_dir);
+    try env.put("TEMP", tmp_dir);
+
+    try runChecked(io, &.{ "make", "WITH_ZLIB=0" }, usockets_dir, &env);
 
     const out_path = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "uws-bench-server" });
     const src_path = try std.fs.path.join(allocator, &.{ root, "benchmark", "uws_server.cpp" });
@@ -141,7 +151,7 @@ fn buildUwsServer(io: std.Io, allocator: std.mem.Allocator, root: []const u8, uw
         usockets_lib,
         "-pthread",
         out_arg,
-    }, root, null);
+    }, root, &env);
 
     return out_path;
 }
@@ -151,7 +161,7 @@ pub fn runUwsExternal(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig
 
     const uws_dir = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "uWebSockets-bench" });
     defer allocator.free(uws_dir);
-    const server_path = try buildUwsServer(io, allocator, root, uws_dir);
+    const server_path = try buildUwsServer(io, allocator, root, uws_dir, environ);
     defer allocator.free(server_path);
 
     const bench_path = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zwebsocket-bench" });

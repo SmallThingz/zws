@@ -159,7 +159,7 @@ This runs `zwebsocket` against real external peers in both directions:
 - Python `aiohttp` client/server
 - compressed and uncompressed paths
 
-The matrix is orchestrated by `validation/run_interop.py`.
+The matrix is orchestrated by `validation/run_interop.zig`.
 
 ### 4. Soak Tests
 
@@ -167,7 +167,7 @@ The matrix is orchestrated by `validation/run_interop.py`.
 zig build soak
 ```
 
-This starts the example echo server and drives it with many concurrent long-lived websocket connections using `aiohttp`.
+This starts the example echo server and drives it with many concurrent long-lived websocket connections using the in-tree Zig soak runner.
 
 The default soak step runs both:
 

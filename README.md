@@ -118,7 +118,7 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
 - `examples/echo_server.zig`: standalone echo server example
 - `examples/frame_echo_server.zig`: frame-level echo server example using `echoFrame`
 - `examples/ws_client.zig`: standalone client example with manual HTTP upgrade
-- `validation/`: interop peers and soak runners
+- `validation/`: Zig interop and soak runners, plus peer dependency metadata
 
 ## 🏁 Benchmarking
 
@@ -126,6 +126,7 @@ Benchmark support lives under [`benchmark/`](./benchmark/).
 
 ```bash
 zig build bench-compare -Doptimize=ReleaseFast
+zig build bench-ab -Doptimize=ReleaseFast
 ```
 
 Environment overrides:

@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const ParsePerMessageDeflateError = error{
+    DuplicateExtensionOffer,
     DuplicateExtensionParameter,
     InvalidExtensionParameter,
 };
@@ -62,7 +63,10 @@ pub fn parsePerMessageDeflate(header_value: []const u8) PerMessageDeflateOfferIt
 
 pub fn parsePerMessageDeflateFirst(header_value: []const u8) ParsePerMessageDeflateError!?PerMessageDeflate {
     var offers = parsePerMessageDeflate(header_value);
-    return offers.next();
+    const first = try offers.next();
+    if (first == null) return null;
+    if ((try offers.next()) != null) return error.DuplicateExtensionOffer;
+    return first;
 }
 
 fn parsePerMessageDeflateOffer(extension_part: []const u8) ParsePerMessageDeflateError!?PerMessageDeflate {
@@ -199,14 +203,9 @@ test "parsePerMessageDeflate preserves repeated offers as alternatives" {
         (try offers.next()).?,
     );
     try std.testing.expectEqual(@as(?PerMessageDeflate, null), try offers.next());
-    try std.testing.expectEqualDeep(
-        PerMessageDeflate{
-            .server_no_context_takeover = false,
-            .client_no_context_takeover = true,
-        },
-        (try parsePerMessageDeflateFirst(
-            "permessage-deflate; client_no_context_takeover, permessage-deflate",
-        )).?,
+    try std.testing.expectError(
+        error.DuplicateExtensionOffer,
+        parsePerMessageDeflateFirst("permessage-deflate, permessage-deflate; client_no_context_takeover"),
     );
 }
 

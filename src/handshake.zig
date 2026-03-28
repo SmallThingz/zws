@@ -82,6 +82,27 @@ fn subprotocolWasOffered(offered: []const u8, selected: []const u8) bool {
     return false;
 }
 
+fn negotiatedPerMessageDeflateForOffer(
+    requested: extensions.PerMessageDeflate,
+    preferred: extensions.PerMessageDeflate,
+) extensions.PerMessageDeflate {
+    return .{
+        // The server can elect its own receive-side takeover policy.
+        .server_no_context_takeover = preferred.server_no_context_takeover,
+        // The client-side policy must have been offered by the peer.
+        .client_no_context_takeover = preferred.client_no_context_takeover and requested.client_no_context_takeover,
+    };
+}
+
+fn perMessageDeflateOfferScore(
+    requested: extensions.PerMessageDeflate,
+    preferred: extensions.PerMessageDeflate,
+) usize {
+    var score: usize = 0;
+    if (preferred.client_no_context_takeover and requested.client_no_context_takeover) score += 1;
+    return score;
+}
+
 pub fn computeAcceptKey(client_key: []const u8) HandshakeError![28]u8 {
     if (!validateClientKey(client_key)) return error.InvalidWebSocketKey;
 
@@ -126,11 +147,15 @@ pub fn acceptServerHandshake(
     if (opts.enable_permessage_deflate) {
         if (req.sec_websocket_extensions) |header_value| {
             var offers = extensions.parsePerMessageDeflate(header_value);
+            var best_score: usize = 0;
             while (offers.next() catch {
                 return rejectHandshake(opts.observer, error.ExtensionsNotSupported);
-            }) |_| {
-                if (negotiated_permessage_deflate == null) {
-                    negotiated_permessage_deflate = opts.permessage_deflate;
+            }) |requested| {
+                const candidate = negotiatedPerMessageDeflateForOffer(requested, opts.permessage_deflate);
+                const score = perMessageDeflateOfferScore(requested, opts.permessage_deflate);
+                if (negotiated_permessage_deflate == null or score > best_score) {
+                    negotiated_permessage_deflate = candidate;
+                    best_score = score;
                 }
             }
         }
@@ -289,10 +314,17 @@ test "acceptServerHandshake negotiates permessage-deflate when enabled and offer
         .enable_permessage_deflate = true,
     });
     try std.testing.expectEqualStrings(
-        "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+        "permessage-deflate; server_no_context_takeover",
         response.selected_extensions.?,
     );
     try std.testing.expect(response.permessage_deflate != null);
+    try std.testing.expectEqualDeep(
+        extensions.PerMessageDeflate{
+            .server_no_context_takeover = true,
+            .client_no_context_takeover = false,
+        },
+        response.permessage_deflate.?,
+    );
 }
 
 test "acceptServerHandshake rejects malformed permessage-deflate offers when negotiation is enabled" {
@@ -306,7 +338,7 @@ test "acceptServerHandshake rejects malformed permessage-deflate offers when neg
 
 test "acceptServerHandshake accepts repeated permessage-deflate offers as alternatives" {
     var req = validRequest();
-    req.sec_websocket_extensions = "permessage-deflate; client_max_window_bits, permessage-deflate";
+    req.sec_websocket_extensions = "permessage-deflate, permessage-deflate; client_no_context_takeover";
 
     const response = try acceptServerHandshake(req, .{
         .enable_permessage_deflate = true,
@@ -315,6 +347,22 @@ test "acceptServerHandshake accepts repeated permessage-deflate offers as altern
     try std.testing.expectEqualStrings(
         "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
         response.selected_extensions.?,
+    );
+    try std.testing.expectEqualDeep(
+        extensions.PerMessageDeflate{
+            .server_no_context_takeover = true,
+            .client_no_context_takeover = true,
+        },
+        response.permessage_deflate.?,
+    );
+}
+
+test "acceptServerHandshake rejects duplicate permessage-deflate tokens in a response parse path" {
+    try std.testing.expectError(
+        error.DuplicateExtensionOffer,
+        extensions.parsePerMessageDeflateFirst(
+            "permessage-deflate, permessage-deflate; client_no_context_takeover",
+        ),
     );
 }
 
