@@ -245,6 +245,14 @@ pub fn Conn(comptime static: StaticConfig) type {
             try self.finishTimedOp(timed);
         }
 
+        fn writeVecAllTimed(self: *Self, data: [][]const u8) (ProtocolError || Io.Writer.Error)!void {
+            if (comptime !runtime_hooks) return self.writer.writeVecAll(data);
+            const timed = self.beginTimedOp(.write);
+            defer self.clearTimedOp(.write);
+            try self.writer.writeVecAll(data);
+            try self.finishTimedOp(timed);
+        }
+
         fn flushTimed(self: *Self) (ProtocolError || Io.Writer.Error)!void {
             if (comptime !runtime_hooks) return self.writer.flush();
             const timed = self.beginTimedOp(.flush);
@@ -344,7 +352,7 @@ pub fn Conn(comptime static: StaticConfig) type {
             const total_len = std.math.add(usize, parsed.header_len, payload_len) catch return null;
             if (total_len > self.reader.buffer.len) return null;
 
-            const frame_bytes = try self.peekTimed(total_len);
+            const frame_bytes = if (header_bytes.len >= total_len) header_bytes[0..total_len] else try self.peekTimed(total_len);
             const payload: []u8 = @constCast(frame_bytes[parsed.header_len..][0..payload_len]);
             if (parsed.header.masked) applyMask(payload, parsed.mask, 0);
             self.reader.toss(total_len);
@@ -585,8 +593,8 @@ pub fn Conn(comptime static: StaticConfig) type {
                 return;
             }
 
-            try self.writeAllTimed(header_buf[0..header_len]);
-            try self.writeAllTimed(payload);
+            var write_parts = [_][]const u8{ header_buf[0..header_len], payload };
+            try self.writeVecAllTimed(write_parts[0..]);
             self.observeFrameWrite(opcode, payload.len, fin, compressed);
         }
 
