@@ -37,3 +37,26 @@ Notes:
 - `uWebSockets` and `uSockets` are cloned on demand under `.zig-cache/`.
 - The `uWebSockets` benchmark build uses no TLS and no websocket compression.
 - The default workload is a small binary echo frame, which is a transport-focused benchmark rather than an application benchmark.
+
+## Cleaner A/B Harness
+
+`bench-compare` is useful for quick checks, but it also pays setup/build overhead every invocation.
+For lower-variance repeated measurements, use:
+
+```sh
+benchmark/run_ab.sh
+```
+
+This harness:
+
+- builds `zwebsocket` binaries once
+- builds `uWebSockets` benchmark server once
+- starts both servers once
+- runs strict interleaved rounds (`zwebsocket` then `uWebSockets`) and prints averages
+
+Environment overrides:
+
+```sh
+ROUNDS=6 CONNS=16 ITERS=200000 WARMUP=10000 PIPELINE=8 MSG_SIZE=16 benchmark/run_ab.sh
+ROUNDS=6 CONNS=1 ITERS=150000 WARMUP=10000 PIPELINE=1 MSG_SIZE=16 benchmark/run_ab.sh
+```

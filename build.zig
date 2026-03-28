@@ -145,6 +145,10 @@ pub fn build(b: *std.Build) void {
     const compare_step = b.step("bench-compare", "Compare zwebsocket and uWebSockets");
     compare_step.dependOn(&compare_run.step);
 
+    const bench_ab_run = b.addSystemCommand(&.{b.pathFromRoot("benchmark/run_ab.sh")});
+    const bench_ab_step = b.step("bench-ab", "Run low-noise interleaved zwebsocket vs uWebSockets benchmark rounds");
+    bench_ab_step.dependOn(&bench_ab_run.step);
+
     const bench_server_step = b.step("bench-server", "Build the standalone websocket benchmark server");
     bench_server_step.dependOn(&install_bench_server.step);
 
