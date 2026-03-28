@@ -1,6 +1,7 @@
 const std = @import("std");
 
 pub const ParsePerMessageDeflateError = error{
+    DuplicateExtensionOffer,
     DuplicateExtensionParameter,
     InvalidExtensionParameter,
 };
@@ -34,11 +35,13 @@ pub fn offersPerMessageDeflate(header_value: []const u8) bool {
 }
 
 pub fn parsePerMessageDeflate(header_value: []const u8) ParsePerMessageDeflateError!?PerMessageDeflate {
+    var matched: ?PerMessageDeflate = null;
     var extension_it = std.mem.splitScalar(u8, header_value, ',');
     while (extension_it.next()) |extension_part| {
         var param_it = std.mem.splitScalar(u8, extension_part, ';');
         const name = std.mem.trim(u8, param_it.next() orelse continue, " \t");
         if (!std.ascii.eqlIgnoreCase(name, "permessage-deflate")) continue;
+        if (matched != null) return error.DuplicateExtensionOffer;
 
         var parsed: PerMessageDeflate = .{
             .server_no_context_takeover = false,
@@ -87,11 +90,10 @@ pub fn parsePerMessageDeflate(header_value: []const u8) ParsePerMessageDeflateEr
             }
             return error.InvalidExtensionParameter;
         }
-
-        return parsed;
+        matched = parsed;
     }
 
-    return null;
+    return matched;
 }
 
 fn parseWindowBits(value: []const u8) error{InvalidWindowBits}!u8 {
@@ -150,6 +152,10 @@ test "parsePerMessageDeflate parses negotiated parameters and rejects malformed 
     try std.testing.expectError(
         error.DuplicateExtensionParameter,
         parsePerMessageDeflate("permessage-deflate; client_max_window_bits; client_max_window_bits=15"),
+    );
+    try std.testing.expectError(
+        error.DuplicateExtensionOffer,
+        parsePerMessageDeflate("permessage-deflate, permessage-deflate; client_no_context_takeover"),
     );
 }
 

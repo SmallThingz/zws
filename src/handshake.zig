@@ -300,6 +300,11 @@ test "acceptServerHandshake rejects malformed permessage-deflate offers when neg
     try std.testing.expectError(error.ExtensionsNotSupported, acceptServerHandshake(req, .{
         .enable_permessage_deflate = true,
     }));
+
+    req.sec_websocket_extensions = "permessage-deflate, permessage-deflate; client_no_context_takeover";
+    try std.testing.expectError(error.ExtensionsNotSupported, acceptServerHandshake(req, .{
+        .enable_permessage_deflate = true,
+    }));
 }
 
 test "acceptServerHandshake accepts connection token with extra commas and spaces" {
