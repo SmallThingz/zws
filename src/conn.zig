@@ -898,16 +898,30 @@ fn applyMask(bytes: []u8, mask: [mask_len]u8, start_offset: usize) void {
     if (bytes.len == 0) return;
 
     const offset = start_offset & 3;
-    var repeated_mask_bytes: [8]u8 = undefined;
-    for (0..8) |i| {
-        repeated_mask_bytes[i] = mask[(offset + i) & 3];
-    }
-    const repeated_mask = std.mem.readInt(u64, repeated_mask_bytes[0..], .little);
-
     var i: usize = 0;
-    while (i + 8 <= bytes.len) : (i += 8) {
-        const value = std.mem.readInt(u64, bytes[i..][0..8], .little);
-        std.mem.writeInt(u64, bytes[i..][0..8], value ^ repeated_mask, .little);
+    if (bytes.len >= 64) {
+        const Vec = @Vector(16, u8);
+        var repeated_mask_bytes_vec: [16]u8 = undefined;
+        for (0..16) |j| {
+            repeated_mask_bytes_vec[j] = mask[(offset + j) & 3];
+        }
+        const repeated_mask_vec: Vec = repeated_mask_bytes_vec;
+
+        while (i + @sizeOf(Vec) <= bytes.len) : (i += @sizeOf(Vec)) {
+            const ptr: *align(1) Vec = @ptrCast(bytes[i..].ptr);
+            ptr.* ^= repeated_mask_vec;
+        }
+    } else {
+        var repeated_mask_bytes_u64: [8]u8 = undefined;
+        for (0..8) |j| {
+            repeated_mask_bytes_u64[j] = mask[(offset + j) & 3];
+        }
+        const repeated_mask_u64 = std.mem.readInt(u64, repeated_mask_bytes_u64[0..], .little);
+
+        while (i + 8 <= bytes.len) : (i += 8) {
+            const value = std.mem.readInt(u64, bytes[i..][0..8], .little);
+            std.mem.writeInt(u64, bytes[i..][0..8], value ^ repeated_mask_u64, .little);
+        }
     }
     while (i < bytes.len) : (i += 1) {
         bytes[i] ^= mask[(offset + i) & 3];
