@@ -43,6 +43,7 @@ pub const StaticConfig = struct {
     auto_pong: bool = true,
     auto_reply_close: bool = true,
     validate_utf8: bool = true,
+    runtime_hooks: bool = true,
 };
 
 pub const Config = struct {
@@ -106,6 +107,7 @@ pub fn Conn(comptime static: StaticConfig) type {
     const auto_pong = static.auto_pong;
     const auto_reply_close = static.auto_reply_close;
     const validate_utf8 = static.validate_utf8;
+    const runtime_hooks = static.runtime_hooks;
 
     return struct {
         reader: *Io.Reader,
@@ -158,10 +160,12 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn emit(self: *const Self, event: observe.Event) void {
+            if (comptime !runtime_hooks) return;
             if (self.config.observer) |observer| observer.emit(event);
         }
 
         fn beginTimedOp(self: *const Self, phase: observe.IoPhase) ?TimedOp {
+            if (comptime !runtime_hooks) return null;
             const budget_ns = switch (phase) {
                 .read => self.config.timeouts.read_ns,
                 .write => self.config.timeouts.write_ns,
@@ -184,6 +188,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn clearTimedOp(self: *const Self, phase: observe.IoPhase) void {
+            if (comptime !runtime_hooks) return;
             if (self.config.timeouts.deadlines) |deadlines| switch (phase) {
                 .read => deadlines.setReadDeadlineNs(null),
                 .write => deadlines.setWriteDeadlineNs(null),
@@ -192,6 +197,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn finishTimedOp(self: *const Self, timed: ?TimedOp) ProtocolError!void {
+            if (comptime !runtime_hooks) return;
             const op = timed orelse return;
             const elapsed_ns = self.config.timeouts.clock.nowNs() -| op.start_ns;
             if (elapsed_ns > op.budget_ns) {
@@ -205,6 +211,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn peekGreedyTimed(self: *Self, n: usize) (ProtocolError || Io.Reader.Error)![]const u8 {
+            if (comptime !runtime_hooks) return self.reader.peekGreedy(n);
             const timed = self.beginTimedOp(.read);
             defer self.clearTimedOp(.read);
             const out = try self.reader.peekGreedy(n);
@@ -213,6 +220,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn peekTimed(self: *Self, n: usize) (ProtocolError || Io.Reader.Error)![]const u8 {
+            if (comptime !runtime_hooks) return self.reader.peek(n);
             const timed = self.beginTimedOp(.read);
             defer self.clearTimedOp(.read);
             const out = try self.reader.peek(n);
@@ -221,6 +229,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn readSliceAllTimed(self: *Self, dest: []u8) (ProtocolError || Io.Reader.Error)!void {
+            if (comptime !runtime_hooks) return self.reader.readSliceAll(dest);
             const timed = self.beginTimedOp(.read);
             defer self.clearTimedOp(.read);
             try self.reader.readSliceAll(dest);
@@ -228,6 +237,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn writeAllTimed(self: *Self, bytes: []const u8) (ProtocolError || Io.Writer.Error)!void {
+            if (comptime !runtime_hooks) return self.writer.writeAll(bytes);
             const timed = self.beginTimedOp(.write);
             defer self.clearTimedOp(.write);
             try self.writer.writeAll(bytes);
@@ -235,6 +245,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn flushTimed(self: *Self) (ProtocolError || Io.Writer.Error)!void {
+            if (comptime !runtime_hooks) return self.writer.flush();
             const timed = self.beginTimedOp(.flush);
             defer self.clearTimedOp(.flush);
             try self.writer.flush();

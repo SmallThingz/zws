@@ -8,6 +8,7 @@ const BenchConn = zws.ConnType(.{
     .auto_pong = false,
     .auto_reply_close = false,
     .validate_utf8 = false,
+    .runtime_hooks = false,
 });
 
 fn usage() void {
