@@ -13,6 +13,7 @@ pub fn main(init: std.process.Init) !void {
     const conns = scripts.envInt(env, "CONNS", 16);
     const iters = scripts.envInt(env, "ITERS", 200_000);
     const warmup = scripts.envInt(env, "WARMUP", 10_000);
+    const pipeline = scripts.envInt(env, "PIPELINE", 1);
     const msg_size = scripts.envInt(env, "MSG_SIZE", 16);
 
     try scripts.runZwebsocketExternal(init.io, allocator, .{
@@ -20,6 +21,7 @@ pub fn main(init: std.process.Init) !void {
         .conns = conns,
         .iters = iters,
         .warmup = warmup,
+        .pipeline = pipeline,
         .msg_size = msg_size,
     }, root, init.minimal.environ);
 
@@ -28,6 +30,7 @@ pub fn main(init: std.process.Init) !void {
         .conns = conns,
         .iters = iters,
         .warmup = warmup,
+        .pipeline = pipeline,
         .msg_size = msg_size,
     }, root, init.minimal.environ);
 }

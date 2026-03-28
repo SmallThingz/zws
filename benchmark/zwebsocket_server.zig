@@ -16,7 +16,7 @@ fn usage() void {
         \\zwebsocket-bench-server
         \\
         \\Usage:
-        \\  zwebsocket-bench-server [--port=9001]
+        \\  zwebsocket-bench-server [--port=9001] [--pipeline=1]
         \\
     , .{});
 }
@@ -25,15 +25,18 @@ fn flushIfBuffered(w: *Io.Writer) Io.Writer.Error!void {
     if (w.buffered().len != 0) try w.flush();
 }
 
-fn handleConn(io: Io, stream: std.Io.net.Stream) Io.Cancelable!void {
+fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize) Io.Cancelable!void {
     defer stream.close(io);
     common.setTcpNoDelay(&stream);
 
+    const write_buf_len: usize = if (pipeline > 1) 4 * 1024 else 64;
+    const flush_every: usize = if (pipeline > 1) pipeline else 1;
+
     var read_buf: [4 * 1024]u8 = undefined;
-    var write_buf: [64]u8 = undefined;
+    var write_storage: [4 * 1024]u8 = undefined;
 
     var sr = stream.reader(io, &read_buf);
-    var sw = stream.writer(io, &write_buf);
+    var sw = stream.writer(io, write_storage[0..write_buf_len]);
 
     const req = common.parseHandshakeRequest(&sr.interface) catch return;
     _ = zws.serverHandshake(&sw.interface, req, .{}) catch return;
@@ -42,6 +45,7 @@ fn handleConn(io: Io, stream: std.Io.net.Stream) Io.Cancelable!void {
     var conn = BenchConn.init(&sr.interface, &sw.interface, .{});
 
     var payload_buf: [64 * 1024]u8 = undefined;
+    var buffered_frames: usize = 0;
     while (true) {
         const echoed = conn.echoFrame(payload_buf[0..]) catch |err| switch (err) {
             error.EndOfStream => return,
@@ -51,12 +55,17 @@ fn handleConn(io: Io, stream: std.Io.net.Stream) Io.Cancelable!void {
             sw.interface.flush() catch {};
             return;
         }
-        flushIfBuffered(&sw.interface) catch return;
+        buffered_frames += 1;
+        if (buffered_frames >= flush_every or sr.interface.buffered().len == 0) {
+            flushIfBuffered(&sw.interface) catch return;
+            buffered_frames = 0;
+        }
     }
 }
 
 pub fn main(init: std.process.Init) !void {
     var port: u16 = 9001;
+    var pipeline: usize = 1;
 
     var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer it.deinit();
@@ -71,6 +80,8 @@ pub fn main(init: std.process.Init) !void {
         if (common.parseKeyVal(arg)) |kv| {
             if (std.mem.eql(u8, kv.key, "port")) {
                 port = try std.fmt.parseInt(u16, kv.val, 10);
+            } else if (std.mem.eql(u8, kv.key, "pipeline")) {
+                pipeline = try std.fmt.parseInt(usize, kv.val, 10);
             } else {
                 return error.UnknownArg;
             }
@@ -78,6 +89,7 @@ pub fn main(init: std.process.Init) !void {
         }
         return error.UnknownArg;
     }
+    if (pipeline == 0) return error.InvalidPipeline;
 
     const addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(port) };
     var listener = try std.Io.net.IpAddress.listen(&addr, init.io, .{ .reuse_address = true });
@@ -92,7 +104,7 @@ pub fn main(init: std.process.Init) !void {
             error.Canceled => return,
             else => return,
         };
-        group.concurrent(init.io, handleConn, .{ init.io, stream }) catch {
+        group.concurrent(init.io, handleConn, .{ init.io, stream, pipeline }) catch {
             stream.close(init.io);
         };
     }

@@ -8,6 +8,7 @@ pub const BenchConfig = struct {
     conns: usize,
     iters: usize,
     warmup: usize,
+    pipeline: usize = 1,
     msg_size: usize,
     quiet: bool = true,
 };
@@ -85,8 +86,10 @@ pub fn runZwebsocketExternal(io: std.Io, allocator: std.mem.Allocator, cfg: Benc
     defer allocator.free(bench_path);
 
     var port_buf: [16]u8 = undefined;
+    var pipeline_buf: [32]u8 = undefined;
     const port_arg = try std.fmt.bufPrint(&port_buf, "--port={d}", .{cfg.port});
-    var server = try spawnBackground(io, &.{ server_path, port_arg }, root);
+    const pipeline_arg = try std.fmt.bufPrint(&pipeline_buf, "--pipeline={d}", .{cfg.pipeline});
+    var server = try spawnBackground(io, &.{ server_path, port_arg, pipeline_arg }, root);
     defer terminateChild(io, &server);
 
     try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(200), .awake);
@@ -173,6 +176,7 @@ fn runBench(
     var conns_buf: [32]u8 = undefined;
     var iters_buf: [32]u8 = undefined;
     var warmup_buf: [32]u8 = undefined;
+    var pipeline_buf: [32]u8 = undefined;
     var port_buf: [32]u8 = undefined;
     var size_buf: [32]u8 = undefined;
     var host_buf: [64]u8 = undefined;
@@ -181,6 +185,7 @@ fn runBench(
     const conns_arg = try std.fmt.bufPrint(&conns_buf, "--conns={d}", .{cfg.conns});
     const iters_arg = try std.fmt.bufPrint(&iters_buf, "--iters={d}", .{cfg.iters});
     const warmup_arg = try std.fmt.bufPrint(&warmup_buf, "--warmup={d}", .{cfg.warmup});
+    const pipeline_arg = try std.fmt.bufPrint(&pipeline_buf, "--pipeline={d}", .{cfg.pipeline});
     const port_arg = try std.fmt.bufPrint(&port_buf, "--port={d}", .{cfg.port});
     const size_arg = try std.fmt.bufPrint(&size_buf, "--msg-size={d}", .{cfg.msg_size});
     const host_arg = try std.fmt.bufPrint(&host_buf, "--host={s}", .{cfg.host});
@@ -192,7 +197,7 @@ fn runBench(
 
     var argv: std.ArrayList([]const u8) = .empty;
     defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ bench_path, host_arg, port_arg, path_arg, conns_arg, iters_arg, warmup_arg, size_arg, "--quiet" });
+    try argv.appendSlice(allocator, &.{ bench_path, host_arg, port_arg, path_arg, conns_arg, iters_arg, warmup_arg, pipeline_arg, size_arg, "--quiet" });
 
     try runChecked(io, argv.items, root, &env);
 }

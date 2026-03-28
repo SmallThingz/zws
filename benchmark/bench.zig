@@ -10,6 +10,7 @@ const Config = struct {
     conns: usize = 1,
     iters: u64 = 200_000,
     warmup: u64 = 10_000,
+    pipeline: usize = 1,
     msg_size: usize = 16,
     quiet: bool = false,
     binary: bool = true,
@@ -41,6 +42,7 @@ fn usage() void {
         \\  --conns=1          Concurrent connections
         \\  --iters=200000     Messages per connection
         \\  --warmup=10000     Warmup messages per connection
+        \\  --pipeline=1       In-flight frames per connection
         \\  --msg-size=16      Payload bytes per message
         \\  --text             Use text frames (default is binary)
         \\  --quiet            Print a single summary line
@@ -139,40 +141,55 @@ fn performHandshake(sr: *Io.Reader, sw: *Io.Writer, handshake_request: []const u
     }
 }
 
-fn warmConnection(io: Io, state: *ConnState, handshake_request: []const u8, frame_bytes: []const u8, response_bytes: usize, warmup: u64) !void {
+fn runBatch(sw: *Io.Writer, sr: *Io.Reader, frame_bytes: []const u8, response_bytes: usize, batch: usize) !void {
+    var sent: usize = 0;
+    while (sent < batch) : (sent += 1) {
+        try sw.writeAll(frame_bytes);
+    }
+    try sw.flush();
+
+    var received: usize = 0;
+    while (received < batch) : (received += 1) {
+        try discardExact(sr, response_bytes);
+    }
+}
+
+fn warmConnection(
+    io: Io,
+    state: *ConnState,
+    handshake_request: []const u8,
+    frame_bytes: []const u8,
+    response_bytes: usize,
+    warmup: u64,
+    pipeline: usize,
+) !void {
     var sr = state.stream.reader(io, state.read_buf);
     var sw = state.stream.writer(io, state.write_buf);
 
     try performHandshake(&sr.interface, &sw.interface, handshake_request);
 
     var i: u64 = 0;
-    while (i < warmup) : (i += 1) {
-        try sw.interface.writeAll(frame_bytes);
-        try sw.interface.flush();
-        try discardExact(&sr.interface, response_bytes);
+    while (i < warmup) {
+        const batch = @min(warmup - i, pipeline);
+        try runBatch(&sw.interface, &sr.interface, frame_bytes, response_bytes, batch);
+        i += batch;
     }
 }
 
-fn benchConn(io: Io, state: *ConnState, frame_bytes: []const u8, response_bytes: usize, iters: u64) Io.Cancelable!void {
+fn benchConn(io: Io, state: *ConnState, frame_bytes: []const u8, response_bytes: usize, iters: u64, pipeline: usize) Io.Cancelable!void {
     var sr = state.stream.reader(io, state.read_buf);
     var sw = state.stream.writer(io, state.write_buf);
     defer state.stream.close(io);
 
     var i: u64 = 0;
-    while (i < iters) : (i += 1) {
-        sw.interface.writeAll(frame_bytes) catch |err| {
+    while (i < iters) {
+        const batch = @min(iters - i, pipeline);
+        runBatch(&sw.interface, &sr.interface, frame_bytes, response_bytes, batch) catch |err| {
             state.result.err = err;
             return;
         };
-        sw.interface.flush() catch |err| {
-            state.result.err = err;
-            return;
-        };
-        discardExact(&sr.interface, response_bytes) catch |err| {
-            state.result.err = err;
-            return;
-        };
-        state.result.completed += 1;
+        state.result.completed += batch;
+        i += batch;
     }
 }
 
@@ -185,13 +202,14 @@ fn connectAndWarmup(
     frame_bytes: []const u8,
     response_bytes: usize,
     warmup: u64,
+    pipeline: usize,
 ) !void {
     for (states) |*st| {
         st.read_buf = try a.alloc(u8, 64 * 1024);
         st.write_buf = try a.alloc(u8, 4096);
         st.stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
         common.setTcpNoDelay(&st.stream);
-        try warmConnection(io, st, handshake_request, frame_bytes, response_bytes, warmup);
+        try warmConnection(io, st, handshake_request, frame_bytes, response_bytes, warmup, pipeline);
     }
 }
 
@@ -237,6 +255,8 @@ pub fn main(init: std.process.Init) !void {
                 cfg.iters = try std.fmt.parseInt(u64, kv.val, 10);
             } else if (std.mem.eql(u8, kv.key, "warmup")) {
                 cfg.warmup = try std.fmt.parseInt(u64, kv.val, 10);
+            } else if (std.mem.eql(u8, kv.key, "pipeline")) {
+                cfg.pipeline = try std.fmt.parseInt(usize, kv.val, 10);
             } else if (std.mem.eql(u8, kv.key, "msg-size")) {
                 cfg.msg_size = try std.fmt.parseInt(usize, kv.val, 10);
             } else {
@@ -246,6 +266,7 @@ pub fn main(init: std.process.Init) !void {
         }
         return error.UnknownArg;
     }
+    if (cfg.pipeline == 0) return error.InvalidPipeline;
 
     const a = init.gpa;
     const address: std.Io.net.IpAddress = .{ .ip4 = try std.Io.net.Ip4Address.parse(cfg.host, cfg.port) };
@@ -267,14 +288,14 @@ pub fn main(init: std.process.Init) !void {
     @memset(states, .{});
     defer freeStates(a, states);
 
-    try connectAndWarmup(a, init.io, address, states, handshake_request, frame_bytes, response_bytes, cfg.warmup);
+    try connectAndWarmup(a, init.io, address, states, handshake_request, frame_bytes, response_bytes, cfg.warmup, cfg.pipeline);
 
     var group: Io.Group = .init;
     defer group.cancel(init.io);
 
     const start = Io.Clock.Timestamp.now(init.io, .awake);
     for (states) |*st| {
-        try group.concurrent(init.io, benchConn, .{ init.io, st, frame_bytes, response_bytes, cfg.iters });
+        try group.concurrent(init.io, benchConn, .{ init.io, st, frame_bytes, response_bytes, cfg.iters, cfg.pipeline });
     }
     group.await(init.io) catch {};
     const end = Io.Clock.Timestamp.now(init.io, .awake);
