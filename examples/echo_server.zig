@@ -51,6 +51,7 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void
             .{
                 .allocator = std.heap.page_allocator,
                 .negotiated = pmd,
+                .compress_outgoing = true,
             }
         else
             null,

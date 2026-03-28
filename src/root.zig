@@ -128,6 +128,45 @@ fn fuzzBuiltin(
     fuzz_abi.fuzzer_run();
 }
 
+test "fuzz falls back to a single empty-smith input when corpus is empty" {
+    const State = struct {
+        calls: usize = 0,
+        saw_empty: bool = false,
+    };
+
+    const Harness = struct {
+        fn testOne(state: *State, smith: *std.testing.Smith) !void {
+            state.calls += 1;
+            state.saw_empty = smith.in != null and smith.in.?.len == 0;
+        }
+    };
+
+    var state: State = .{};
+    try fuzz(&state, Harness.testOne, .{ .corpus = &.{} });
+    try std.testing.expectEqual(@as(usize, 1), state.calls);
+    try std.testing.expect(state.saw_empty);
+}
+
+test "fuzz replays every provided corpus input in non-fuzz builds" {
+    const State = struct {
+        calls: usize = 0,
+        total_len: usize = 0,
+    };
+
+    const Harness = struct {
+        fn testOne(state: *State, smith: *std.testing.Smith) !void {
+            state.calls += 1;
+            state.total_len += smith.in.?.len;
+        }
+    };
+
+    var state: State = .{};
+    const corpus = [_][]const u8{ "a", "bc", "" };
+    try fuzz(&state, Harness.testOne, .{ .corpus = corpus[0..] });
+    try std.testing.expectEqual(@as(usize, corpus.len), state.calls);
+    try std.testing.expectEqual(@as(usize, 3), state.total_len);
+}
+
 test {
     _ = @import("observe.zig");
     _ = @import("extensions.zig");
@@ -135,5 +174,6 @@ test {
     _ = @import("handshake.zig");
     _ = @import("conn.zig");
     _ = @import("flate_backend.zig");
+    _ = @import("test_support.zig");
     _ = @import("validation_tests.zig");
 }

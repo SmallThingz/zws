@@ -116,6 +116,11 @@ fn defaultNowNs(_: ?*anyopaque) u64 {
     return 0;
 }
 
+test "default clock callback is callable" {
+    const clock: Clock = .{};
+    _ = clock.nowNs();
+}
+
 test "Clock.nowNs uses custom callback and preserves context" {
     const State = struct {
         value: u64,

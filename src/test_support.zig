@@ -40,3 +40,46 @@ pub fn appendTestFrame(
         b.* ^= mask[i & 3];
     }
 }
+
+const TestOpcode = enum(u4) {
+    continuation = 0x0,
+    text = 0x1,
+    binary = 0x2,
+};
+
+test "appendTestFrame writes unmasked short and extended payload frames" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    try appendTestFrame(TestOpcode, &out, std.testing.allocator, .text, true, false, "hi", .{ 1, 2, 3, 4 });
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 0x02, 'h', 'i' }, out.items);
+
+    out.clearRetainingCapacity();
+    var payload_126: [126]u8 = undefined;
+    @memset(&payload_126, 'a');
+    try appendTestFrame(TestOpcode, &out, std.testing.allocator, .binary, false, false, payload_126[0..], .{ 1, 2, 3, 4 });
+    try std.testing.expectEqual(@as(u8, 0x02), out.items[0]);
+    try std.testing.expectEqual(@as(u8, 126), out.items[1]);
+    try std.testing.expectEqual(@as(u8, 0), out.items[2]);
+    try std.testing.expectEqual(@as(u8, 126), out.items[3]);
+    try std.testing.expectEqual(@as(usize, 4 + payload_126.len), out.items.len);
+}
+
+test "appendTestFrame masks payload bytes and writes 64-bit lengths" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    var payload_big: [65536]u8 = undefined;
+    for (&payload_big, 0..) |*b, i| b.* = @truncate(i);
+    const mask = [_]u8{ 0x11, 0x22, 0x33, 0x44 };
+    try appendTestFrame(TestOpcode, &out, std.testing.allocator, .binary, true, true, payload_big[0..], mask);
+
+    try std.testing.expectEqual(@as(u8, 0x82), out.items[0]);
+    try std.testing.expectEqual(@as(u8, 0xFF), out.items[1]);
+    try std.testing.expectEqual(@as(u64, payload_big.len), std.mem.readInt(u64, out.items[2..10], .big));
+    try std.testing.expectEqualSlices(u8, mask[0..], out.items[10..14]);
+    try std.testing.expectEqual(payload_big[0] ^ mask[0], out.items[14]);
+    try std.testing.expectEqual(payload_big[1] ^ mask[1], out.items[15]);
+    try std.testing.expectEqual(payload_big[2] ^ mask[2], out.items[16]);
+    try std.testing.expectEqual(payload_big[3] ^ mask[3], out.items[17]);
+}

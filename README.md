@@ -160,4 +160,4 @@ zig build bench-compare -Doptimize=ReleaseFast
 - Context takeover support is disabled by default (`StaticConfig.permessage_deflate_context_takeover = false`).
 - When enabled, `StaticConfig` defaults (`permessage_deflate_min_payload_len = 64`, `permessage_deflate_require_compression_gain = true`) skip tiny messages and avoid non-beneficial compression.
 - No TLS or HTTP server framework is bundled; use the raw stream API or the example server as the integration point.
-- Compression support uses `std.compress.flate`; no external compression library is required.
+- Non-takeover `permessage-deflate` framing uses system `zlib`; optional context-takeover support uses `std.compress.flate`.

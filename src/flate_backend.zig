@@ -1,5 +1,9 @@
 const std = @import("std");
 const flate = std.compress.flate;
+const c = @cImport({
+    @cInclude("stdlib.h");
+    @cInclude("zlib.h");
+});
 
 pub const DeflateError = error{
     OutOfMemory,
@@ -15,13 +19,26 @@ pub const InflateError = error{
 };
 
 /// Backend-local flush mode identifiers kept for compatibility with conn.zig.
-pub const sync_flush: i32 = 0;
-pub const full_flush: i32 = 1;
+pub const sync_flush = c.Z_SYNC_FLUSH;
+pub const full_flush = c.Z_FULL_FLUSH;
 const sync_flush_tail = [_]u8{ 0x00, 0x00, 0xff, 0xff };
 const takeover_sentinel: u8 = 0x00;
 
+fn zalloc(_: ?*anyopaque, items: c_uint, size: c_uint) callconv(.c) ?*anyopaque {
+    const total = std.math.mul(usize, @as(usize, items), @as(usize, size)) catch return null;
+    return c.malloc(total);
+}
+
+fn zfree(_: ?*anyopaque, ptr: ?*anyopaque) callconv(.c) void {
+    c.free(ptr);
+}
+
 fn flateCounter(n: usize) error{CounterTooLarge}!u32 {
     return std.math.cast(u32, n) orelse error.CounterTooLarge;
+}
+
+fn zlibCounter(n: usize) error{CounterTooLarge}!c_uint {
+    return std.math.cast(c_uint, n) orelse error.CounterTooLarge;
 }
 
 fn optionsFromLevel(level: i32) flate.Compress.Options {
@@ -142,27 +159,45 @@ pub fn deflateMessage(
         sync_flush, full_flush => {},
         else => return error.DeflateFailed,
     }
-    _ = flateCounter(payload.len) catch return error.CounterTooLarge;
+    var stream: c.z_stream = std.mem.zeroes(c.z_stream);
+    stream.zalloc = zalloc;
+    stream.zfree = zfree;
+    const init_rc = c.deflateInit2_(
+        &stream,
+        @intCast(level),
+        c.Z_DEFLATED,
+        -15,
+        c.MAX_MEM_LEVEL,
+        c.Z_DEFAULT_STRATEGY,
+        c.ZLIB_VERSION,
+        @sizeOf(c.z_stream),
+    );
+    if (init_rc != c.Z_OK) return error.DeflateFailed;
+    defer _ = c.deflateEnd(&stream);
 
-    const initial_capacity = @max(@as(usize, 256), payload.len +| (payload.len / 8) + 64);
-    var out = std.Io.Writer.Allocating.initCapacity(allocator, initial_capacity) catch return error.OutOfMemory;
-    errdefer out.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
 
-    var compress_buf: [flate.max_window_len]u8 = undefined;
-    var compressor = flate.Compress.init(
-        &out.writer,
-        compress_buf[0..],
-        .raw,
-        optionsFromLevel(level),
-    ) catch return error.DeflateFailed;
+    stream.next_in = if (payload.len == 0) null else @ptrCast(@constCast(payload.ptr));
+    stream.avail_in = zlibCounter(payload.len) catch return error.CounterTooLarge;
 
-    compressor.writer.writeAll(payload) catch |err| switch (err) {
-        error.WriteFailed => return error.OutOfMemory,
-    };
-    compressor.finish() catch |err| switch (err) {
-        error.WriteFailed => return error.OutOfMemory,
-    };
-    return out.toOwnedSlice() catch return error.OutOfMemory;
+    var chunk: [1024]u8 = undefined;
+    while (true) {
+        stream.next_out = @ptrCast(&chunk[0]);
+        stream.avail_out = @as(c_uint, @intCast(chunk.len));
+
+        const rc = c.deflate(&stream, @intCast(flush_mode));
+        if (rc != c.Z_OK) return error.DeflateFailed;
+
+        const produced = chunk.len - stream.avail_out;
+        out.appendSlice(allocator, chunk[0..produced]) catch return error.OutOfMemory;
+
+        if (stream.avail_in == 0 and stream.avail_out != 0) break;
+    }
+
+    if (!std.mem.endsWith(u8, out.items, &sync_flush_tail)) return error.DeflateFailed;
+    out.shrinkRetainingCapacity(out.items.len - sync_flush_tail.len);
+    return out.toOwnedSlice(allocator) catch return error.OutOfMemory;
 }
 
 pub fn inflateMessage(
@@ -170,53 +205,44 @@ pub fn inflateMessage(
     compressed_payload: []const u8,
     dest: []u8,
 ) InflateError![]u8 {
-    const compat_suffix = [_]u8{
-        0x00, 0x00, 0xff, 0xff,
-        0x01, 0x00, 0x00, 0xff,
-        0xff,
-    };
+    _ = allocator;
 
-    // First attempt: RFC7692-style payloads that omit Z_SYNC_FLUSH tail.
-    const with_suffix = inflateWithSuffix(allocator, compressed_payload, dest, compat_suffix[0..]) catch |err| switch (err) {
-        error.InflateFailed => null,
-        else => return err,
-    };
-    if (with_suffix) |inflated| {
-        if (inflated.len != 0 or compressed_payload.len == 0) return inflated;
+    var stream: c.z_stream = std.mem.zeroes(c.z_stream);
+    stream.zalloc = zalloc;
+    stream.zfree = zfree;
+    const init_rc = c.inflateInit2_(&stream, -15, c.ZLIB_VERSION, @sizeOf(c.z_stream));
+    if (init_rc != c.Z_OK) return error.InflateFailed;
+    defer _ = c.inflateEnd(&stream);
+
+    stream.next_in = if (compressed_payload.len == 0) null else @ptrCast(@constCast(compressed_payload.ptr));
+    stream.avail_in = zlibCounter(compressed_payload.len) catch return error.CounterTooLarge;
+    stream.next_out = if (dest.len == 0) null else @ptrCast(dest.ptr);
+    stream.avail_out = zlibCounter(dest.len) catch return error.CounterTooLarge;
+
+    while (true) {
+        const prev_in = stream.avail_in;
+        const prev_out = stream.avail_out;
+        const rc = c.inflate(&stream, c.Z_SYNC_FLUSH);
+        switch (rc) {
+            c.Z_STREAM_END => return dest[0..stream.total_out],
+            c.Z_OK => {
+                if (stream.avail_in == 0) return dest[0..stream.total_out];
+                if (stream.avail_out == 0) return error.MessageTooLarge;
+            },
+            c.Z_BUF_ERROR => {
+                if (stream.avail_in == 0) return dest[0..stream.total_out];
+                if (stream.avail_out == 0) return error.MessageTooLarge;
+            },
+            else => return error.InflateFailed,
+        }
+
+        if (stream.avail_in == prev_in and stream.avail_out == prev_out) {
+            return error.InflateFailed;
+        }
     }
-
-    // Fallback for peers that emit complete raw-deflate streams per message.
-    return inflateWithSuffix(allocator, compressed_payload, dest, ""[0..]);
 }
 
-fn inflateWithSuffix(
-    allocator: std.mem.Allocator,
-    compressed_payload: []const u8,
-    dest: []u8,
-    suffix: []const u8,
-) InflateError![]u8 {
-    _ = flateCounter(compressed_payload.len) catch return error.CounterTooLarge;
-    _ = flateCounter(dest.len) catch return error.CounterTooLarge;
-
-    const input_len = std.math.add(usize, compressed_payload.len, suffix.len) catch return error.CounterTooLarge;
-    const input = allocator.alloc(u8, input_len) catch return error.OutOfMemory;
-    defer allocator.free(input);
-    @memcpy(input[0..compressed_payload.len], compressed_payload);
-    @memcpy(input[compressed_payload.len..], suffix);
-
-    var reader = std.Io.Reader.fixed(input);
-    var inflate_buf: [flate.max_window_len]u8 = undefined;
-    var decompressor: flate.Decompress = .init(&reader, .raw, inflate_buf[0..]);
-    var writer = std.Io.Writer.fixed(dest);
-
-    _ = decompressor.reader.streamRemaining(&writer) catch |err| switch (err) {
-        error.WriteFailed => return error.MessageTooLarge,
-        else => return error.InflateFailed,
-    };
-    return dest[0..writer.end];
-}
-
-test "flate permessage-deflate helpers roundtrip sync and full flush payloads" {
+test "zlib permessage-deflate helpers roundtrip sync and full flush payloads" {
     const payload = "zwebsocket interop text payload with enough repetition to exercise permessage-deflate";
 
     inline for (.{ sync_flush, full_flush }) |flush_mode| {
@@ -242,6 +268,60 @@ test "deflateMessage and inflateMessage roundtrip binary data" {
     var out: [1024]u8 = undefined;
     const inflated = try inflateMessage(std.testing.allocator, compressed, out[0..]);
     try std.testing.expectEqualSlices(u8, payload[0..], inflated);
+}
+
+test "deflateMessage outputs streams that a reused zlib inflater can consume sequentially" {
+    const m1 = "hello hello hello";
+    const m2 = "hello hello hello again";
+
+    const c1 = try deflateMessage(std.testing.allocator, m1, 1, sync_flush);
+    defer std.testing.allocator.free(c1);
+    const c2 = try deflateMessage(std.testing.allocator, m2, 1, sync_flush);
+    defer std.testing.allocator.free(c2);
+    const in1 = try std.mem.concat(std.testing.allocator, u8, &.{ c1, &sync_flush_tail });
+    defer std.testing.allocator.free(in1);
+    const in2 = try std.mem.concat(std.testing.allocator, u8, &.{ c2, &sync_flush_tail });
+    defer std.testing.allocator.free(in2);
+
+    var stream: c.z_stream = std.mem.zeroes(c.z_stream);
+    stream.zalloc = zalloc;
+    stream.zfree = zfree;
+    try std.testing.expectEqual(@as(c_int, c.Z_OK), c.inflateInit2_(&stream, -15, c.ZLIB_VERSION, @sizeOf(c.z_stream)));
+    defer _ = c.inflateEnd(&stream);
+
+    var out1: [64]u8 = undefined;
+    stream.next_in = @ptrCast(@constCast(in1.ptr));
+    stream.avail_in = try zlibCounter(in1.len);
+    stream.next_out = @ptrCast(out1[0..].ptr);
+    stream.avail_out = try zlibCounter(out1.len);
+    while (true) {
+        const rc = c.inflate(&stream, c.Z_SYNC_FLUSH);
+        if (rc == c.Z_OK or rc == c.Z_BUF_ERROR) {
+            if (stream.avail_in == 0) break;
+            if (stream.avail_out == 0) return error.MessageTooLarge;
+            continue;
+        }
+        return error.InflateFailed;
+    }
+    try std.testing.expectEqualStrings(m1, out1[0..stream.total_out]);
+
+    const out1_len = stream.total_out;
+    var out2: [64]u8 = undefined;
+    stream.next_in = @ptrCast(@constCast(in2.ptr));
+    stream.avail_in = try zlibCounter(in2.len);
+    stream.next_out = @ptrCast(out2[0..].ptr);
+    stream.avail_out = try zlibCounter(out2.len);
+    while (true) {
+        const rc = c.inflate(&stream, c.Z_SYNC_FLUSH);
+        if (rc == c.Z_OK or rc == c.Z_BUF_ERROR) {
+            if (stream.avail_in == 0) break;
+            if (stream.avail_out == 0) return error.MessageTooLarge;
+            continue;
+        }
+        return error.InflateFailed;
+    }
+    const out2_len = stream.total_out - out1_len;
+    try std.testing.expectEqualStrings(m2, out2[0..out2_len]);
 }
 
 test "inflateMessage accepts RFC7692 stripped sync-flush payloads" {
@@ -278,4 +358,9 @@ test "takeover helpers roundtrip multiple messages through shared compression st
 test "flateCounter rejects lengths that do not fit 32-bit counters" {
     try std.testing.expectEqual(@as(u32, 123), try flateCounter(123));
     try std.testing.expectError(error.CounterTooLarge, flateCounter(@as(usize, std.math.maxInt(u32)) + 1));
+}
+
+test "zlibCounter rejects lengths that do not fit zlib counters" {
+    try std.testing.expectEqual(@as(c_uint, 123), try zlibCounter(123));
+    try std.testing.expectError(error.CounterTooLarge, zlibCounter(@as(usize, std.math.maxInt(c_uint)) + 1));
 }
