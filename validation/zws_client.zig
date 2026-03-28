@@ -1,6 +1,6 @@
 const std = @import("std");
 const zws = @import("zwebsocket");
-const common = @import("zws_example_common");
+const common = @import("zws_support_common");
 
 const Io = common.Io;
 

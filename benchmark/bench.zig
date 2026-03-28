@@ -1,5 +1,5 @@
 const std = @import("std");
-const builtin = @import("builtin");
+const common = @import("zws_support_common");
 
 const Io = std.Io;
 
@@ -47,29 +47,6 @@ fn usage() void {
         \\  --help             Show this help
         \\
     , .{});
-}
-
-fn parseKeyVal(arg: []const u8) ?struct { key: []const u8, val: []const u8 } {
-    if (!std.mem.startsWith(u8, arg, "--")) return null;
-    const eq = std.mem.indexOfScalar(u8, arg, '=') orelse return null;
-    return .{ .key = arg[2..eq], .val = arg[eq + 1 ..] };
-}
-
-fn trimCR(line: []const u8) []const u8 {
-    if (line.len != 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
-    return line;
-}
-
-fn setTcpNoDelay(stream: *const std.Io.net.Stream) void {
-    if (builtin.os.tag != .linux) return;
-    const linux = std.os.linux;
-    var one: i32 = 1;
-    std.posix.setsockopt(
-        stream.socket.handle,
-        @intCast(linux.IPPROTO.TCP),
-        linux.TCP.NODELAY,
-        std.mem.asBytes(&one),
-    ) catch {};
 }
 
 fn discardExact(r: *Io.Reader, n: usize) !void {
@@ -151,13 +128,13 @@ fn performHandshake(sr: *Io.Reader, sw: *Io.Writer, handshake_request: []const u
     try sw.flush();
 
     const status_line_incl = try sr.takeDelimiterInclusive('\n');
-    const status_line = trimCR(status_line_incl[0 .. status_line_incl.len - 1]);
+    const status_line = common.trimCR(status_line_incl[0 .. status_line_incl.len - 1]);
     if (!std.mem.startsWith(u8, status_line, "HTTP/1.1 101")) return error.BadHandshake;
 
     while (true) {
         const line0_incl = try sr.takeDelimiterInclusive('\n');
         const line0 = line0_incl[0 .. line0_incl.len - 1];
-        const line = trimCR(line0);
+        const line = common.trimCR(line0);
         if (line.len == 0) break;
     }
 }
@@ -213,7 +190,7 @@ fn connectAndWarmup(
         st.read_buf = try a.alloc(u8, 64 * 1024);
         st.write_buf = try a.alloc(u8, 4096);
         st.stream = try std.Io.net.IpAddress.connect(&address, io, .{ .mode = .stream });
-        setTcpNoDelay(&st.stream);
+        common.setTcpNoDelay(&st.stream);
         try warmConnection(io, st, handshake_request, frame_bytes, response_bytes, warmup);
     }
 }
@@ -247,7 +224,7 @@ pub fn main(init: std.process.Init) !void {
             cfg.binary = false;
             continue;
         }
-        if (parseKeyVal(arg)) |kv| {
+        if (common.parseKeyVal(arg)) |kv| {
             if (std.mem.eql(u8, kv.key, "host")) {
                 cfg.host = kv.val;
             } else if (std.mem.eql(u8, kv.key, "port")) {

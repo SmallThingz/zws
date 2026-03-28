@@ -12,6 +12,15 @@ pub fn build(b: *std.Build) void {
     mod.linkSystemLibrary("c", .{});
     mod.linkSystemLibrary("z", .{});
 
+    const support_common = b.createModule(.{
+        .root_source_file = b.path("support/common.zig"),
+        .target = target,
+        .optimize = optimize,
+        .imports = &.{
+            .{ .name = "zwebsocket", .module = mod },
+        },
+    });
+
     const mod_tests = b.addTest(.{
         .root_module = mod,
     });
@@ -25,6 +34,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws_support_common", .module = support_common },
             },
         }),
     });
@@ -38,6 +48,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws_support_common", .module = support_common },
             },
         }),
     });
@@ -51,6 +62,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws_support_common", .module = support_common },
             },
         }),
     });
@@ -64,6 +76,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws_support_common", .module = support_common },
             },
         }),
     });
@@ -77,6 +90,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws_support_common", .module = support_common },
             },
         }),
     });
@@ -90,6 +104,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws_support_common", .module = support_common },
             },
         }),
     });
@@ -103,14 +118,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
             .imports = &.{
                 .{ .name = "zwebsocket", .module = mod },
-                .{ .name = "zws_example_common", .module = b.createModule(.{
-                    .root_source_file = b.path("examples/common.zig"),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "zwebsocket", .module = mod },
-                    },
-                }) },
+                .{ .name = "zws_support_common", .module = support_common },
             },
         }),
     });

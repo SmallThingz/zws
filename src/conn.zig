@@ -2093,6 +2093,8 @@ const TestDeadlineState = struct {
     read_len: usize = 0,
     write_calls: [8]?u64 = [_]?u64{null} ** 8,
     write_len: usize = 0,
+    flush_calls: [8]?u64 = [_]?u64{null} ** 8,
+    flush_len: usize = 0,
 
     fn setRead(ctx: ?*anyopaque, deadline_ns: ?u64) void {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
@@ -2104,6 +2106,12 @@ const TestDeadlineState = struct {
         const self: *@This() = @ptrCast(@alignCast(ctx.?));
         self.write_calls[self.write_len] = deadline_ns;
         self.write_len += 1;
+    }
+
+    fn setFlush(ctx: ?*anyopaque, deadline_ns: ?u64) void {
+        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        self.flush_calls[self.flush_len] = deadline_ns;
+        self.flush_len += 1;
     }
 };
 
@@ -2220,15 +2228,67 @@ test "deadline controller is set and cleared around timed reads and writes" {
                 .now_ns_fn = StaticClock.now,
             },
             .write_ns = 20,
+            .flush_ns = 20,
             .deadlines = .{
                 .ctx = &deadline_state,
                 .set_write_deadline_ns_fn = TestDeadlineState.setWrite,
+                .set_flush_deadline_ns_fn = TestDeadlineState.setFlush,
             },
         },
     });
     try write_conn.writeBinary("y");
+    try write_conn.flush();
 
     try std.testing.expect(deadline_state.write_len >= 2);
     try std.testing.expectEqual(@as(?u64, 30), deadline_state.write_calls[0]);
     try std.testing.expectEqual(@as(?u64, null), deadline_state.write_calls[deadline_state.write_len - 1]);
+    try std.testing.expect(deadline_state.flush_len >= 2);
+    try std.testing.expectEqual(@as(?u64, 30), deadline_state.flush_calls[0]);
+    try std.testing.expectEqual(@as(?u64, null), deadline_state.flush_calls[deadline_state.flush_len - 1]);
+}
+
+test "runtime_hooks false disables observer and timeout hooks" {
+    var observer_state: TestObserverState = .{};
+    var clock_state: TestClockState = .{
+        .step_ns = 5,
+    };
+    var deadline_state: TestDeadlineState = .{};
+
+    const wire = [_]u8{ 0x81, 0x01, 'x' };
+    var reader = Io.Reader.fixed(wire[0..]);
+    var write_buf: [16]u8 = undefined;
+    var writer = Io.Writer.fixed(write_buf[0..]);
+    var conn = Conn(.{
+        .role = .client,
+        .runtime_hooks = false,
+    }).init(&reader, &writer, .{
+        .timeouts = .{
+            .clock = .{
+                .ctx = &clock_state,
+                .now_ns_fn = TestClockState.now,
+            },
+            .read_ns = 1,
+            .write_ns = 1,
+            .flush_ns = 1,
+            .deadlines = .{
+                .ctx = &deadline_state,
+                .set_read_deadline_ns_fn = TestDeadlineState.setRead,
+                .set_write_deadline_ns_fn = TestDeadlineState.setWrite,
+                .set_flush_deadline_ns_fn = TestDeadlineState.setFlush,
+            },
+        },
+        .observer = observer_state.observer(),
+    });
+
+    var frame_buf: [8]u8 = undefined;
+    const frame = try conn.readFrame(frame_buf[0..]);
+    try std.testing.expectEqual(Opcode.text, frame.header.opcode);
+    try std.testing.expectEqualStrings("x", frame.payload);
+    try conn.writeBinary("ok");
+    try conn.flush();
+
+    try std.testing.expectEqual(@as(usize, 0), observer_state.len);
+    try std.testing.expectEqual(@as(usize, 0), deadline_state.read_len);
+    try std.testing.expectEqual(@as(usize, 0), deadline_state.write_len);
+    try std.testing.expectEqual(@as(usize, 0), deadline_state.flush_len);
 }
