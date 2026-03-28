@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const windows = std.os.windows;
 
 const Args = struct {
     server_bin: []const u8,
@@ -260,6 +261,78 @@ fn spawnServer(io: std.Io, argv: []const []const u8, cwd: ?[]const u8) !std.proc
     });
 }
 
+fn spawnChild(
+    io: std.Io,
+    argv: []const []const u8,
+    cwd: ?[]const u8,
+    env_map: ?*const std.process.Environ.Map,
+) !std.process.Child {
+    const cwd_opt: std.process.Child.Cwd = if (cwd) |p| .{ .path = p } else .inherit;
+    return try std.process.spawn(io, .{
+        .argv = argv,
+        .cwd = cwd_opt,
+        .environ_map = env_map,
+        .stdin = .ignore,
+        .stdout = .inherit,
+        .stderr = .inherit,
+    });
+}
+
+fn childCleanupPosix(child: *std.process.Child) void {
+    if (child.stdin) |stdin| {
+        _ = std.posix.system.close(stdin.handle);
+        child.stdin = null;
+    }
+    if (child.stdout) |stdout| {
+        _ = std.posix.system.close(stdout.handle);
+        child.stdout = null;
+    }
+    if (child.stderr) |stderr| {
+        _ = std.posix.system.close(stderr.handle);
+        child.stderr = null;
+    }
+    child.id = null;
+}
+
+fn statusToTerm(status: u32) std.process.Child.Term {
+    return if (std.posix.W.IFEXITED(status))
+        .{ .exited = std.posix.W.EXITSTATUS(status) }
+    else if (std.posix.W.IFSIGNALED(status))
+        .{ .signal = std.posix.W.TERMSIG(status) }
+    else if (std.posix.W.IFSTOPPED(status))
+        .{ .stopped = std.posix.W.STOPSIG(status) }
+    else
+        .{ .unknown = status };
+}
+
+fn tryCollectChildTerm(io: std.Io, child: *std.process.Child) !?std.process.Child.Term {
+    if (child.id == null) return null;
+
+    if (builtin.os.tag == .windows) {
+        const zero_timeout: windows.LARGE_INTEGER = 0;
+        return switch (windows.ntdll.NtWaitForSingleObject(child.id.?, .FALSE, &zero_timeout)) {
+            windows.NTSTATUS.WAIT_0 => try child.wait(io),
+            .TIMEOUT, .USER_APC, .ALERTED => null,
+            else => |status| windows.unexpectedStatus(status),
+        };
+    }
+
+    var status: if (builtin.link_libc) c_int else u32 = undefined;
+    while (true) {
+        const rc = std.posix.system.waitpid(child.id.?, &status, std.posix.W.NOHANG);
+        switch (std.posix.errno(rc)) {
+            .SUCCESS => {
+                if (rc == 0) return null;
+                childCleanupPosix(child);
+                return statusToTerm(@bitCast(status));
+            },
+            .INTR => continue,
+            .CHILD => return error.ProcessFailed,
+            else => |err| return std.posix.unexpectedErrno(err),
+        }
+    }
+}
+
 fn terminateChild(io: std.Io, child: *std.process.Child) void {
     if (child.id == null) return;
     if (builtin.os.tag == .windows) {
@@ -287,6 +360,36 @@ fn waitForPort(io: std.Io, port: u16, timeout_ms: u64) !void {
     return error.PortWaitTimedOut;
 }
 
+fn termFailed(term: std.process.Child.Term) bool {
+    return switch (term) {
+        .exited => |code| code != 0,
+        else => true,
+    };
+}
+
+fn runCheckedTimed(
+    io: std.Io,
+    argv: []const []const u8,
+    cwd: ?[]const u8,
+    env_map: ?*const std.process.Environ.Map,
+    timeout_ms: u64,
+) !void {
+    var child = try spawnChild(io, argv, cwd, env_map);
+
+    const start = std.Io.Timestamp.now(io, .awake);
+    const deadline = start.addDuration(std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)));
+    while (std.Io.Timestamp.now(io, .awake).nanoseconds < deadline.nanoseconds) {
+        if (try tryCollectChildTerm(io, &child)) |term| {
+            if (termFailed(term)) return error.ProcessFailed;
+            return;
+        }
+        try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(50), .awake);
+    }
+
+    child.kill(io);
+    return error.ProcessTimedOut;
+}
+
 const Scenario = struct {
     name: []const u8,
     port: u16,
@@ -304,8 +407,17 @@ fn runScenario(io: std.Io, scenario: Scenario) !void {
     var server = try spawnServer(io, scenario.server_cmd, scenario.server_cwd);
     defer terminateChild(io, &server);
 
-    try waitForPort(io, scenario.port, 10_000);
-    try runChecked(io, scenario.client_cmd, scenario.client_cwd, null);
+    waitForPort(io, scenario.port, 10_000) catch |err| {
+        if (try tryCollectChildTerm(io, &server)) |term| {
+            if (termFailed(term)) return error.ProcessFailed;
+        }
+        return err;
+    };
+    try runCheckedTimed(io, scenario.client_cmd, scenario.client_cwd, null, 30_000);
+
+    if (try tryCollectChildTerm(io, &server)) |term| {
+        if (termFailed(term)) return error.ProcessFailed;
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -341,7 +453,7 @@ pub fn main(init: std.process.Init) !void {
             .port = args.port_base,
             .server_cmd = &.{ args.server_bin, port_0 },
             .server_cwd = root,
-            .client_cmd = &.{ "timeout", "30s", node, "-e", node_peer_code, "client", node_client_url_0 },
+            .client_cmd = &.{ node, "-e", node_peer_code, "client", node_client_url_0 },
             .client_cwd = validation_dir,
         },
         .{
@@ -349,7 +461,7 @@ pub fn main(init: std.process.Init) !void {
             .port = args.port_base + 1,
             .server_cmd = &.{ args.server_bin, port_1, "--compression" },
             .server_cwd = root,
-            .client_cmd = &.{ "timeout", "30s", node, "-e", node_peer_code, "client", node_client_url_1, "--compression" },
+            .client_cmd = &.{ node, "-e", node_peer_code, "client", node_client_url_1, "--compression" },
             .client_cwd = validation_dir,
         },
         .{
@@ -357,7 +469,7 @@ pub fn main(init: std.process.Init) !void {
             .port = args.port_base + 2,
             .server_cmd = &.{ args.server_bin, port_2 },
             .server_cwd = root,
-            .client_cmd = &.{ "timeout", "30s", python, "-c", aiohttp_peer_code, "client", aiohttp_client_url_2 },
+            .client_cmd = &.{ python, "-c", aiohttp_peer_code, "client", aiohttp_client_url_2 },
             .client_cwd = validation_dir,
         },
         .{
@@ -365,7 +477,7 @@ pub fn main(init: std.process.Init) !void {
             .port = args.port_base + 3,
             .server_cmd = &.{ args.server_bin, port_3, "--compression" },
             .server_cwd = root,
-            .client_cmd = &.{ "timeout", "30s", python, "-c", aiohttp_peer_code, "client", aiohttp_client_url_3, "--compression" },
+            .client_cmd = &.{ python, "-c", aiohttp_peer_code, "client", aiohttp_client_url_3, "--compression" },
             .client_cwd = validation_dir,
         },
         .{
@@ -373,7 +485,7 @@ pub fn main(init: std.process.Init) !void {
             .port = args.port_base + 4,
             .server_cmd = &.{ args.server_bin, port_4, "--compression" },
             .server_cwd = root,
-            .client_cmd = &.{ "timeout", "30s", args.repeated_client_bin, port_4 },
+            .client_cmd = &.{ args.repeated_client_bin, port_4 },
             .client_cwd = root,
         },
         .{
@@ -381,7 +493,7 @@ pub fn main(init: std.process.Init) !void {
             .port = args.port_base + 5,
             .server_cmd = &.{ node, "-e", node_peer_code, "server", port_5 },
             .server_cwd = validation_dir,
-            .client_cmd = &.{ "timeout", "30s", args.client_bin, port_5 },
+            .client_cmd = &.{ args.client_bin, port_5 },
             .client_cwd = root,
         },
         .{
@@ -389,7 +501,7 @@ pub fn main(init: std.process.Init) !void {
             .port = args.port_base + 6,
             .server_cmd = &.{ node, "-e", node_peer_code, "server", port_6, "--compression" },
             .server_cwd = validation_dir,
-            .client_cmd = &.{ "timeout", "30s", args.client_bin, port_6, "--compression" },
+            .client_cmd = &.{ args.client_bin, port_6, "--compression" },
             .client_cwd = root,
         },
         .{
@@ -397,7 +509,7 @@ pub fn main(init: std.process.Init) !void {
             .port = args.port_base + 7,
             .server_cmd = &.{ python, "-c", aiohttp_peer_code, "server", port_7 },
             .server_cwd = validation_dir,
-            .client_cmd = &.{ "timeout", "30s", args.client_bin, port_7 },
+            .client_cmd = &.{ args.client_bin, port_7 },
             .client_cwd = root,
         },
         .{
@@ -405,7 +517,7 @@ pub fn main(init: std.process.Init) !void {
             .port = args.port_base + 8,
             .server_cmd = &.{ python, "-c", aiohttp_peer_code, "server", port_8, "--compression" },
             .server_cwd = validation_dir,
-            .client_cmd = &.{ "timeout", "30s", args.client_bin, port_8, "--compression" },
+            .client_cmd = &.{ args.client_bin, port_8, "--compression" },
             .client_cwd = root,
         },
     };
