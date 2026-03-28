@@ -115,3 +115,91 @@ fn defaultNowNs(_: ?*anyopaque) u64 {
     }
     return 0;
 }
+
+test "Clock.nowNs uses custom callback and preserves context" {
+    const State = struct {
+        value: u64,
+
+        fn now(ctx: ?*anyopaque) u64 {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.value += 7;
+            return self.value;
+        }
+    };
+
+    var state: State = .{ .value = 10 };
+    const clock: Clock = .{
+        .ctx = &state,
+        .now_ns_fn = State.now,
+    };
+    try std.testing.expectEqual(@as(u64, 17), clock.nowNs());
+    try std.testing.expectEqual(@as(u64, 24), clock.nowNs());
+}
+
+test "DeadlineController invokes only configured callbacks" {
+    const State = struct {
+        read: ?u64 = null,
+        write: ?u64 = null,
+        flush: ?u64 = null,
+
+        fn setRead(ctx: ?*anyopaque, deadline_ns: ?u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.read = deadline_ns;
+        }
+        fn setWrite(ctx: ?*anyopaque, deadline_ns: ?u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.write = deadline_ns;
+        }
+        fn setFlush(ctx: ?*anyopaque, deadline_ns: ?u64) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.flush = deadline_ns;
+        }
+    };
+
+    var state: State = .{};
+    const controller: DeadlineController = .{
+        .ctx = &state,
+        .set_read_deadline_ns_fn = State.setRead,
+        .set_flush_deadline_ns_fn = State.setFlush,
+    };
+    controller.setReadDeadlineNs(123);
+    controller.setWriteDeadlineNs(456);
+    controller.setFlushDeadlineNs(null);
+
+    try std.testing.expectEqual(@as(?u64, 123), state.read);
+    try std.testing.expectEqual(@as(?u64, null), state.write);
+    try std.testing.expectEqual(@as(?u64, null), state.flush);
+
+    const controller_all: DeadlineController = .{
+        .ctx = &state,
+        .set_write_deadline_ns_fn = State.setWrite,
+    };
+    controller_all.setWriteDeadlineNs(789);
+    try std.testing.expectEqual(@as(?u64, 789), state.write);
+}
+
+test "Observer.emit forwards event to callback" {
+    const State = struct {
+        called: bool = false,
+        seen: ?Event = null,
+
+        fn onEvent(ctx: ?*anyopaque, event: Event) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            self.called = true;
+            self.seen = event;
+        }
+    };
+
+    var state: State = .{};
+    const observer: Observer = .{
+        .ctx = &state,
+        .on_event_fn = State.onEvent,
+    };
+    observer.emit(.{ .ping_received = .{ .payload_len = 9 } });
+
+    try std.testing.expect(state.called);
+    switch (state.seen.?) {
+        .ping_received => |event| try std.testing.expectEqual(@as(usize, 9), event.payload_len),
+        else => return error.TestExpectedEqual,
+    }
+}

@@ -25,6 +25,10 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    const support_tests = b.addTest(.{
+        .root_module = support_common,
+    });
+    const run_support_tests = b.addRunArtifact(support_tests);
 
     const bench_exe = b.addExecutable(.{
         .name = "zwebsocket-bench",
@@ -126,6 +130,7 @@ pub fn build(b: *std.Build) void {
 
     const test_step = b.step("test", "Run zwebsocket tests");
     test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_support_tests.step);
 
     const bench_run = b.addRunArtifact(bench_exe);
     bench_run.step.dependOn(&install_bench.step);
@@ -189,6 +194,7 @@ pub fn build(b: *std.Build) void {
 
     const validate_step = b.step("validate", "Run tests, interop, and soak validation");
     validate_step.dependOn(&run_mod_tests.step);
+    validate_step.dependOn(&run_support_tests.step);
     validate_step.dependOn(&interop_run.step);
     validate_step.dependOn(&soak_run.step);
     validate_step.dependOn(&soak_compressed.step);

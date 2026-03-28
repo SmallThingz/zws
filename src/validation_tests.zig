@@ -1,46 +1,8 @@
 const std = @import("std");
 const zws = @import("root.zig");
+const test_support = @import("test_support.zig");
 
 const Io = std.Io;
-
-fn appendTestFrame(
-    out: *std.ArrayList(u8),
-    a: std.mem.Allocator,
-    opcode: zws.Opcode,
-    fin: bool,
-    masked: bool,
-    payload: []const u8,
-    mask: [4]u8,
-) !void {
-    const first: u8 = @as(u8, @intFromEnum(opcode)) | if (fin) @as(u8, 0x80) else 0;
-    try out.append(a, first);
-
-    if (payload.len <= 125) {
-        try out.append(a, @as(u8, @intCast(payload.len)) | if (masked) @as(u8, 0x80) else 0);
-    } else if (payload.len <= std.math.maxInt(u16)) {
-        try out.append(a, 126 | if (masked) @as(u8, 0x80) else 0);
-        var ext: [2]u8 = undefined;
-        std.mem.writeInt(u16, ext[0..], @as(u16, @intCast(payload.len)), .big);
-        try out.appendSlice(a, ext[0..]);
-    } else {
-        try out.append(a, 127 | if (masked) @as(u8, 0x80) else 0);
-        var ext: [8]u8 = undefined;
-        std.mem.writeInt(u64, ext[0..], payload.len, .big);
-        try out.appendSlice(a, ext[0..]);
-    }
-
-    if (masked) {
-        try out.appendSlice(a, mask[0..]);
-        const start = out.items.len;
-        try out.resize(a, start + payload.len);
-        @memcpy(out.items[start..][0..payload.len], payload);
-        for (out.items[start..][0..payload.len], 0..) |*b, i| {
-            b.* ^= mask[i & 3];
-        }
-    } else {
-        try out.appendSlice(a, payload);
-    }
-}
 
 fn fuzzMalformedFrames(_: void, smith: *std.testing.Smith) !void {
     var input_buf: [96]u8 = undefined;
@@ -121,9 +83,9 @@ test "property random fragmented masked reads reconstruct message bytes" {
 
         var wire: std.ArrayList(u8) = .empty;
         defer wire.deinit(std.testing.allocator);
-        try appendTestFrame(&wire, std.testing.allocator, .binary, split_at == total_len, true, payload[0..split_at], .{ 1, 2, 3, 4 });
+        try test_support.appendTestFrame(zws.Opcode, &wire, std.testing.allocator, .binary, split_at == total_len, true, payload[0..split_at], .{ 1, 2, 3, 4 });
         if (split_at != total_len) {
-            try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, payload[split_at..], .{ 5, 6, 7, 8 });
+            try test_support.appendTestFrame(zws.Opcode, &wire, std.testing.allocator, .continuation, true, true, payload[split_at..], .{ 5, 6, 7, 8 });
         }
 
         var reader = Io.Reader.fixed(wire.items);

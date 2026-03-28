@@ -5,6 +5,7 @@ const proto = @import("protocol.zig");
 const extensions = @import("extensions.zig");
 const observe = @import("observe.zig");
 const zlib_backend = @import("zlib_backend.zig");
+const test_support = @import("test_support.zig");
 
 const control_payload_max_len = 125;
 const frame_header_max_len = 14;
@@ -725,7 +726,6 @@ pub fn Conn(comptime static: StaticConfig) type {
                     self.close_received = true;
                     self.recv_fragment_opcode = null;
                     self.recv_fragment_compressed = false;
-                    self.observeControlReceived(.close, payload);
                     const close_frame = try parseClosePayload(payload, validate_utf8);
                     if (!self.close_sent) {
                         try self.writeClose(close_frame.code, close_frame.reason);
@@ -923,32 +923,7 @@ fn appendTestFrame(
     payload: []const u8,
     mask: [mask_len]u8,
 ) !void {
-    const first: u8 = @as(u8, @intFromEnum(opcode)) | if (fin) @as(u8, 0x80) else 0;
-    try out.append(a, first);
-
-    if (payload.len <= control_payload_max_len) {
-        try out.append(a, @as(u8, @intCast(payload.len)) | if (masked) @as(u8, 0x80) else 0);
-    } else if (payload.len <= std.math.maxInt(u16)) {
-        try out.append(a, 126 | if (masked) @as(u8, 0x80) else 0);
-        var ext: [2]u8 = undefined;
-        std.mem.writeInt(u16, ext[0..], @as(u16, @intCast(payload.len)), .big);
-        try out.appendSlice(a, ext[0..]);
-    } else {
-        try out.append(a, 127 | if (masked) @as(u8, 0x80) else 0);
-        var ext: [8]u8 = undefined;
-        std.mem.writeInt(u64, ext[0..], payload.len, .big);
-        try out.appendSlice(a, ext[0..]);
-    }
-
-    if (masked) {
-        try out.appendSlice(a, mask[0..]);
-        const start = out.items.len;
-        try out.resize(a, start + payload.len);
-        @memcpy(out.items[start..][0..payload.len], payload);
-        applyMask(out.items[start..][0..payload.len], mask, 0);
-    } else {
-        try out.appendSlice(a, payload);
-    }
+    try test_support.appendTestFrame(Opcode, out, a, opcode, fin, masked, payload, mask);
 }
 
 fn appendMalformedHeader(out: *std.ArrayList(u8), a: std.mem.Allocator, first: u8, second: u8) !void {
@@ -2153,6 +2128,33 @@ test "observer records frame reads and writes" {
         },
         else => try std.testing.expect(false),
     }
+}
+
+test "echoFrame emits close_received once per close frame" {
+    var state: TestObserverState = .{};
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    const close_payload = [_]u8{ 0x03, 0xE8 };
+    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, close_payload[0..], .{ 1, 2, 3, 4 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var out: [64]u8 = undefined;
+    var writer = Io.Writer.fixed(out[0..]);
+    var conn = Conn(.{}).init(&reader, &writer, .{
+        .observer = state.observer(),
+    });
+    var scratch: [32]u8 = undefined;
+    const echoed = try conn.echoFrame(scratch[0..]);
+    try std.testing.expectEqual(Opcode.close, echoed.opcode);
+
+    var close_received_count: usize = 0;
+    for (state.events[0..state.len]) |event| {
+        switch (event) {
+            .close_received => close_received_count += 1,
+            else => {},
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 1), close_received_count);
 }
 
 test "read timeout returns Timeout and emits a timeout event" {
