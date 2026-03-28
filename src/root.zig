@@ -134,6 +134,6 @@ test {
     _ = @import("protocol.zig");
     _ = @import("handshake.zig");
     _ = @import("conn.zig");
-    _ = @import("zlib_backend.zig");
+    _ = @import("flate_backend.zig");
     _ = @import("validation_tests.zig");
 }

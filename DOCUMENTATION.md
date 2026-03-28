@@ -91,7 +91,7 @@ Current event coverage includes:
 
 - enable it during the handshake with `ServerHandshakeOptions.enable_permessage_deflate`
 - propagate the negotiated `ServerHandshakeResponse.permessage_deflate` into `Config.permessage_deflate`
-- compressed message I/O currently depends on system `zlib`
+- compressed message I/O uses `std.compress.flate`
 
 The library negotiates the extension conservatively and defaults to:
 

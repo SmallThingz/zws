@@ -4,7 +4,7 @@ const Io = std.Io;
 const proto = @import("protocol.zig");
 const extensions = @import("extensions.zig");
 const observe = @import("observe.zig");
-const zlib_backend = @import("zlib_backend.zig");
+const flate_backend = @import("flate_backend.zig");
 const test_support = @import("test_support.zig");
 
 const control_payload_max_len = 125;
@@ -780,7 +780,7 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn inflateMessage(self: *Self, compressed_payload: []const u8, dest: []u8) ProtocolError![]u8 {
-            const inflated = zlib_backend.inflateMessage(compressionAllocator(self), compressed_payload, dest) catch |err| switch (err) {
+            const inflated = flate_backend.inflateMessage(compressionAllocator(self), compressed_payload, dest) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.CounterTooLarge => return error.MessageTooLarge,
                 error.MessageTooLarge => return error.MessageTooLarge,
@@ -792,7 +792,7 @@ pub fn Conn(comptime static: StaticConfig) type {
 
         fn deflateMessage(self: *Self, payload: []const u8) ProtocolError![]u8 {
             const pmd = self.config.permessage_deflate.?;
-            return zlib_backend.deflateMessage(
+            return flate_backend.deflateMessage(
                 pmd.allocator,
                 payload,
                 pmd.compression_level,
@@ -867,7 +867,7 @@ fn outgoingFlushMode(comptime role: Role, negotiated: extensions.PerMessageDefla
         .server => negotiated.server_no_context_takeover,
         .client => negotiated.client_no_context_takeover,
     };
-    return if (no_context_takeover) zlib_backend.full_flush else zlib_backend.sync_flush;
+    return if (no_context_takeover) flate_backend.full_flush else flate_backend.sync_flush;
 }
 
 pub fn parseClosePayload(payload: []const u8, validate_utf8: bool) ProtocolError!CloseFrame {

@@ -154,4 +154,4 @@ zig build bench-compare -Doptimize=ReleaseFast
 - Connection state is synchronous and stream-oriented.
 - `permessage-deflate` is implemented and negotiated when enabled.
 - No TLS or HTTP server framework is bundled; use the raw stream API or the example server as the integration point.
-- Compression support links against system `zlib`. If you do not enable `permessage-deflate`, the core RFC 6455 path remains pure Zig.
+- Compression support uses `std.compress.flate`; no external compression library is required.

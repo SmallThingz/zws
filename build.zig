@@ -10,7 +10,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     mod.linkSystemLibrary("c", .{});
-    mod.linkSystemLibrary("z", .{});
 
     const support_common = b.createModule(.{
         .root_source_file = b.path("support/common.zig"),
