@@ -125,11 +125,13 @@ pub fn acceptServerHandshake(
     var negotiated_permessage_deflate: ?extensions.PerMessageDeflate = null;
     if (opts.enable_permessage_deflate) {
         if (req.sec_websocket_extensions) |header_value| {
-            const offered = extensions.parsePerMessageDeflate(header_value) catch {
+            var offers = extensions.parsePerMessageDeflate(header_value);
+            while (offers.next() catch {
                 return rejectHandshake(opts.observer, error.ExtensionsNotSupported);
-            };
-            if (offered != null) {
-                negotiated_permessage_deflate = opts.permessage_deflate;
+            }) |_| {
+                if (negotiated_permessage_deflate == null) {
+                    negotiated_permessage_deflate = opts.permessage_deflate;
+                }
             }
         }
     }
@@ -300,11 +302,20 @@ test "acceptServerHandshake rejects malformed permessage-deflate offers when neg
     try std.testing.expectError(error.ExtensionsNotSupported, acceptServerHandshake(req, .{
         .enable_permessage_deflate = true,
     }));
+}
 
-    req.sec_websocket_extensions = "permessage-deflate, permessage-deflate; client_no_context_takeover";
-    try std.testing.expectError(error.ExtensionsNotSupported, acceptServerHandshake(req, .{
+test "acceptServerHandshake accepts repeated permessage-deflate offers as alternatives" {
+    var req = validRequest();
+    req.sec_websocket_extensions = "permessage-deflate; client_max_window_bits, permessage-deflate";
+
+    const response = try acceptServerHandshake(req, .{
         .enable_permessage_deflate = true,
-    }));
+    });
+    try std.testing.expect(response.permessage_deflate != null);
+    try std.testing.expectEqualStrings(
+        "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
+        response.selected_extensions.?,
+    );
 }
 
 test "acceptServerHandshake accepts connection token with extra commas and spaces" {

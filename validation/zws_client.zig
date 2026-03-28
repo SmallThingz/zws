@@ -75,7 +75,7 @@ pub fn main(init: std.process.Init) !void {
     const reply = try common.performClientHandshake(&sr.interface, &sw.interface, request);
 
     const negotiated_permessage_deflate = if (reply.selected_extensions) |header|
-        try zws.parsePerMessageDeflate(header)
+        try zws.parsePerMessageDeflateFirst(header)
     else
         null;
     const conn_cfg: zws.Config = .{
