@@ -93,6 +93,8 @@ Current event coverage includes:
 - propagate the negotiated `ServerHandshakeResponse.permessage_deflate` into `Config.permessage_deflate`
 - compressed message I/O uses `std.compress.flate`
 - compression remains disabled by default (`Config.permessage_deflate = null`)
+- context takeover runtime support is disabled by default (`StaticConfig.permessage_deflate_context_takeover = false`)
+- enable takeover support by instantiating `ConnType(.{ .permessage_deflate_context_takeover = true, ... })`
 - when enabled, `StaticConfig` has conservative compile-time defaults:
   - `permessage_deflate_min_payload_len = 64`
   - `permessage_deflate_require_compression_gain = true`
@@ -102,7 +104,7 @@ The library negotiates the extension conservatively and defaults to:
 - `server_no_context_takeover`
 - `client_no_context_takeover`
 
-That keeps the runtime model simple and avoids cross-message compressor state.
+With context takeover support disabled, this keeps the runtime model simple and avoids cross-message compressor state.
 
 ### Deployment Notes
 

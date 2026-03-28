@@ -45,6 +45,9 @@ pub const StaticConfig = struct {
     auto_reply_close: bool = true,
     validate_utf8: bool = true,
     runtime_hooks: bool = true,
+    /// Enables runtime support for cross-message permessage-deflate context takeover.
+    /// When false, each compressed message is treated as independent.
+    permessage_deflate_context_takeover: bool = false,
     /// Skip compression for payloads smaller than this size.
     permessage_deflate_min_payload_len: usize = 64,
     /// If true, only send compressed frames when they are smaller than input.
@@ -113,6 +116,7 @@ pub fn Conn(comptime static: StaticConfig) type {
     const auto_reply_close = static.auto_reply_close;
     const validate_utf8 = static.validate_utf8;
     const runtime_hooks = static.runtime_hooks;
+    const permessage_deflate_context_takeover = static.permessage_deflate_context_takeover;
     const permessage_deflate_min_payload_len = static.permessage_deflate_min_payload_len;
     const permessage_deflate_require_compression_gain = static.permessage_deflate_require_compression_gain;
 
@@ -133,6 +137,8 @@ pub fn Conn(comptime static: StaticConfig) type {
         send_fragment_opcode: ?MessageOpcode = null,
         close_sent: bool = false,
         close_received: bool = false,
+        send_takeover: ?flate_backend.TakeoverDeflater = null,
+        recv_takeover: ?flate_backend.TakeoverInflater = null,
 
         const Self = @This();
         const masked_write_scratch_len = 4096;
@@ -164,6 +170,17 @@ pub fn Conn(comptime static: StaticConfig) type {
 
         pub fn flush(self: *Self) (ProtocolError || Io.Writer.Error)!void {
             try self.flushTimed();
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (self.send_takeover) |*deflater| {
+                deflater.deinit();
+                self.send_takeover = null;
+            }
+            if (self.recv_takeover) |*inflater| {
+                inflater.deinit();
+                self.recv_takeover = null;
+            }
         }
 
         fn emit(self: *const Self, event: observe.Event) void {
@@ -806,6 +823,19 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn inflateMessage(self: *Self, compressed_payload: []const u8, dest: []u8) ProtocolError![]u8 {
+            if (comptime permessage_deflate_context_takeover) {
+                if (self.shouldUseIncomingContextTakeover()) {
+                    const inflated_takeover = self.inflateMessageTakeover(compressed_payload, dest) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.CounterTooLarge => return error.MessageTooLarge,
+                        error.MessageTooLarge => return error.MessageTooLarge,
+                        error.InflateFailed => return error.InvalidCompressedMessage,
+                    };
+                    if (inflated_takeover.len > self.config.max_message_payload_len) return error.MessageTooLarge;
+                    return inflated_takeover;
+                }
+            }
+
             const inflated = flate_backend.inflateMessage(compressionAllocator(self), compressed_payload, dest) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.CounterTooLarge => return error.MessageTooLarge,
@@ -817,6 +847,17 @@ pub fn Conn(comptime static: StaticConfig) type {
         }
 
         fn deflateMessage(self: *Self, payload: []const u8) ProtocolError![]u8 {
+            if (comptime permessage_deflate_context_takeover) {
+                if (self.shouldUseOutgoingContextTakeover()) {
+                    const takeover = try self.ensureSendTakeoverDeflater();
+                    return takeover.deflateMessage(payload) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.CounterTooLarge => return error.MessageTooLarge,
+                        error.DeflateFailed => return error.InvalidCompressedMessage,
+                    };
+                }
+            }
+
             const pmd = self.config.permessage_deflate.?;
             return flate_backend.deflateMessage(
                 pmd.allocator,
@@ -832,6 +873,43 @@ pub fn Conn(comptime static: StaticConfig) type {
 
         fn compressionAllocator(self: *const Self) std.mem.Allocator {
             return self.config.permessage_deflate.?.allocator;
+        }
+
+        fn shouldUseOutgoingContextTakeover(self: *const Self) bool {
+            const pmd = self.config.permessage_deflate orelse return false;
+            return !outgoingNoContextTakeover(static.role, pmd.negotiated);
+        }
+
+        fn shouldUseIncomingContextTakeover(self: *const Self) bool {
+            const pmd = self.config.permessage_deflate orelse return false;
+            return !incomingNoContextTakeover(static.role, pmd.negotiated);
+        }
+
+        fn ensureSendTakeoverDeflater(self: *Self) ProtocolError!*flate_backend.TakeoverDeflater {
+            if (self.send_takeover == null) {
+                self.send_takeover = undefined;
+                errdefer self.send_takeover = null;
+                const pmd = self.config.permessage_deflate.?;
+                self.send_takeover.?.init(pmd.allocator, pmd.compression_level) catch |err| switch (err) {
+                    error.OutOfMemory => return error.OutOfMemory,
+                    error.CounterTooLarge => return error.MessageTooLarge,
+                    error.DeflateFailed => return error.InvalidCompressedMessage,
+                };
+            }
+            return &self.send_takeover.?;
+        }
+
+        fn ensureRecvTakeoverInflater(self: *Self) *flate_backend.TakeoverInflater {
+            if (self.recv_takeover == null) {
+                self.recv_takeover = .{};
+                self.recv_takeover.?.init();
+            }
+            return &self.recv_takeover.?;
+        }
+
+        fn inflateMessageTakeover(self: *Self, compressed_payload: []const u8, dest: []u8) flate_backend.InflateError![]u8 {
+            const inflater = self.ensureRecvTakeoverInflater();
+            return inflater.inflateMessage(compressionAllocator(self), compressed_payload, dest);
         }
 
         fn validateOutgoingSequence(self: *Self, opcode: Opcode, fin: bool) ProtocolError!void {
@@ -889,11 +967,22 @@ fn validateUtf8IfEnabled(comptime enabled: bool, payload: []const u8) ProtocolEr
 }
 
 fn outgoingFlushMode(comptime role: Role, negotiated: extensions.PerMessageDeflate) i32 {
-    const no_context_takeover = switch (role) {
+    const no_context_takeover = outgoingNoContextTakeover(role, negotiated);
+    return if (no_context_takeover) flate_backend.full_flush else flate_backend.sync_flush;
+}
+
+fn outgoingNoContextTakeover(comptime role: Role, negotiated: extensions.PerMessageDeflate) bool {
+    return switch (role) {
         .server => negotiated.server_no_context_takeover,
         .client => negotiated.client_no_context_takeover,
     };
-    return if (no_context_takeover) flate_backend.full_flush else flate_backend.sync_flush;
+}
+
+fn incomingNoContextTakeover(comptime role: Role, negotiated: extensions.PerMessageDeflate) bool {
+    return switch (role) {
+        .server => negotiated.client_no_context_takeover,
+        .client => negotiated.server_no_context_takeover,
+    };
 }
 
 pub fn parseClosePayload(payload: []const u8, validate_utf8: bool) ProtocolError!CloseFrame {
@@ -2040,6 +2129,59 @@ test "permessage-deflate client/server roundtrip preserves message payloads" {
     const message = try server.readMessage(message_buf[0..]);
     try std.testing.expectEqual(MessageOpcode.text, message.opcode);
     try std.testing.expectEqualStrings(payload, message.payload);
+}
+
+test "permessage-deflate context takeover roundtrip across multiple messages" {
+    const TakeoverClient = Conn(.{
+        .role = .client,
+        .permessage_deflate_context_takeover = true,
+        .permessage_deflate_min_payload_len = 1,
+        .permessage_deflate_require_compression_gain = false,
+    });
+    const TakeoverServer = Conn(.{
+        .role = .server,
+        .permessage_deflate_context_takeover = true,
+        .permessage_deflate_min_payload_len = 1,
+        .permessage_deflate_require_compression_gain = false,
+    });
+    const negotiated: extensions.PerMessageDeflate = .{
+        .server_no_context_takeover = false,
+        .client_no_context_takeover = false,
+    };
+    const pmd_cfg: PerMessageDeflateConfig = .{
+        .allocator = std.testing.allocator,
+        .negotiated = negotiated,
+    };
+
+    var wire: [2048]u8 = undefined;
+    var client_writer = Io.Writer.fixed(wire[0..]);
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var client = TakeoverClient.init(&empty_reader, &client_writer, .{
+        .permessage_deflate = pmd_cfg,
+    });
+    defer client.deinit();
+
+    const m1 = "hello hello hello";
+    const m2 = "hello hello hello again";
+    try client.writeText(m1);
+    try client.writeText(m2);
+
+    var server_reader = Io.Reader.fixed(wire[0..client_writer.end]);
+    var sink: [0]u8 = .{};
+    var server_writer = Io.Writer.fixed(sink[0..]);
+    var server = TakeoverServer.init(&server_reader, &server_writer, .{
+        .permessage_deflate = pmd_cfg,
+    });
+    defer server.deinit();
+    var message_buf: [256]u8 = undefined;
+
+    const got1 = try server.readMessage(message_buf[0..]);
+    try std.testing.expectEqual(MessageOpcode.text, got1.opcode);
+    try std.testing.expectEqualStrings(m1, got1.payload);
+
+    const got2 = try server.readMessage(message_buf[0..]);
+    try std.testing.expectEqual(MessageOpcode.text, got2.opcode);
+    try std.testing.expectEqualStrings(m2, got2.payload);
 }
 
 test "writeMessage skips compression below configured payload threshold" {
