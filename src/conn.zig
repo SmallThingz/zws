@@ -45,6 +45,10 @@ pub const StaticConfig = struct {
     auto_reply_close: bool = true,
     validate_utf8: bool = true,
     runtime_hooks: bool = true,
+    /// Skip compression for payloads smaller than this size.
+    permessage_deflate_min_payload_len: usize = 64,
+    /// If true, only send compressed frames when they are smaller than input.
+    permessage_deflate_require_compression_gain: bool = true,
 };
 
 pub const Config = struct {
@@ -109,6 +113,8 @@ pub fn Conn(comptime static: StaticConfig) type {
     const auto_reply_close = static.auto_reply_close;
     const validate_utf8 = static.validate_utf8;
     const runtime_hooks = static.runtime_hooks;
+    const permessage_deflate_min_payload_len = static.permessage_deflate_min_payload_len;
+    const permessage_deflate_require_compression_gain = static.permessage_deflate_require_compression_gain;
 
     return struct {
         reader: *Io.Reader,
@@ -613,8 +619,20 @@ pub fn Conn(comptime static: StaticConfig) type {
                 return;
             }
 
+            if (payload.len < permessage_deflate_min_payload_len) {
+                try self.writeFrameInternal(opcode, payload, true, false);
+                return;
+            }
+
             const compressed_payload = try self.deflateMessage(payload);
             defer compressionAllocator(self).free(compressed_payload);
+
+            if (comptime permessage_deflate_require_compression_gain) {
+                if (compressed_payload.len >= payload.len) {
+                    try self.writeFrameInternal(opcode, payload, true, false);
+                    return;
+                }
+            }
             try self.writeFrameInternal(opcode, compressed_payload, true, true);
         }
 
@@ -2022,6 +2040,66 @@ test "permessage-deflate client/server roundtrip preserves message payloads" {
     const message = try server.readMessage(message_buf[0..]);
     try std.testing.expectEqual(MessageOpcode.text, message.opcode);
     try std.testing.expectEqualStrings(payload, message.payload);
+}
+
+test "writeMessage skips compression below configured payload threshold" {
+    const TunedConn = Conn(.{
+        .permessage_deflate_min_payload_len = 32,
+        .permessage_deflate_require_compression_gain = false,
+    });
+    var wire: [128]u8 = undefined;
+    var writer = Io.Writer.fixed(wire[0..]);
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var conn = TunedConn.init(&empty_reader, &writer, .{
+        .permessage_deflate = .{
+            .allocator = std.testing.allocator,
+        },
+    });
+
+    try conn.writeText("tiny");
+    try std.testing.expectEqual(@as(u8, 0x81), wire[0]);
+    try std.testing.expectEqual(@as(u8, 4), wire[1]);
+    try std.testing.expectEqualStrings("tiny", wire[2 .. 2 + 4]);
+}
+
+test "writeMessage skips non-beneficial compression when gain is required" {
+    const TunedConn = Conn(.{
+        .permessage_deflate_min_payload_len = 1,
+        .permessage_deflate_require_compression_gain = true,
+    });
+    const payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x42, 0x99, 0x01 };
+
+    var wire: [256]u8 = undefined;
+    var writer = Io.Writer.fixed(wire[0..]);
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var conn = TunedConn.init(&empty_reader, &writer, .{
+        .permessage_deflate = .{
+            .allocator = std.testing.allocator,
+        },
+    });
+
+    try conn.writeBinary(payload[0..]);
+    try std.testing.expectEqual(@as(u8, 0x82), wire[0]);
+}
+
+test "writeMessage can force compression even without size gain" {
+    const TunedConn = Conn(.{
+        .permessage_deflate_min_payload_len = 1,
+        .permessage_deflate_require_compression_gain = false,
+    });
+    const payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x42, 0x99, 0x01 };
+
+    var wire: [256]u8 = undefined;
+    var writer = Io.Writer.fixed(wire[0..]);
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var conn = TunedConn.init(&empty_reader, &writer, .{
+        .permessage_deflate = .{
+            .allocator = std.testing.allocator,
+        },
+    });
+
+    try conn.writeBinary(payload[0..]);
+    try std.testing.expectEqual(@as(u8, 0xC2), wire[0]);
 }
 
 test "beginFrame rejects compressed control frames even when permessage-deflate is enabled" {

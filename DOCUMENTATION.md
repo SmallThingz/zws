@@ -92,6 +92,10 @@ Current event coverage includes:
 - enable it during the handshake with `ServerHandshakeOptions.enable_permessage_deflate`
 - propagate the negotiated `ServerHandshakeResponse.permessage_deflate` into `Config.permessage_deflate`
 - compressed message I/O uses `std.compress.flate`
+- compression remains disabled by default (`Config.permessage_deflate = null`)
+- when enabled, `StaticConfig` has conservative compile-time defaults:
+  - `permessage_deflate_min_payload_len = 64`
+  - `permessage_deflate_require_compression_gain = true`
 
 The library negotiates the extension conservatively and defaults to:
 

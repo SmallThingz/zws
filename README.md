@@ -14,6 +14,7 @@ Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame ho
 - 📦 **Low-allocation reads**: stream frames chunk-by-chunk, read full frames, or borrow buffered payload slices when they fit.
 - 🧠 **Strict protocol checks**: rejects malformed control frames, invalid close payloads, bad UTF-8, bad mask bits, and non-minimal extended lengths.
 - 🗜 **`permessage-deflate`**: handshake negotiation plus compressed message read/write support, with `server_no_context_takeover` and `client_no_context_takeover`.
+- 🎛 **Per-message compression policy**: compile-time `ConnType` knobs decide when messages are compressed (`permessage_deflate_min_payload_len`, `permessage_deflate_require_compression_gain`).
 - ⏱ **Timeout hooks**: optional read, write, and flush time budgets with pluggable deadline callbacks for framework-owned transports.
 - 👀 **Observability hooks**: optional event stream for handshakes, frame/message flow, control frames, protocol failures, and timeout events.
 - 🔁 **Convenience helpers**: `readMessage`, `echoFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, and `writeClose`.
@@ -153,5 +154,7 @@ zig build bench-compare -Doptimize=ReleaseFast
 - Server-side RFC 6455 handshake validation is included.
 - Connection state is synchronous and stream-oriented.
 - `permessage-deflate` is implemented and negotiated when enabled.
+- Compression is disabled by default (`Config.permessage_deflate = null`).
+- When enabled, `StaticConfig` defaults (`permessage_deflate_min_payload_len = 64`, `permessage_deflate_require_compression_gain = true`) skip tiny messages and avoid non-beneficial compression.
 - No TLS or HTTP server framework is bundled; use the raw stream API or the example server as the integration point.
 - Compression support uses `std.compress.flate`; no external compression library is required.
