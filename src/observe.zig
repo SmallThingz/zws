@@ -1,3 +1,4 @@
+const builtin = @import("builtin");
 const std = @import("std");
 const proto = @import("protocol.zig");
 
@@ -107,9 +108,9 @@ pub const Observer = struct {
 };
 
 fn defaultNowNs(_: ?*anyopaque) u64 {
-    if (@hasDecl(std.c, "clock_gettime") and @hasDecl(std.c, "CLOCK")) {
-        var ts: std.c.timespec = undefined;
-        if (std.c.clock_gettime(std.c.CLOCK.MONOTONIC, &ts) == 0) {
+    if (builtin.os.tag == .linux) {
+        var ts: std.os.linux.timespec = undefined;
+        if (std.os.linux.clock_gettime(std.os.linux.CLOCK.MONOTONIC, &ts) == 0) {
             return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
         }
     }
