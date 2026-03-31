@@ -256,6 +256,43 @@ test "takeover helpers roundtrip multiple messages through shared compression st
     try std.testing.expectEqualStrings(m2, got2);
 }
 
+test "inflateMessage reports InflateFailed for malformed compressed payloads" {
+    const malformed = [_]u8{ 0xff, 0x00, 0xaa, 0x55 };
+    var out: [32]u8 = undefined;
+    try std.testing.expectError(
+        error.InflateFailed,
+        inflateMessage(std.testing.allocator, malformed[0..], out[0..]),
+    );
+}
+
+test "inflateMessage reports MessageTooLarge when destination is too small" {
+    const payload = "payload that cannot fit in tiny output";
+    const compressed = try deflateMessage(std.testing.allocator, payload, 1, sync_flush);
+    defer std.testing.allocator.free(compressed);
+
+    var tiny: [4]u8 = undefined;
+    try std.testing.expectError(
+        error.MessageTooLarge,
+        inflateMessage(std.testing.allocator, compressed, tiny[0..]),
+    );
+}
+
+test "takeover inflater rejects payloads that are missing takeover sentinel" {
+    var inflater: TakeoverInflater = undefined;
+    inflater.init();
+    defer inflater.deinit();
+
+    const plain = "hello";
+    const compressed = try deflateMessage(std.testing.allocator, plain, 1, sync_flush);
+    defer std.testing.allocator.free(compressed);
+
+    var out: [32]u8 = undefined;
+    try std.testing.expectError(
+        error.InflateFailed,
+        inflater.inflateMessage(std.testing.allocator, compressed, out[0..]),
+    );
+}
+
 test "optionsFromLevel maps compression levels onto std.flate presets" {
     try std.testing.expectEqual(flate.Compress.Options.fastest, optionsFromLevel(-1));
     try std.testing.expectEqual(flate.Compress.Options.fastest, optionsFromLevel(1));

@@ -209,6 +209,21 @@ test "parsePerMessageDeflate preserves repeated offers as alternatives" {
     );
 }
 
+test "parsePerMessageDeflate iterator propagates malformed offers after valid alternatives" {
+    var offers = parsePerMessageDeflate(
+        "permessage-deflate; client_no_context_takeover, permessage-deflate; server_max_window_bits=99",
+    );
+
+    try std.testing.expectEqualDeep(
+        PerMessageDeflate{
+            .server_no_context_takeover = false,
+            .client_no_context_takeover = true,
+        },
+        (try offers.next()).?,
+    );
+    try std.testing.expectError(error.InvalidExtensionParameter, offers.next());
+}
+
 test "parseWindowBits accepts RFC range only" {
     try std.testing.expectEqual(@as(u8, 8), try parseWindowBits("8"));
     try std.testing.expectEqual(@as(u8, 15), try parseWindowBits("15"));
