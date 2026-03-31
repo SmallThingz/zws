@@ -91,7 +91,7 @@ Current event coverage includes:
 
 - enable it during the handshake with `ServerHandshakeOptions.enable_permessage_deflate`
 - propagate the negotiated `ServerHandshakeResponse.permessage_deflate` into `Config.permessage_deflate`
-- compressed message I/O uses system `zlib` for RFC7692 framing, while optional context-takeover support uses `std.compress.flate`
+- compressed message I/O uses `std.compress.flate` for RFC7692 framing and optional context-takeover support
 - compression remains disabled by default (`Config.permessage_deflate = null`)
 - outgoing compressed writes are opt-in (`PerMessageDeflateConfig.compress_outgoing = false` by default)
 - context takeover runtime support is disabled by default (`StaticConfig.permessage_deflate_context_takeover = false`)

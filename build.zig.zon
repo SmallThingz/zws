@@ -3,12 +3,7 @@
     .version = "0.0.0",
     .fingerprint = 0xa626e93070fc150f,
     .minimum_zig_version = "0.16.0-dev.2905+5d71e3051",
-    .dependencies = .{
-        .ziglibc = .{
-            .url = "git+https://github.com/SmallThingz/ziglibc#f7498cf373a9fe67787664f6917bf15df2f68aeb",
-            .hash = "N-V-__8AAOg8CgBsWJ9s3O7sKDdMR56qqkTUlWl4nZjhXq5Z",
-        },
-    },
+    .dependencies = .{},
     .paths = .{
         "build.zig",
         "build.zig.zon",
