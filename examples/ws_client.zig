@@ -12,8 +12,10 @@ const Config = struct {
     message: []const u8 = "hello from zwebsocket",
 };
 
-fn usage() void {
-    std.debug.print(
+fn usage(io: Io) !void {
+    var buf: [640]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buf);
+    try stdout.interface.writeAll(
         \\zwebsocket-client
         \\
         \\Usage:
@@ -30,7 +32,8 @@ fn usage() void {
         \\This example performs the HTTP websocket client handshake manually and
         \\then switches to `zws.ClientConn` for frame/message I/O.
         \\
-    , .{});
+    );
+    try stdout.interface.flush();
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -43,7 +46,7 @@ pub fn main(init: std.process.Init) !void {
     while (it.next()) |arg_z| {
         const arg: []const u8 = arg_z;
         if (std.mem.eql(u8, arg, "--help")) {
-            usage();
+            try usage(init.io);
             return;
         }
         if (std.mem.eql(u8, arg, "--compression")) {
@@ -102,13 +105,23 @@ pub fn main(init: std.process.Init) !void {
     var message_buf: [128 * 1024]u8 = undefined;
     const echoed = try conn.readMessage(message_buf[0..]);
     if (echoed.opcode != .text) return error.UnexpectedOpcode;
-    std.debug.print("echoed text: {s}\n", .{echoed.payload});
+    {
+        var stdout_buf: [256]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
+        try stdout.interface.print("echoed text: {s}\n", .{echoed.payload});
+        try stdout.interface.flush();
+    }
 
     try conn.writePing("demo");
     try sw.interface.flush();
     const pong = try conn.readFrame(message_buf[0..]);
     if (pong.header.opcode != .pong) return error.UnexpectedOpcode;
-    std.debug.print("pong payload: {s}\n", .{pong.payload});
+    {
+        var stdout_buf: [256]u8 = undefined;
+        var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
+        try stdout.interface.print("pong payload: {s}\n", .{pong.payload});
+        try stdout.interface.flush();
+    }
 
     try conn.writeClose(1000, "done");
     try sw.interface.flush();

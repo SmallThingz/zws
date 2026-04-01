@@ -16,8 +16,8 @@ Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame ho
 - 🗜 **`permessage-deflate`**: handshake negotiation plus compressed message read/write support, with `server_no_context_takeover` and `client_no_context_takeover`.
 - 🧠 **Optional context takeover**: compile-time `ConnType` toggle (`permessage_deflate_context_takeover`) enables cross-message compression state when negotiated.
 - 🎛 **Per-message compression policy**: compile-time `ConnType` knobs decide when messages are compressed (`permessage_deflate_min_payload_len`, `permessage_deflate_require_compression_gain`).
-- ⏱ **Timeout hooks**: optional read, write, and flush time budgets with pluggable deadline callbacks for framework-owned transports.
-- 👀 **Observability hooks**: optional event stream for handshakes, frame/message flow, control frames, protocol failures, and timeout events.
+- ⏱ **Timeout hooks**: optional read, write, and flush time budgets with typed runtime hooks for framework-owned transports.
+- 👀 **Observability hooks**: optional typed event stream for handshakes, frame/message flow, control frames, protocol failures, and timeout events.
 - 🔁 **Convenience helpers**: `readMessage`, `echoFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, and `writeClose`.
 - 🧪 **Validation stack**: unit tests, fuzz/property tests, a cross-library interop matrix, soak runners, and benchmarks live alongside the library.
 
@@ -101,7 +101,7 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
 - Compression path:
   `PerMessageDeflate`, `PerMessageDeflateConfig`, `ServerHandshakeResponse.permessage_deflate`, `Config.permessage_deflate`.
 - Runtime hooks:
-  `TimeoutConfig`, `Clock`, `DeadlineController`, `Observer`, `ObserveEvent`.
+  `TimeoutConfig`, `DefaultRuntimeHooks`, `ConnTypeWithHooks(...)`, `acceptServerHandshakeWithHooks(...)`, `serverHandshakeWithHooks(...)`, `ObserveEvent`.
 
 ## 📚 Docs
 

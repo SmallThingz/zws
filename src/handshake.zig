@@ -27,7 +27,6 @@ pub const ServerHandshakeOptions = struct {
     enable_permessage_deflate: bool = false,
     permessage_deflate: extensions.PerMessageDeflate = .{},
     extra_headers: []const Header = &.{},
-    observer: ?observe.Observer = null,
 };
 
 pub const ServerHandshakeResponse = struct {
@@ -122,25 +121,34 @@ pub fn acceptServerHandshake(
     req: ServerHandshakeRequest,
     opts: ServerHandshakeOptions,
 ) HandshakeError!ServerHandshakeResponse {
-    if (!std.mem.eql(u8, req.method, "GET")) return rejectHandshake(opts.observer, error.MethodNotGet);
-    if (!req.is_http_11) return rejectHandshake(opts.observer, error.HttpVersionNotSupported);
+    var hooks: observe.DefaultRuntimeHooks = .{};
+    return acceptServerHandshakeWithHooks(req, opts, &hooks);
+}
 
-    const connection = req.connection orelse return rejectHandshake(opts.observer, error.MissingConnectionHeader);
-    if (!containsTokenIgnoreCase(connection, "upgrade")) return rejectHandshake(opts.observer, error.InvalidConnectionHeader);
+pub fn acceptServerHandshakeWithHooks(
+    req: ServerHandshakeRequest,
+    opts: ServerHandshakeOptions,
+    hooks: anytype,
+) HandshakeError!ServerHandshakeResponse {
+    if (!std.mem.eql(u8, req.method, "GET")) return rejectHandshake(hooks, error.MethodNotGet);
+    if (!req.is_http_11) return rejectHandshake(hooks, error.HttpVersionNotSupported);
 
-    const upgrade = req.upgrade orelse return rejectHandshake(opts.observer, error.MissingUpgradeHeader);
+    const connection = req.connection orelse return rejectHandshake(hooks, error.MissingConnectionHeader);
+    if (!containsTokenIgnoreCase(connection, "upgrade")) return rejectHandshake(hooks, error.InvalidConnectionHeader);
+
+    const upgrade = req.upgrade orelse return rejectHandshake(hooks, error.MissingUpgradeHeader);
     if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, upgrade, " \t"), "websocket")) {
-        return rejectHandshake(opts.observer, error.InvalidUpgradeHeader);
+        return rejectHandshake(hooks, error.InvalidUpgradeHeader);
     }
 
-    const key = std.mem.trim(u8, req.sec_websocket_key orelse return rejectHandshake(opts.observer, error.MissingWebSocketKey), " \t");
-    const version = req.sec_websocket_version orelse return rejectHandshake(opts.observer, error.MissingWebSocketVersion);
+    const key = std.mem.trim(u8, req.sec_websocket_key orelse return rejectHandshake(hooks, error.MissingWebSocketKey), " \t");
+    const version = req.sec_websocket_version orelse return rejectHandshake(hooks, error.MissingWebSocketVersion);
     if (!std.mem.eql(u8, std.mem.trim(u8, version, " \t"), "13")) {
-        return rejectHandshake(opts.observer, error.UnsupportedWebSocketVersion);
+        return rejectHandshake(hooks, error.UnsupportedWebSocketVersion);
     }
 
     if (opts.reject_extensions and req.sec_websocket_extensions != null) {
-        return rejectHandshake(opts.observer, error.ExtensionsNotSupported);
+        return rejectHandshake(hooks, error.ExtensionsNotSupported);
     }
 
     var negotiated_permessage_deflate: ?extensions.PerMessageDeflate = null;
@@ -149,7 +157,7 @@ pub fn acceptServerHandshake(
             var offers = extensions.parsePerMessageDeflate(header_value);
             var best_score: usize = 0;
             while (offers.next() catch {
-                return rejectHandshake(opts.observer, error.ExtensionsNotSupported);
+                return rejectHandshake(hooks, error.ExtensionsNotSupported);
             }) |requested| {
                 const candidate = negotiatedPerMessageDeflateForOffer(requested, opts.permessage_deflate);
                 const score = perMessageDeflateOfferScore(requested, opts.permessage_deflate);
@@ -162,12 +170,12 @@ pub fn acceptServerHandshake(
     }
 
     if (opts.selected_subprotocol) |selected| {
-        const offered = req.sec_websocket_protocol orelse return rejectHandshake(opts.observer, error.SubprotocolNotOffered);
-        if (!subprotocolWasOffered(offered, selected)) return rejectHandshake(opts.observer, error.SubprotocolNotOffered);
+        const offered = req.sec_websocket_protocol orelse return rejectHandshake(hooks, error.SubprotocolNotOffered);
+        if (!subprotocolWasOffered(offered, selected)) return rejectHandshake(hooks, error.SubprotocolNotOffered);
     }
 
     const accept_key = computeAcceptKey(key) catch |err| {
-        return rejectHandshake(opts.observer, err);
+        return rejectHandshake(hooks, err);
     };
 
     const response: ServerHandshakeResponse = .{
@@ -177,13 +185,11 @@ pub fn acceptServerHandshake(
         .permessage_deflate = negotiated_permessage_deflate,
         .extra_headers = opts.extra_headers,
     };
-    if (opts.observer) |observer| {
-        observer.emit(.{ .handshake_accepted = .{
-            .selected_subprotocol = response.selected_subprotocol != null,
-            .permessage_deflate = response.permessage_deflate != null,
-            .extra_headers_len = response.extra_headers.len,
-        } });
-    }
+    hooks.onEvent(.{ .handshake_accepted = .{
+        .selected_subprotocol = response.selected_subprotocol != null,
+        .permessage_deflate = response.permessage_deflate != null,
+        .extra_headers_len = response.extra_headers.len,
+    } });
     return response;
 }
 
@@ -225,15 +231,23 @@ pub fn serverHandshake(
     req: ServerHandshakeRequest,
     opts: ServerHandshakeOptions,
 ) (HandshakeError || Io.Writer.Error)!ServerHandshakeResponse {
-    const response = try acceptServerHandshake(req, opts);
+    var hooks: observe.DefaultRuntimeHooks = .{};
+    return serverHandshakeWithHooks(writer, req, opts, &hooks);
+}
+
+pub fn serverHandshakeWithHooks(
+    writer: *Io.Writer,
+    req: ServerHandshakeRequest,
+    opts: ServerHandshakeOptions,
+    hooks: anytype,
+) (HandshakeError || Io.Writer.Error)!ServerHandshakeResponse {
+    const response = try acceptServerHandshakeWithHooks(req, opts, hooks);
     try writeServerHandshakeResponse(writer, response);
     return response;
 }
 
-fn rejectHandshake(observer: ?observe.Observer, err: HandshakeError) HandshakeError {
-    if (observer) |o| {
-        o.emit(.{ .handshake_rejected = .{ .name = @errorName(err) } });
-    }
+fn rejectHandshake(hooks: anytype, err: HandshakeError) HandshakeError {
+    hooks.onEvent(.{ .handshake_rejected = .{ .name = @errorName(err) } });
     return err;
 }
 
@@ -525,47 +539,54 @@ test "serverHandshake propagates writer errors" {
     try std.testing.expectError(error.WriteFailed, serverHandshake(&writer, validRequest(), .{}));
 }
 
-test "rejectHandshake emits through the observer and returns the original error" {
+test "rejectHandshake emits through typed hooks and returns the original error" {
     const State = struct {
         event: ?observe.Event = null,
 
-        fn onEvent(ctx: ?*anyopaque, event: observe.Event) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        fn onEvent(self: *@This(), event: observe.Event) void {
             self.event = event;
         }
     };
 
-    var state: State = .{};
-    const observer: observe.Observer = .{
-        .ctx = &state,
-        .on_event_fn = State.onEvent,
+    const Hooks = struct {
+        state: *State,
+
+        fn onEvent(self: *@This(), event: observe.Event) void {
+            self.state.onEvent(event);
+        }
     };
-    try std.testing.expectEqual(error.ExtensionsNotSupported, rejectHandshake(observer, error.ExtensionsNotSupported));
+
+    var state: State = .{};
+    var hooks: Hooks = .{ .state = &state };
+    try std.testing.expectEqual(error.ExtensionsNotSupported, rejectHandshake(&hooks, error.ExtensionsNotSupported));
     switch (state.event.?) {
         .handshake_rejected => |event| try std.testing.expectEqualStrings("ExtensionsNotSupported", event.name),
         else => return error.TestExpectedEqual,
     }
 }
 
-test "handshake observer sees accepted and rejected outcomes" {
+test "handshake hooks see accepted and rejected outcomes" {
     const State = struct {
         events: [2]observe.Event = undefined,
         len: usize = 0,
 
-        fn onEvent(ctx: ?*anyopaque, event: observe.Event) void {
-            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+        fn onEvent(self: *@This(), event: observe.Event) void {
             self.events[self.len] = event;
             self.len += 1;
         }
     };
 
+    const Hooks = struct {
+        state: *State,
+
+        fn onEvent(self: *@This(), event: observe.Event) void {
+            self.state.onEvent(event);
+        }
+    };
+
     var accepted_state: State = .{};
-    _ = try acceptServerHandshake(validRequest(), .{
-        .observer = .{
-            .ctx = &accepted_state,
-            .on_event_fn = State.onEvent,
-        },
-    });
+    var accepted_hooks: Hooks = .{ .state = &accepted_state };
+    _ = try acceptServerHandshakeWithHooks(validRequest(), .{}, &accepted_hooks);
     try std.testing.expectEqual(@as(usize, 1), accepted_state.len);
     switch (accepted_state.events[0]) {
         .handshake_accepted => |event| {
@@ -579,12 +600,8 @@ test "handshake observer sees accepted and rejected outcomes" {
     var rejected_req = validRequest();
     rejected_req.method = "POST";
     var rejected_state: State = .{};
-    try std.testing.expectError(error.MethodNotGet, acceptServerHandshake(rejected_req, .{
-        .observer = .{
-            .ctx = &rejected_state,
-            .on_event_fn = State.onEvent,
-        },
-    }));
+    var rejected_hooks: Hooks = .{ .state = &rejected_state };
+    try std.testing.expectError(error.MethodNotGet, acceptServerHandshakeWithHooks(rejected_req, .{}, &rejected_hooks));
     try std.testing.expectEqual(@as(usize, 1), rejected_state.len);
     switch (rejected_state.events[0]) {
         .handshake_rejected => |event| try std.testing.expectEqualStrings("MethodNotGet", event.name),

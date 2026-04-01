@@ -11,14 +11,17 @@ const BenchConn = zws.ConnType(.{
     .runtime_hooks = false,
 });
 
-fn usage() void {
-    std.debug.print(
+fn usage(io: Io) !void {
+    var buf: [256]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buf);
+    try stdout.interface.writeAll(
         \\zwebsocket-bench-server
         \\
         \\Usage:
         \\  zwebsocket-bench-server [--port=9001] [--pipeline=1] [--msg-size=16]
         \\
-    , .{});
+    );
+    try stdout.interface.flush();
 }
 
 fn flushIfBuffered(w: *Io.Writer) Io.Writer.Error!void {
@@ -89,7 +92,7 @@ pub fn main(init: std.process.Init) !void {
     while (it.next()) |arg_z| {
         const arg: []const u8 = arg_z;
         if (std.mem.eql(u8, arg, "--help")) {
-            usage();
+            try usage(init.io);
             return;
         }
         if (common.parseKeyVal(arg)) |kv| {

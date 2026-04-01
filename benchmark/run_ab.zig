@@ -88,8 +88,8 @@ fn spawnBackground(io: std.Io, argv: []const []const u8, cwd: ?[]const u8) !std.
 }
 
 fn buildZwebsocketBins(io: std.Io, root: []const u8, optimize: []const u8) !void {
-    const optimize_arg = try std.fmt.allocPrint(std.heap.page_allocator, "-Doptimize={s}", .{optimize});
-    defer std.heap.page_allocator.free(optimize_arg);
+    var optimize_buf: [64]u8 = undefined;
+    const optimize_arg = try std.fmt.bufPrint(&optimize_buf, "-Doptimize={s}", .{optimize});
     try runChecked(io, &.{ "zig", "build", "install", optimize_arg }, root, null);
 }
 
@@ -138,7 +138,7 @@ fn runBenchRate(
 }
 
 pub fn main(init: std.process.Init) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
 

@@ -172,7 +172,6 @@ pub fn deflateMessage(
         error.WriteFailed => return error.OutOfMemory,
     };
 
-    _ = output.written();
     return output.toOwnedSlice() catch return error.OutOfMemory;
 }
 

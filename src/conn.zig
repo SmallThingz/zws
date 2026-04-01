@@ -59,7 +59,6 @@ pub const Config = struct {
     max_message_payload_len: usize = std.math.maxInt(usize),
     permessage_deflate: ?PerMessageDeflateConfig = null,
     timeouts: observe.TimeoutConfig = .{},
-    observer: ?observe.Observer = null,
 };
 
 pub const PerMessageDeflateConfig = struct {
@@ -112,6 +111,12 @@ const ParsedHeader = struct {
 /// Creates a websocket connection type specialized for a fixed role and policy
 /// set so the hot path can be compiled without runtime configuration branches.
 pub fn Conn(comptime static: StaticConfig) type {
+    return ConnWithHooks(static, observe.DefaultRuntimeHooks);
+}
+
+/// Creates a websocket connection type specialized for a fixed role, policy,
+/// and runtime hook implementation.
+pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
     const expects_masked = static.role == .server;
     const auto_pong = static.auto_pong;
     const auto_reply_close = static.auto_reply_close;
@@ -120,11 +125,13 @@ pub fn Conn(comptime static: StaticConfig) type {
     const permessage_deflate_context_takeover = static.permessage_deflate_context_takeover;
     const permessage_deflate_min_payload_len = static.permessage_deflate_min_payload_len;
     const permessage_deflate_require_compression_gain = static.permessage_deflate_require_compression_gain;
+    if (comptime runtime_hooks) observe.validateHooks(Hooks);
 
     return struct {
         reader: *Io.Reader,
         writer: *Io.Writer,
         config: Config,
+        hooks: Hooks,
         mask_prng: std.Random.DefaultPrng,
 
         recv_active: bool = false,
@@ -150,6 +157,10 @@ pub fn Conn(comptime static: StaticConfig) type {
         };
 
         pub fn init(reader: *Io.Reader, writer: *Io.Writer, config: Config) Self {
+            return initWithHooks(reader, writer, config, .{});
+        }
+
+        pub fn initWithHooks(reader: *Io.Reader, writer: *Io.Writer, config: Config, hooks: Hooks) Self {
             const seed = nextMaskSeed() ^
                 @as(u64, @truncate(@intFromPtr(reader))) ^
                 (@as(u64, @truncate(@intFromPtr(writer))) << 1);
@@ -157,6 +168,7 @@ pub fn Conn(comptime static: StaticConfig) type {
                 .reader = reader,
                 .writer = writer,
                 .config = config,
+                .hooks = hooks,
                 .mask_prng = std.Random.DefaultPrng.init(seed),
             };
         }
@@ -186,7 +198,8 @@ pub fn Conn(comptime static: StaticConfig) type {
 
         fn emit(self: *const Self, event: observe.Event) void {
             if (comptime !runtime_hooks) return;
-            if (self.config.observer) |observer| observer.emit(event);
+            var hooks = @constCast(&self.hooks);
+            hooks.onEvent(event);
         }
 
         fn beginTimedOp(self: *const Self, phase: observe.IoPhase) ?TimedOp {
@@ -197,13 +210,14 @@ pub fn Conn(comptime static: StaticConfig) type {
                 .flush => self.config.timeouts.flush_ns,
             } orelse return null;
 
-            const start_ns = self.config.timeouts.clock.nowNs();
+            const start_ns = self.hooks.nowNs();
             const deadline_ns = std.math.add(u64, start_ns, budget_ns) catch std.math.maxInt(u64);
-            if (self.config.timeouts.deadlines) |deadlines| switch (phase) {
-                .read => deadlines.setReadDeadlineNs(deadline_ns),
-                .write => deadlines.setWriteDeadlineNs(deadline_ns),
-                .flush => deadlines.setFlushDeadlineNs(deadline_ns),
-            };
+            var hooks = @constCast(&self.hooks);
+            switch (phase) {
+                .read => hooks.setReadDeadlineNs(deadline_ns),
+                .write => hooks.setWriteDeadlineNs(deadline_ns),
+                .flush => hooks.setFlushDeadlineNs(deadline_ns),
+            }
 
             return .{
                 .phase = phase,
@@ -214,17 +228,18 @@ pub fn Conn(comptime static: StaticConfig) type {
 
         fn clearTimedOp(self: *const Self, phase: observe.IoPhase) void {
             if (comptime !runtime_hooks) return;
-            if (self.config.timeouts.deadlines) |deadlines| switch (phase) {
-                .read => deadlines.setReadDeadlineNs(null),
-                .write => deadlines.setWriteDeadlineNs(null),
-                .flush => deadlines.setFlushDeadlineNs(null),
-            };
+            var hooks = @constCast(&self.hooks);
+            switch (phase) {
+                .read => hooks.setReadDeadlineNs(null),
+                .write => hooks.setWriteDeadlineNs(null),
+                .flush => hooks.setFlushDeadlineNs(null),
+            }
         }
 
         fn finishTimedOp(self: *const Self, timed: ?TimedOp) ProtocolError!void {
             if (comptime !runtime_hooks) return;
             const op = timed orelse return;
-            const elapsed_ns = self.config.timeouts.clock.nowNs() -| op.start_ns;
+            const elapsed_ns = self.hooks.nowNs() -| op.start_ns;
             if (elapsed_ns > op.budget_ns) {
                 self.emit(.{ .timeout = .{
                     .phase = op.phase,
@@ -2501,8 +2516,8 @@ test "internal observer and discard helpers cover control flow directly" {
     var empty_reader = Io.Reader.fixed(""[0..]);
     var out: [64]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
-    var conn = Conn(.{}).init(&empty_reader, &writer, .{
-        .observer = observer_state.observer(),
+    var conn = ConnWithHooks(.{}, TestHooks).initWithHooks(&empty_reader, &writer, .{}, .{
+        .observer = &observer_state,
     });
 
     conn.observeFrameRead(.{
@@ -2562,17 +2577,9 @@ const TestObserverState = struct {
     events: [16]observe.Event = undefined,
     len: usize = 0,
 
-    fn onEvent(ctx: ?*anyopaque, event: observe.Event) void {
-        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+    fn push(self: *@This(), event: observe.Event) void {
         self.events[self.len] = event;
         self.len += 1;
-    }
-
-    fn observer(self: *@This()) observe.Observer {
-        return .{
-            .ctx = self,
-            .on_event_fn = onEvent,
-        };
     }
 };
 
@@ -2580,8 +2587,7 @@ const TestClockState = struct {
     now_ns: u64 = 0,
     step_ns: u64,
 
-    fn now(ctx: ?*anyopaque) u64 {
-        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+    fn now(self: *@This()) u64 {
         const current = self.now_ns;
         self.now_ns += self.step_ns;
         return current;
@@ -2596,22 +2602,47 @@ const TestDeadlineState = struct {
     flush_calls: [8]?u64 = [_]?u64{null} ** 8,
     flush_len: usize = 0,
 
-    fn setRead(ctx: ?*anyopaque, deadline_ns: ?u64) void {
-        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+    fn setRead(self: *@This(), deadline_ns: ?u64) void {
         self.read_calls[self.read_len] = deadline_ns;
         self.read_len += 1;
     }
 
-    fn setWrite(ctx: ?*anyopaque, deadline_ns: ?u64) void {
-        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+    fn setWrite(self: *@This(), deadline_ns: ?u64) void {
         self.write_calls[self.write_len] = deadline_ns;
         self.write_len += 1;
     }
 
-    fn setFlush(ctx: ?*anyopaque, deadline_ns: ?u64) void {
-        const self: *@This() = @ptrCast(@alignCast(ctx.?));
+    fn setFlush(self: *@This(), deadline_ns: ?u64) void {
         self.flush_calls[self.flush_len] = deadline_ns;
         self.flush_len += 1;
+    }
+};
+
+const TestHooks = struct {
+    observer: ?*TestObserverState = null,
+    clock: ?*TestClockState = null,
+    deadlines: ?*TestDeadlineState = null,
+    fixed_now_ns: ?u64 = null,
+
+    pub fn nowNs(self: *const @This()) u64 {
+        if (self.clock) |clock| return clock.now();
+        return self.fixed_now_ns orelse 0;
+    }
+
+    pub fn setReadDeadlineNs(self: *@This(), deadline_ns: ?u64) void {
+        if (self.deadlines) |deadlines| deadlines.setRead(deadline_ns);
+    }
+
+    pub fn setWriteDeadlineNs(self: *@This(), deadline_ns: ?u64) void {
+        if (self.deadlines) |deadlines| deadlines.setWrite(deadline_ns);
+    }
+
+    pub fn setFlushDeadlineNs(self: *@This(), deadline_ns: ?u64) void {
+        if (self.deadlines) |deadlines| deadlines.setFlush(deadline_ns);
+    }
+
+    pub fn onEvent(self: *@This(), event: observe.Event) void {
+        if (self.observer) |observer| observer.push(event);
     }
 };
 
@@ -2621,8 +2652,8 @@ test "observer records frame reads and writes" {
     var empty_reader = Io.Reader.fixed(""[0..]);
     var write_buf: [32]u8 = undefined;
     var write_writer = Io.Writer.fixed(write_buf[0..]);
-    var write_conn = Conn(.{}).init(&empty_reader, &write_writer, .{
-        .observer = state.observer(),
+    var write_conn = ConnWithHooks(.{}, TestHooks).initWithHooks(&empty_reader, &write_writer, .{}, .{
+        .observer = &state,
     });
     try write_conn.writeBinary("abc");
 
@@ -2630,8 +2661,8 @@ test "observer records frame reads and writes" {
     var read_reader = Io.Reader.fixed(wire[0..]);
     var read_sink: [0]u8 = .{};
     var read_writer = Io.Writer.fixed(read_sink[0..]);
-    var read_conn = Conn(.{ .role = .client }).init(&read_reader, &read_writer, .{
-        .observer = state.observer(),
+    var read_conn = ConnWithHooks(.{ .role = .client }, TestHooks).initWithHooks(&read_reader, &read_writer, .{}, .{
+        .observer = &state,
     });
     var frame_buf: [8]u8 = undefined;
     _ = try read_conn.readFrame(frame_buf[0..]);
@@ -2665,8 +2696,8 @@ test "echoFrame emits close_received once per close frame" {
     var reader = Io.Reader.fixed(wire.items);
     var out: [64]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
-    var conn = Conn(.{}).init(&reader, &writer, .{
-        .observer = state.observer(),
+    var conn = ConnWithHooks(.{}, TestHooks).initWithHooks(&reader, &writer, .{}, .{
+        .observer = &state,
     });
     var scratch: [32]u8 = undefined;
     const echoed = try conn.echoFrame(scratch[0..]);
@@ -2691,15 +2722,13 @@ test "read timeout returns Timeout and emits a timeout event" {
     var reader = Io.Reader.fixed(wire[0..]);
     var sink: [0]u8 = .{};
     var writer = Io.Writer.fixed(sink[0..]);
-    var conn = Conn(.{ .role = .client }).init(&reader, &writer, .{
+    var conn = ConnWithHooks(.{ .role = .client }, TestHooks).initWithHooks(&reader, &writer, .{
         .timeouts = .{
-            .clock = .{
-                .ctx = &clock_state,
-                .now_ns_fn = TestClockState.now,
-            },
             .read_ns = 1,
         },
-        .observer = observer_state.observer(),
+    }, .{
+        .observer = &observer_state,
+        .clock = &clock_state,
     });
 
     try std.testing.expectError(error.Timeout, conn.beginFrame());
@@ -2715,29 +2744,19 @@ test "read timeout returns Timeout and emits a timeout event" {
 }
 
 test "deadline controller is set and cleared around timed reads and writes" {
-    const StaticClock = struct {
-        fn now(_: ?*anyopaque) u64 {
-            return 10;
-        }
-    };
-
     var deadline_state: TestDeadlineState = .{};
 
     const read_wire = [_]u8{ 0x81, 0x01, 'x' };
     var reader = Io.Reader.fixed(read_wire[0..]);
     var read_sink: [0]u8 = .{};
     var read_writer = Io.Writer.fixed(read_sink[0..]);
-    var read_conn = Conn(.{ .role = .client }).init(&reader, &read_writer, .{
+    var read_conn = ConnWithHooks(.{ .role = .client }, TestHooks).initWithHooks(&reader, &read_writer, .{
         .timeouts = .{
-            .clock = .{
-                .now_ns_fn = StaticClock.now,
-            },
             .read_ns = 20,
-            .deadlines = .{
-                .ctx = &deadline_state,
-                .set_read_deadline_ns_fn = TestDeadlineState.setRead,
-            },
         },
+    }, .{
+        .deadlines = &deadline_state,
+        .fixed_now_ns = 10,
     });
     var read_buf: [4]u8 = undefined;
     _ = try read_conn.readFrame(read_buf[0..]);
@@ -2749,19 +2768,14 @@ test "deadline controller is set and cleared around timed reads and writes" {
     var empty_reader = Io.Reader.fixed(""[0..]);
     var out: [16]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
-    var write_conn = Conn(.{}).init(&empty_reader, &writer, .{
+    var write_conn = ConnWithHooks(.{}, TestHooks).initWithHooks(&empty_reader, &writer, .{
         .timeouts = .{
-            .clock = .{
-                .now_ns_fn = StaticClock.now,
-            },
             .write_ns = 20,
             .flush_ns = 20,
-            .deadlines = .{
-                .ctx = &deadline_state,
-                .set_write_deadline_ns_fn = TestDeadlineState.setWrite,
-                .set_flush_deadline_ns_fn = TestDeadlineState.setFlush,
-            },
         },
+    }, .{
+        .deadlines = &deadline_state,
+        .fixed_now_ns = 10,
     });
     try write_conn.writeBinary("y");
     try write_conn.flush();
@@ -2785,26 +2799,19 @@ test "runtime_hooks false disables observer and timeout hooks" {
     var reader = Io.Reader.fixed(wire[0..]);
     var write_buf: [16]u8 = undefined;
     var writer = Io.Writer.fixed(write_buf[0..]);
-    var conn = Conn(.{
+    var conn = ConnWithHooks(.{
         .role = .client,
         .runtime_hooks = false,
-    }).init(&reader, &writer, .{
+    }, TestHooks).initWithHooks(&reader, &writer, .{
         .timeouts = .{
-            .clock = .{
-                .ctx = &clock_state,
-                .now_ns_fn = TestClockState.now,
-            },
             .read_ns = 1,
             .write_ns = 1,
             .flush_ns = 1,
-            .deadlines = .{
-                .ctx = &deadline_state,
-                .set_read_deadline_ns_fn = TestDeadlineState.setRead,
-                .set_write_deadline_ns_fn = TestDeadlineState.setWrite,
-                .set_flush_deadline_ns_fn = TestDeadlineState.setFlush,
-            },
         },
-        .observer = observer_state.observer(),
+    }, .{
+        .observer = &observer_state,
+        .clock = &clock_state,
+        .deadlines = &deadline_state,
     });
 
     var frame_buf: [8]u8 = undefined;

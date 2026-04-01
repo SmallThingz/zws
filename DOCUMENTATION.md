@@ -12,7 +12,7 @@ The public exports in `src/root.zig` are the supported package API:
 - `ConnType`, `Conn`, `ServerConn`, `ClientConn`
 - frame/message read and write helpers
 - `PerMessageDeflate` and `PerMessageDeflateConfig`
-- timeout and observer types (`TimeoutConfig`, `Clock`, `DeadlineController`, `Observer`, `ObserveEvent`)
+- timeout and observability types (`TimeoutConfig`, `DefaultRuntimeHooks`, `ObserveEvent`)
 
 Within a patch release, those symbols and their documented semantics should not break.
 
@@ -66,14 +66,18 @@ The connection API assumes buffered I/O.
 Timeouts are configured per connection through `Config.timeouts`.
 
 - `read_ns`, `write_ns`, and `flush_ns` bound individual blocking operations
-- `clock` provides the elapsed-time source
-- `deadlines` lets the embedding framework translate those budgets into transport-level deadlines
+- `ConnTypeWithHooks(..., Hooks)` lets the embedding framework provide the elapsed-time source and deadline mapping
+- `Conn`, `ServerConn`, `ClientConn`, and plain handshake helpers use `DefaultRuntimeHooks`
 
-Without a `DeadlineController`, timeout enforcement is cooperative: the library can detect an operation ran longer than budget once that operation returns. With a `DeadlineController`, the framework can map the same budget into socket or runtime deadlines so blocking I/O can fail promptly.
+Without custom hooks, timeout enforcement is cooperative: the library can detect an operation ran longer than budget once that operation returns. With hook-provided deadline methods, the framework can map the same budget into socket or runtime deadlines so blocking I/O can fail promptly.
 
 ### Observability
 
-The library exposes an optional event stream through `Config.observer` and `ServerHandshakeOptions.observer`.
+The library exposes an optional event stream through typed runtime hooks.
+
+- connection flows can use `ConnTypeWithHooks(.{ ... }, Hooks)` plus `initWithHooks(...)`
+- handshake-only flows can use `acceptServerHandshakeWithHooks(...)` and `serverHandshakeWithHooks(...)`
+- hook types provide `nowNs`, `setReadDeadlineNs`, `setWriteDeadlineNs`, `setFlushDeadlineNs`, and `onEvent`
 
 Current event coverage includes:
 
@@ -122,7 +126,7 @@ Production callers should still decide their own:
 - accept loop / task model
 - connection limits
 - timeout budgets and idle handling policy
-- how to export observer events into logs, metrics, or traces
+- how to export hook events into logs, metrics, or traces
 - TLS termination
 
 ## Validation

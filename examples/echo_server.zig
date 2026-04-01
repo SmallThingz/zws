@@ -11,8 +11,10 @@ const Config = struct {
     max_message_payload_len: usize = 1024 * 1024,
 };
 
-fn usage() void {
-    std.debug.print(
+fn usage(io: Io) !void {
+    var buf: [512]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buf);
+    try stdout.interface.writeAll(
         \\zwebsocket-echo-server
         \\
         \\Usage:
@@ -25,7 +27,8 @@ fn usage() void {
         \\  --max-message=1048576
         \\  --help
         \\
-    , .{});
+    );
+    try stdout.interface.flush();
 }
 
 fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
@@ -49,7 +52,7 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void
         .max_message_payload_len = cfg.max_message_payload_len,
         .permessage_deflate = if (accepted.permessage_deflate) |pmd|
             .{
-                .allocator = std.heap.page_allocator,
+                .allocator = std.heap.smp_allocator,
                 .negotiated = pmd,
                 .compress_outgoing = true,
             }
@@ -86,7 +89,7 @@ pub fn main(init: std.process.Init) !void {
     while (it.next()) |arg_z| {
         const arg: []const u8 = arg_z;
         if (std.mem.eql(u8, arg, "--help")) {
-            usage();
+            try usage(init.io);
             return;
         }
         if (std.mem.eql(u8, arg, "--compression")) {

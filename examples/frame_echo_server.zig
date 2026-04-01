@@ -10,8 +10,10 @@ const Config = struct {
     max_frame_payload_len: u64 = 128 * 1024,
 };
 
-fn usage() void {
-    std.debug.print(
+fn usage(io: Io) !void {
+    var buf: [640]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buf);
+    try stdout.interface.writeAll(
         \\zwebsocket-frame-echo-server
         \\
         \\Usage:
@@ -26,7 +28,8 @@ fn usage() void {
         \\This example stays on the frame API and uses `echoFrame(...)` instead of
         \\reassembling full messages with `readMessage(...)`.
         \\
-    , .{});
+    );
+    try stdout.interface.flush();
 }
 
 fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
@@ -50,7 +53,7 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void
         .max_frame_payload_len = cfg.max_frame_payload_len,
         .permessage_deflate = if (accepted.permessage_deflate) |pmd|
             .{
-                .allocator = std.heap.page_allocator,
+                .allocator = std.heap.smp_allocator,
                 .negotiated = pmd,
                 .compress_outgoing = true,
             }
@@ -80,7 +83,7 @@ pub fn main(init: std.process.Init) !void {
     while (it.next()) |arg_z| {
         const arg: []const u8 = arg_z;
         if (std.mem.eql(u8, arg, "--help")) {
-            usage();
+            try usage(init.io);
             return;
         }
         if (std.mem.eql(u8, arg, "--compression")) {

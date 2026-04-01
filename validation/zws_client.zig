@@ -11,8 +11,10 @@ const Config = struct {
     compression: bool = false,
 };
 
-fn usage() void {
-    std.debug.print(
+fn usage(io: Io) !void {
+    var buf: [512]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buf);
+    try stdout.interface.writeAll(
         \\zwebsocket-interop-client
         \\
         \\Usage:
@@ -25,7 +27,8 @@ fn usage() void {
         \\  --compression
         \\  --help
         \\
-    , .{});
+    );
+    try stdout.interface.flush();
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -38,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     while (it.next()) |arg_z| {
         const arg: []const u8 = arg_z;
         if (std.mem.eql(u8, arg, "--help")) {
-            usage();
+            try usage(init.io);
             return;
         }
         if (std.mem.eql(u8, arg, "--compression")) {

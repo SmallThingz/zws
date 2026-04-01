@@ -29,8 +29,10 @@ const ConnState = struct {
     result: ConnResult = .{},
 };
 
-fn usage() void {
-    std.debug.print(
+fn usage(io: Io) !void {
+    var buf: [768]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &buf);
+    try stdout.interface.writeAll(
         \\zwebsocket-bench
         \\
         \\Usage:
@@ -50,7 +52,8 @@ fn usage() void {
         \\  --rate-file=PATH   Write msg/s as a single float line
         \\  --help             Show this help
         \\
-    , .{});
+    );
+    try stdout.interface.flush();
 }
 
 fn discardExact(r: *Io.Reader, n: usize) !void {
@@ -233,7 +236,7 @@ pub fn main(init: std.process.Init) !void {
     while (it.next()) |arg_z| {
         const arg: []const u8 = arg_z;
         if (std.mem.eql(u8, arg, "--help")) {
-            usage();
+            try usage(init.io);
             return;
         }
         if (std.mem.eql(u8, arg, "--quiet")) {
@@ -317,14 +320,17 @@ pub fn main(init: std.process.Init) !void {
     const payload_mib_per_sec = (msgs_per_sec * @as(f64, @floatFromInt(cfg.msg_size))) / (1024.0 * 1024.0);
     const label = init.environ_map.get("BENCH_LABEL") orelse "zwebsocket";
 
+    var stdout_buf: [256]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
     if (cfg.quiet) {
-        std.debug.print("{s}: {d:.2} msg/s, {d:.2} MiB/s\n", .{ label, msgs_per_sec, payload_mib_per_sec });
+        try stdout.interface.print("{s}: {d:.2} msg/s, {d:.2} MiB/s\n", .{ label, msgs_per_sec, payload_mib_per_sec });
     } else {
-        std.debug.print(
+        try stdout.interface.print(
             "label={s} total_msgs={d} elapsed_ns={d} msg_per_sec={d:.2} payload_mib_per_sec={d:.2}\n",
             .{ label, total_ok, elapsed_ns, msgs_per_sec, payload_mib_per_sec },
         );
     }
+    try stdout.interface.flush();
 
     if (cfg.rate_file) |path| {
         const file = try std.Io.Dir.createFileAbsolute(init.io, path, .{ .truncate = true });

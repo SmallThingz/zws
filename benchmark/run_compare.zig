@@ -2,7 +2,7 @@ const std = @import("std");
 const scripts = @import("scripts.zig");
 
 pub fn main(init: std.process.Init) !void {
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    var arena = std.heap.ArenaAllocator.init(init.gpa);
     defer arena.deinit();
     const allocator = arena.allocator();
 

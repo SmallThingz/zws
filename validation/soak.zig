@@ -118,8 +118,8 @@ fn runWorker(args: WorkerArgs) !void {
     var sr = stream.reader(args.io, &read_buf);
     var sw = stream.writer(args.io, &write_buf);
 
-    const request = try common.buildClientHandshakeRequest(std.heap.page_allocator, args.host, "/", args.compression);
-    defer std.heap.page_allocator.free(request);
+    const request = try common.buildClientHandshakeRequest(std.heap.smp_allocator, args.host, "/", args.compression);
+    defer std.heap.smp_allocator.free(request);
     const reply = try common.performClientHandshake(&sr.interface, &sw.interface, request);
 
     const negotiated = if (reply.selected_extensions) |header|
@@ -129,7 +129,7 @@ fn runWorker(args: WorkerArgs) !void {
     var conn = zws.ClientConn.init(&sr.interface, &sw.interface, .{
         .permessage_deflate = if (negotiated) |pmd|
             .{
-                .allocator = std.heap.page_allocator,
+                .allocator = std.heap.smp_allocator,
                 .negotiated = pmd,
                 .compress_outgoing = true,
             }
