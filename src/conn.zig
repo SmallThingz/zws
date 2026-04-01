@@ -473,6 +473,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                         .ping => if (comptime auto_pong) {
                             if (!self.close_sent) {
                                 try self.writePong(payload);
+                                try self.flushAutoControlReply();
                                 self.emit(.{ .auto_pong_sent = .{ .payload_len = payload.len } });
                             }
                         },
@@ -483,7 +484,10 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                             self.recv_fragment_compressed = false;
                             const close_frame = try parseClosePayload(payload, validate_utf8);
                             if (comptime auto_reply_close) {
-                                if (!self.close_sent) try self.writeClose(close_frame.code, close_frame.reason);
+                                if (!self.close_sent) {
+                                    try self.writeClose(close_frame.code, close_frame.reason);
+                                    try self.flushAutoControlReply();
+                                }
                             }
                             return error.ConnectionClosed;
                         },
@@ -822,6 +826,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                     .ping => if (comptime auto_pong) {
                         if (!self.close_sent) {
                             try self.writePong(payload);
+                            try self.flushAutoControlReply();
                             self.emit(.{ .auto_pong_sent = .{ .payload_len = payload.len } });
                         }
                     },
@@ -832,7 +837,10 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                         self.recv_fragment_compressed = false;
                         const close_frame = try parseClosePayload(payload, validate_utf8);
                         if (comptime auto_reply_close) {
-                            if (!self.close_sent) try self.writeClose(close_frame.code, close_frame.reason);
+                            if (!self.close_sent) {
+                                try self.writeClose(close_frame.code, close_frame.reason);
+                                try self.flushAutoControlReply();
+                            }
                         }
                         return true;
                     },
@@ -845,6 +853,15 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         fn writeControlFrame(self: *Self, opcode: Opcode, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
             if (payload.len > control_payload_max_len) return error.ControlFrameTooLarge;
             try self.writeFrame(opcode, payload, true);
+        }
+
+        fn flushAutoControlReply(self: *Self) (ProtocolError || Io.Writer.Error)!void {
+            // `readMessage`/`discardRemainingMessage` stay in a blocking read loop after
+            // auto-generated pong/close replies. Flush them immediately so the peer does
+            // not deadlock waiting for that control frame. Any caller-buffered message
+            // bytes piggyback on this flush as well, so a pending write is pushed out on
+            // the next incoming ping without requiring a separate explicit flush first.
+            try self.flushTimed();
         }
 
         fn inflateMessage(self: *Self, compressed_payload: []const u8, dest: []u8) ProtocolError![]u8 {
@@ -1080,6 +1097,58 @@ fn appendTestFrame(
     try test_support.appendTestFrame(Opcode, out, a, opcode, fin, masked, payload, mask);
 }
 
+const FlushTrackingWriter = struct {
+    interface: Io.Writer,
+    sink: []u8,
+    flushed_end: usize = 0,
+    flush_count: usize = 0,
+
+    fn init(buffer: []u8, sink: []u8) FlushTrackingWriter {
+        return .{
+            .interface = .{
+                .vtable = &.{
+                    .drain = drain,
+                    .flush = flush,
+                    .rebase = rebase,
+                },
+                .buffer = buffer,
+            },
+            .sink = sink,
+        };
+    }
+
+    fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *FlushTrackingWriter = @fieldParentPtr("interface", w);
+        try flush(w);
+
+        for (data[0 .. data.len - 1]) |part| try self.append(part);
+        const last = data[data.len - 1];
+        for (0..splat) |_| try self.append(last);
+        return Io.Writer.countSplat(data, splat);
+    }
+
+    fn flush(w: *Io.Writer) Io.Writer.Error!void {
+        const self: *FlushTrackingWriter = @fieldParentPtr("interface", w);
+        self.flush_count += 1;
+        try self.append(w.buffer[0..w.end]);
+        w.end = 0;
+    }
+
+    fn rebase(w: *Io.Writer, preserve: usize, capacity: usize) Io.Writer.Error!void {
+        _ = capacity;
+        if (preserve > w.end or preserve > w.buffer.len) return error.WriteFailed;
+        const start = w.end - preserve;
+        std.mem.copyForwards(u8, w.buffer[0..preserve], w.buffer[start..][0..preserve]);
+        w.end = preserve;
+    }
+
+    fn append(self: *FlushTrackingWriter, bytes: []const u8) Io.Writer.Error!void {
+        if (self.flushed_end + bytes.len > self.sink.len) return error.WriteFailed;
+        @memcpy(self.sink[self.flushed_end..][0..bytes.len], bytes);
+        self.flushed_end += bytes.len;
+    }
+};
+
 const test_small_binary_payload = [_]u8{ 0xde, 0xad, 0xbe, 0xef, 0x17, 0x42, 0x99, 0x01 };
 
 test "validateUtf8IfEnabled enforces comptime-enabled validation only" {
@@ -1157,6 +1226,28 @@ test "readMessage reassembles fragments and auto-pongs" {
     try std.testing.expectEqual(MessageOpcode.text, message.opcode);
     try std.testing.expectEqualStrings("Hello", message.payload);
     try std.testing.expectEqualSlices(u8, &.{ 0x8A, 0x01, '!' }, out[0..writer.end]);
+}
+
+test "readMessage flushes auto-pongs and pending buffered writes before blocking again" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .ping, true, true, "!", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "go", .{ 5, 6, 7, 8 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var buffer: [32]u8 = undefined;
+    var sink: [32]u8 = undefined;
+    var writer = FlushTrackingWriter.init(buffer[0..], sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer.interface, .{});
+
+    try conn.writeText("ok");
+
+    var msg_buf: [8]u8 = undefined;
+    const msg = try conn.readMessage(msg_buf[0..]);
+    try std.testing.expectEqual(MessageOpcode.binary, msg.opcode);
+    try std.testing.expectEqualStrings("go", msg.payload);
+    try std.testing.expect(writer.flush_count >= 1);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 0x02, 'o', 'k', 0x8A, 0x01, '!' }, writer.sink[0..writer.flushed_end]);
 }
 
 test "client writes masked frame" {
@@ -1588,6 +1679,26 @@ test "readMessage handles pong close and configured auto reply behavior" {
     }
 }
 
+test "readMessage flushes auto-close replies and pending buffered writes" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    const close_payload = [_]u8{ 0x03, 0xE8, 'b', 'y', 'e' };
+    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, close_payload[0..], .{ 1, 2, 3, 4 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var buffer: [32]u8 = undefined;
+    var sink: [32]u8 = undefined;
+    var writer = FlushTrackingWriter.init(buffer[0..], sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer.interface, .{});
+
+    try conn.writeText("ok");
+
+    var msg_buf: [8]u8 = undefined;
+    try std.testing.expectError(error.ConnectionClosed, conn.readMessage(msg_buf[0..]));
+    try std.testing.expect(writer.flush_count >= 1);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 0x02, 'o', 'k', 0x88, 0x05, 0x03, 0xE8, 'b', 'y', 'e' }, writer.sink[0..writer.flushed_end]);
+}
+
 test "readMessage clears fragmented receive state when a close interrupts a message" {
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(std.testing.allocator);
@@ -1695,6 +1806,27 @@ test "readMessage drains fragmented oversized messages and preserves next messag
     const next = try conn.readFrame(frame_buf[0..]);
     try std.testing.expectEqual(Opcode.binary, next.header.opcode);
     try std.testing.expectEqualStrings("ok", next.payload);
+}
+
+test "discardRemainingMessage flushes auto-pongs while draining oversized fragmented messages" {
+    var wire: std.ArrayList(u8) = .empty;
+    defer wire.deinit(std.testing.allocator);
+    try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "abc", .{ 1, 2, 3, 4 });
+    try appendTestFrame(&wire, std.testing.allocator, .ping, true, true, "!", .{ 5, 6, 7, 8 });
+    try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, "de", .{ 9, 10, 11, 12 });
+
+    var reader = Io.Reader.fixed(wire.items);
+    var buffer: [32]u8 = undefined;
+    var sink: [32]u8 = undefined;
+    var writer = FlushTrackingWriter.init(buffer[0..], sink[0..]);
+    var conn = Conn(.{}).init(&reader, &writer.interface, .{});
+
+    try conn.writeText("ok");
+
+    var msg_buf: [2]u8 = undefined;
+    try std.testing.expectError(error.MessageTooLarge, conn.readMessage(msg_buf[0..]));
+    try std.testing.expect(writer.flush_count >= 1);
+    try std.testing.expectEqualSlices(u8, &.{ 0x81, 0x02, 'o', 'k', 0x8A, 0x01, '!' }, writer.sink[0..writer.flushed_end]);
 }
 
 test "readMessage drains fragmented messages that exceed configured max size" {
