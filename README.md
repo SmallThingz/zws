@@ -17,8 +17,9 @@ Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame ho
 - 🧠 **Optional context takeover**: compile-time `Conn.Type` toggle (`permessage_deflate_context_takeover`) enables cross-message compression state when negotiated.
 - 🎛 **Per-message compression policy**: compile-time `Conn.Type` knobs decide when messages are compressed (`permessage_deflate_min_payload_len`, `permessage_deflate_require_compression_gain`).
 - ⏱ **Timeout hooks**: optional read, write, and flush time budgets with typed runtime hooks for framework-owned transports.
-- 👀 **Observability hooks**: optional typed event stream for handshakes, frame/message flow, control frames, protocol failures, and timeout events.
+- ⏱ **Timeout-only runtime hooks**: optional typed deadline hooks for read, write, and flush budgets.
 - 🔁 **Convenience helpers**: `readMessage`, `echoFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, and `writeClose`.
+- 🧩 **Typed message handlers**: `Handler.run(...)` with `Ctx.T()` state access, sync/async handler signatures, and response coercion from `[]const u8`, `[][]const u8`, or structs with `body`.
 - 🧪 **Validation stack**: unit tests, fuzz/property tests, a cross-library interop matrix, soak runners, and benchmarks live alongside the library.
 
 ## 🚀 Quick Start
@@ -68,6 +69,24 @@ For a simple websocket client that performs the HTTP upgrade and then uses `zws.
 zig build examples -Dexample=client -- --host=127.0.0.1 --port=9001 --message=hello
 ```
 
+For a typed per-message handler loop with user-owned state:
+
+```zig
+const io = std.Io.Threaded.global_single_threaded.io();
+var app_state = AppState{};
+var msg_buf: [64 * 1024]u8 = undefined;
+
+fn onMessage(ctx: *zws.Handler.SliceContext(zws.Conn.Server)) ![]const u8 {
+    const state = ctx.T(AppState);
+    state.seen += 1;
+    return ctx.message.payload;
+}
+
+try zws.Handler.run(.{
+    .receive_mode = .solid_slice,
+}, io, &conn, &app_state, msg_buf[0..], onMessage);
+```
+
 ## 📦 Installation
 
 Add as a dependency:
@@ -101,7 +120,9 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
 - Compression path:
   `Extensions.PerMessageDeflate`, `Conn.PerMessageDeflateConfig`, `Handshake.Response.permessage_deflate`, `Conn.Config.permessage_deflate`.
 - Runtime hooks:
-  `Observe.TimeoutConfig`, `Observe.DefaultRuntimeHooks`, `Conn.TypeWithHooks(...)`, `Handshake.acceptServerHandshakeWithHooks(...)`, `Handshake.serverHandshakeWithHooks(...)`, `Observe.Event`.
+  `Observe.TimeoutConfig`, `Observe.DefaultRuntimeHooks`, `Conn.TypeWithHooks(...)`.
+- Message handler loop:
+  `Handler.run(...)`, `Handler.Options`, `Handler.SliceContext(...)`, `Handler.StreamContext(...)`, `Handler.Response`.
 
 ## 📚 Docs
 

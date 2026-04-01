@@ -8,7 +8,8 @@
 //! `Conn.Type` exposes the comptime-specialized connection type constructor.
 //! `Conn.Default`, `Conn.Server`, and `Conn.Client` are convenient aliases for
 //! common configurations. Supporting protocol/extension/observe types live
-//! under `Protocol`, `Extensions`, and `Observe`.
+//! under `Protocol`, `Extensions`, and `Observe`. Message handler helpers live
+//! under `Handler`.
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -17,6 +18,7 @@ pub const Handshake = @import("handshake.zig");
 pub const Observe = @import("observe.zig");
 pub const Extensions = @import("extensions.zig");
 pub const Conn = @import("conn.zig");
+pub const Handler = @import("handler.zig");
 
 pub fn fuzz(
     context: anytype,
@@ -129,8 +131,9 @@ test "public type aliases resolve to the specialized core implementations" {
     );
     try std.testing.expectEqualStrings(@typeName(Conn.Config), @typeName(Conn.Config));
     try std.testing.expectEqualStrings(@typeName(Conn.Frame), @typeName(Conn.Frame));
-    try std.testing.expectEqualStrings(@typeName(Observe.Event), @typeName(Observe.Event));
     try std.testing.expectEqualStrings(@typeName(Observe.TimeoutConfig), @typeName(Observe.TimeoutConfig));
+    try std.testing.expectEqualStrings(@typeName(Observe.IoPhase), @typeName(Observe.IoPhase));
+    try std.testing.expectEqualStrings(@typeName(Handler.Response), @typeName(Handler.Response));
 }
 
 test {
@@ -139,6 +142,7 @@ test {
     _ = @import("protocol.zig");
     _ = @import("handshake.zig");
     _ = @import("conn.zig");
+    _ = @import("handler.zig");
     _ = @import("flate_backend.zig");
     _ = @import("test_support.zig");
     _ = @import("validation_tests.zig");

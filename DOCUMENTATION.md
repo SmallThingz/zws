@@ -12,7 +12,7 @@ The public exports in `src/root.zig` are the supported package API:
 - `Conn`
 - frame/message read and write helpers
 - `Extensions.PerMessageDeflate` and `Conn.PerMessageDeflateConfig`
-- timeout and observability types (`Observe.TimeoutConfig`, `Observe.DefaultRuntimeHooks`, `Observe.Event`)
+- timeout runtime hook types (`Observe.TimeoutConfig`, `Observe.DefaultRuntimeHooks`)
 
 Within a patch release, those symbols and their documented semantics should not break.
 
@@ -53,6 +53,28 @@ That makes it fit two common models:
 - raw `std.Io.net.Stream`
 - custom runtimes that can hand over borrowed reader/writer pairs
 
+For message-oriented application code, you can also run a typed handler loop with `Handler.run(...)` and keep state in user-owned structs via `Ctx.T()`.
+
+### Message Handlers
+
+`Handler.run(...)` is the built-in typed message loop adapter. It does not introduce runtime interfaces/vtables; handler dispatch is comptime-specialized.
+
+- Handler signatures:
+  - sync: `fn(ctx: *Handler.SliceContext(...)) ResponseType`
+  - async-style: `fn(io: std.Io, ctx: *Handler.SliceContext(...)) !ResponseType`
+- `Ctx.T()` gives typed access to user-owned per-loop/per-connection state.
+- Receive mode is configured through `Handler.Options.receive_mode`:
+  - `.solid_slice`: handlers receive a fully assembled message slice from caller-provided message buffer.
+  - `.stream`: handlers pull chunks with `ctx.readChunk(...)` and can avoid full-message assembly in the library.
+- Supported sync return shapes:
+  - `[]const u8`
+  - `[][]const u8` / `[]const []const u8`
+  - `Handler.Response`
+  - structs with `body` (and optional `opcode`)
+
+Response writing stays on the core websocket writer path (`Conn.writeText` / `Conn.writeBinary` / fragmented frames for chunk arrays), and flushing is controlled by `Handler.Options.auto_flush`.
+Control replies (auto-pong / auto-close) can be flushed independently with `Handler.Options.flush_control_replies`.
+
 ### Buffering
 
 The connection API assumes buffered I/O.
@@ -71,23 +93,13 @@ Timeouts are configured per connection through `Conn.Config.timeouts`.
 
 Without custom hooks, timeout enforcement is cooperative: the library can detect an operation ran longer than budget once that operation returns. With hook-provided deadline methods, the framework can map the same budget into socket or runtime deadlines so blocking I/O can fail promptly.
 
-### Observability
+### Runtime Hooks
 
-The library exposes an optional event stream through typed runtime hooks.
+Runtime hooks are now timeout-only.
 
 - connection flows can use `Conn.TypeWithHooks(.{ ... }, Hooks)` plus `initWithHooks(...)`
-- handshake-only flows can use `Handshake.acceptServerHandshakeWithHooks(...)` and `Handshake.serverHandshakeWithHooks(...)`
-- hook types provide `nowNs`, `setReadDeadlineNs`, `setWriteDeadlineNs`, `setFlushDeadlineNs`, and `onEvent`
-
-Current event coverage includes:
-
-- handshake acceptance and rejection
-- frame reads and writes
-- completed message reads
-- ping, pong, and close reception
-- auto-pong emission
-- timeout detection
-- surfaced protocol errors from core sequencing and frame validation paths
+- hook types provide `nowNs`, `setReadDeadlineNs`, `setWriteDeadlineNs`, and `setFlushDeadlineNs`
+- there is no event callback surface in the core hook contract
 
 ### Compression
 
@@ -126,7 +138,7 @@ Production callers should still decide their own:
 - accept loop / task model
 - connection limits
 - timeout budgets and idle handling policy
-- how to export hook events into logs, metrics, or traces
+- how to collect timeout counters/latency metrics in your runtime
 - TLS termination
 
 ## Validation

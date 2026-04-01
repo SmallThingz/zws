@@ -200,12 +200,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             }
         }
 
-        fn emit(self: *const Self, event: observe.Event) void {
-            if (comptime !runtime_hooks) return;
-            var hooks = @constCast(&self.hooks);
-            hooks.onEvent(event);
-        }
-
         fn beginTimedOp(self: *const Self, phase: observe.IoPhase) ?TimedOp {
             if (comptime !runtime_hooks) return null;
             const budget_ns = switch (phase) {
@@ -245,11 +239,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             const op = timed orelse return;
             const elapsed_ns = self.hooks.nowNs() -| op.start_ns;
             if (elapsed_ns > op.budget_ns) {
-                self.emit(.{ .timeout = .{
-                    .phase = op.phase,
-                    .budget_ns = op.budget_ns,
-                    .elapsed_ns = elapsed_ns,
-                } });
                 return error.Timeout;
             }
         }
@@ -304,59 +293,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             try self.finishTimedOp(timed);
         }
 
-        fn observeFrameRead(self: *const Self, header: FrameHeader, borrowed: bool) void {
-            self.emit(.{ .frame_read = .{
-                .opcode = header.opcode,
-                .payload_len = header.payload_len,
-                .fin = header.fin,
-                .compressed = header.compressed,
-                .borrowed = borrowed,
-            } });
-        }
-
-        fn observeFrameWrite(self: *const Self, opcode: Opcode, payload_len: usize, fin: bool, compressed: bool) void {
-            self.emit(.{ .frame_write = .{
-                .opcode = opcode,
-                .payload_len = payload_len,
-                .fin = fin,
-                .compressed = compressed,
-            } });
-        }
-
-        fn observeMessageRead(self: *const Self, opcode: MessageOpcode, payload_len: usize, compressed: bool) void {
-            self.emit(.{ .message_read = .{
-                .opcode = opcode,
-                .payload_len = payload_len,
-                .compressed = compressed,
-            } });
-        }
-
-        fn observeControlReceived(self: *const Self, opcode: Opcode, payload: []const u8) void {
-            switch (opcode) {
-                .ping => self.emit(.{ .ping_received = .{ .payload_len = payload.len } }),
-                .pong => self.emit(.{ .pong_received = .{ .payload_len = payload.len } }),
-                .close => {
-                    const close_frame: CloseFrame = parseClosePayload(payload, validate_utf8) catch .{};
-                    self.emit(.{ .close_received = .{
-                        .code = close_frame.code,
-                        .payload_len = payload.len,
-                    } });
-                },
-                else => {},
-            }
-        }
-
-        fn observeCloseSent(self: *const Self, code: ?u16, payload_len: usize) void {
-            self.emit(.{ .close_sent = .{
-                .code = code,
-                .payload_len = payload_len,
-            } });
-        }
-
-        fn observeProtocolError(self: *const Self, err: ProtocolError) void {
-            self.emit(.{ .protocol_error = .{ .name = @errorName(err) } });
-        }
-
         pub fn beginFrame(self: *Self) (ProtocolError || Io.Reader.Error)!FrameHeader {
             if (self.recv_active) return error.FrameActive;
 
@@ -364,10 +300,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             const prefix = if (available.len >= 2) available else try self.peekTimed(2);
             const header_need = neededHeaderLen(prefix[1]);
             const header_bytes = if (prefix.len >= header_need) prefix else try self.peekTimed(header_need);
-            const parsed = (self.parseHeaderBytes(header_bytes) catch |err| {
-                self.observeProtocolError(err);
-                return err;
-            }).?;
+            const parsed = (try self.parseHeaderBytes(header_bytes)).?;
 
             self.reader.toss(parsed.header_len);
             self.recv_active = true;
@@ -387,10 +320,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             if (header_need > self.reader.buffer.len) return null;
 
             const header_bytes = if (prefix.len >= header_need) prefix else try self.peekTimed(header_need);
-            const parsed = (self.parseHeaderBytes(header_bytes) catch |err| {
-                self.observeProtocolError(err);
-                return err;
-            }).?;
+            const parsed = (try self.parseHeaderBytes(header_bytes)).?;
             const payload_len: usize = std.math.cast(usize, parsed.header.payload_len) orelse return null;
             const total_len = std.math.add(usize, parsed.header_len, payload_len) catch return null;
             if (total_len > self.reader.buffer.len) return null;
@@ -400,7 +330,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             if (parsed.header.masked) applyMask(payload, parsed.mask, 0);
             self.reader.toss(total_len);
             self.noteConsumedFrame(parsed.header);
-            self.observeFrameRead(parsed.header, true);
 
             return .{
                 .header = parsed.header,
@@ -507,7 +436,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                     if (comptime validate_utf8) {
                         if (final_opcode == .text and !std.unicode.utf8ValidateSlice(inflated)) return error.InvalidUtf8;
                     }
-                    self.observeMessageRead(final_opcode, inflated.len, true);
                     return .{
                         .opcode = final_opcode,
                         .payload = inflated,
@@ -530,7 +458,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                 if (comptime validate_utf8) {
                     if (final_opcode == .text and !std.unicode.utf8ValidateSlice(buf[0..total_len])) return error.InvalidUtf8;
                 }
-                self.observeMessageRead(final_opcode, total_len, false);
                 return .{
                     .opcode = final_opcode,
                     .payload = buf[0..total_len],
@@ -564,10 +491,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         ) (ProtocolError || Io.Writer.Error)!void {
             if (proto.isControl(opcode) and payload.len > control_payload_max_len) return error.ControlFrameTooLarge;
             if (proto.isControl(opcode) and compressed) return error.ReservedBitsSet;
-            self.validateOutgoingSequence(opcode, fin) catch |err| {
-                self.observeProtocolError(err);
-                return err;
-            };
+            try self.validateOutgoingSequence(opcode, fin);
 
             var header_buf: [frame_header_max_len]u8 = undefined;
             var header_len: usize = 0;
@@ -611,13 +535,11 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                     try self.writeAllTimed(scratch[0..n]);
                     offset += n;
                 }
-                self.observeFrameWrite(opcode, payload.len, fin, compressed);
                 return;
             }
 
             var write_parts = [_][]const u8{ header_buf[0..header_len], payload };
             try self.writeVecAllTimed(write_parts[0..]);
-            self.observeFrameWrite(opcode, payload.len, fin, compressed);
         }
 
         pub fn writeText(self: *Self, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
@@ -691,7 +613,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
 
             try self.writeControlFrame(.close, payload[0..len]);
             self.close_sent = true;
-            self.observeCloseSent(code, len);
         }
 
         fn parseHeaderBytes(self: *Self, bytes: []const u8) ProtocolError!?ParsedHeader {
@@ -820,7 +741,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             comptime reply_close: bool,
             comptime flush_reply: bool,
         ) (ProtocolError || Io.Writer.Error)!bool {
-            self.observeControlReceived(opcode, payload);
             switch (opcode) {
                 .ping => {
                     try self.autoReplyPing(payload, flush_reply);
@@ -840,7 +760,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             if (self.close_sent) return;
             try self.writePong(payload);
             if (comptime flush_reply) try self.flushAutoControlReply();
-            self.emit(.{ .auto_pong_sent = .{ .payload_len = payload.len } });
         }
 
         fn handleCloseFrame(
@@ -994,12 +913,12 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             self.recv_remaining = 0;
             self.recv_mask_offset = 0;
             self.noteConsumedFrame(header);
-            self.observeFrameRead(header, false);
         }
     };
 }
 
 pub const TypeWithHooks = ConnWithHooks;
+pub const Default = Conn(.{});
 pub const Server = Conn(.{ .role = .server });
 pub const Client = Conn(.{ .role = .client });
 
@@ -2644,44 +2563,7 @@ test "internal header parsing and fragment bookkeeping helpers behave directly" 
     try std.testing.expect(!conn.recv_fragment_compressed);
 }
 
-test "internal observer and discard helpers cover control flow directly" {
-    var observer_state: TestObserverState = .{};
-    var empty_reader = Io.Reader.fixed(""[0..]);
-    var out: [64]u8 = undefined;
-    var writer = Io.Writer.fixed(out[0..]);
-    var conn = ConnWithHooks(.{}, TestHooks).initWithHooks(&empty_reader, &writer, .{}, .{
-        .observer = &observer_state,
-    });
-
-    conn.observeFrameRead(.{
-        .fin = true,
-        .masked = true,
-        .compressed = false,
-        .opcode = .binary,
-        .payload_len = 3,
-    }, true);
-    conn.observeFrameWrite(.text, 2, false, true);
-    conn.observeMessageRead(.binary, 7, false);
-    conn.observeControlReceived(.ping, "!");
-    conn.observeControlReceived(.pong, "?");
-    conn.observeControlReceived(.close, &.{ 0x03, 0xE8, 'o', 'k' });
-    conn.observeCloseSent(1000, 4);
-    conn.observeProtocolError(error.InvalidUtf8);
-
-    try std.testing.expectEqual(@as(usize, 8), observer_state.len);
-    switch (observer_state.events[0]) {
-        .frame_read => |event| try std.testing.expect(event.borrowed),
-        else => return error.TestExpectedEqual,
-    }
-    switch (observer_state.events[5]) {
-        .close_received => |event| try std.testing.expectEqual(@as(?u16, 1000), event.code),
-        else => return error.TestExpectedEqual,
-    }
-    switch (observer_state.events[7]) {
-        .protocol_error => |event| try std.testing.expectEqualStrings("InvalidUtf8", event.name),
-        else => return error.TestExpectedEqual,
-    }
-
+test "internal discard helpers cover control flow directly" {
     var wire: std.ArrayList(u8) = .empty;
     defer wire.deinit(std.testing.allocator);
     try appendTestFrame(&wire, std.testing.allocator, .ping, true, true, "!", .{ 1, 2, 3, 4 });
@@ -2705,16 +2587,6 @@ test "internal observer and discard helpers cover control flow directly" {
     try std.testing.expect(draining_conn.close_received);
     try std.testing.expect(draining_conn.recv_fragment_opcode == null);
 }
-
-const TestObserverState = struct {
-    events: [16]observe.Event = undefined,
-    len: usize = 0,
-
-    fn push(self: *@This(), event: observe.Event) void {
-        self.events[self.len] = event;
-        self.len += 1;
-    }
-};
 
 const TestClockState = struct {
     now_ns: u64 = 0,
@@ -2752,7 +2624,6 @@ const TestDeadlineState = struct {
 };
 
 const TestHooks = struct {
-    observer: ?*TestObserverState = null,
     clock: ?*TestClockState = null,
     deadlines: ?*TestDeadlineState = null,
     fixed_now_ns: ?u64 = null,
@@ -2773,81 +2644,8 @@ const TestHooks = struct {
     pub fn setFlushDeadlineNs(self: *@This(), deadline_ns: ?u64) void {
         if (self.deadlines) |deadlines| deadlines.setFlush(deadline_ns);
     }
-
-    pub fn onEvent(self: *@This(), event: observe.Event) void {
-        if (self.observer) |observer| observer.push(event);
-    }
 };
-
-test "observer records frame reads and writes" {
-    var state: TestObserverState = .{};
-
-    var empty_reader = Io.Reader.fixed(""[0..]);
-    var write_buf: [32]u8 = undefined;
-    var write_writer = Io.Writer.fixed(write_buf[0..]);
-    var write_conn = ConnWithHooks(.{}, TestHooks).initWithHooks(&empty_reader, &write_writer, .{}, .{
-        .observer = &state,
-    });
-    try write_conn.writeBinary("abc");
-
-    const wire = [_]u8{ 0x81, 0x02, 'O', 'K' };
-    var read_reader = Io.Reader.fixed(wire[0..]);
-    var read_sink: [0]u8 = .{};
-    var read_writer = Io.Writer.fixed(read_sink[0..]);
-    var read_conn = ConnWithHooks(.{ .role = .client }, TestHooks).initWithHooks(&read_reader, &read_writer, .{}, .{
-        .observer = &state,
-    });
-    var frame_buf: [8]u8 = undefined;
-    _ = try read_conn.readFrame(frame_buf[0..]);
-
-    try std.testing.expectEqual(@as(usize, 2), state.len);
-    switch (state.events[0]) {
-        .frame_write => |event| {
-            try std.testing.expectEqual(Opcode.binary, event.opcode);
-            try std.testing.expectEqual(@as(u64, 3), event.payload_len);
-            try std.testing.expect(event.fin);
-        },
-        else => try std.testing.expect(false),
-    }
-    switch (state.events[1]) {
-        .frame_read => |event| {
-            try std.testing.expectEqual(Opcode.text, event.opcode);
-            try std.testing.expectEqual(@as(u64, 2), event.payload_len);
-            try std.testing.expect(!event.borrowed);
-        },
-        else => try std.testing.expect(false),
-    }
-}
-
-test "echoFrame emits close_received once per close frame" {
-    var state: TestObserverState = .{};
-    var wire: std.ArrayList(u8) = .empty;
-    defer wire.deinit(std.testing.allocator);
-    const close_payload = [_]u8{ 0x03, 0xE8 };
-    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, close_payload[0..], .{ 1, 2, 3, 4 });
-
-    var reader = Io.Reader.fixed(wire.items);
-    var out: [64]u8 = undefined;
-    var writer = Io.Writer.fixed(out[0..]);
-    var conn = ConnWithHooks(.{}, TestHooks).initWithHooks(&reader, &writer, .{}, .{
-        .observer = &state,
-    });
-    var scratch: [32]u8 = undefined;
-    const echoed = try conn.echoFrame(scratch[0..]);
-    try std.testing.expectEqual(Opcode.close, echoed.opcode);
-
-    var close_received_count: usize = 0;
-    for (state.events[0..state.len]) |event| {
-        switch (event) {
-            .close_received => close_received_count += 1,
-            else => {},
-        }
-    }
-    try std.testing.expectEqual(@as(usize, 1), close_received_count);
-}
-
-test "read timeout returns Timeout and emits a timeout event" {
-    var observer_state: TestObserverState = .{};
+test "read timeout returns Timeout" {
     var clock_state: TestClockState = .{
         .step_ns = 5,
     };
@@ -2860,20 +2658,10 @@ test "read timeout returns Timeout and emits a timeout event" {
             .read_ns = 1,
         },
     }, .{
-        .observer = &observer_state,
         .clock = &clock_state,
     });
 
     try std.testing.expectError(error.Timeout, conn.beginFrame());
-    try std.testing.expectEqual(@as(usize, 1), observer_state.len);
-    switch (observer_state.events[0]) {
-        .timeout => |event| {
-            try std.testing.expectEqual(observe.IoPhase.read, event.phase);
-            try std.testing.expectEqual(@as(u64, 1), event.budget_ns);
-            try std.testing.expect(event.elapsed_ns > event.budget_ns);
-        },
-        else => try std.testing.expect(false),
-    }
 }
 
 test "deadline controller is set and cleared around timed reads and writes" {
@@ -2921,8 +2709,7 @@ test "deadline controller is set and cleared around timed reads and writes" {
     try std.testing.expectEqual(@as(?u64, null), deadline_state.flush_calls[deadline_state.flush_len - 1]);
 }
 
-test "runtime_hooks false disables observer and timeout hooks" {
-    var observer_state: TestObserverState = .{};
+test "runtime_hooks false disables timeout hooks" {
     var clock_state: TestClockState = .{
         .step_ns = 5,
     };
@@ -2942,7 +2729,6 @@ test "runtime_hooks false disables observer and timeout hooks" {
             .flush_ns = 1,
         },
     }, .{
-        .observer = &observer_state,
         .clock = &clock_state,
         .deadlines = &deadline_state,
     });
@@ -2954,7 +2740,6 @@ test "runtime_hooks false disables observer and timeout hooks" {
     try conn.writeBinary("ok");
     try conn.flush();
 
-    try std.testing.expectEqual(@as(usize, 0), observer_state.len);
     try std.testing.expectEqual(@as(usize, 0), deadline_state.read_len);
     try std.testing.expectEqual(@as(usize, 0), deadline_state.write_len);
     try std.testing.expectEqual(@as(usize, 0), deadline_state.flush_len);
