@@ -17,7 +17,7 @@ fn usage(io: Io) !void {
         \\zwebsocket-frame-echo-server
         \\
         \\Usage:
-        \\  zig build example-frame-echo-server -- [options]
+        \\  zig build examples -Dexample=frame-echo-server -- [options]
         \\
         \\Options:
         \\  --port=9002

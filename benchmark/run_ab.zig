@@ -14,6 +14,14 @@ const Config = struct {
     optimize: []const u8 = "ReleaseFast",
     zws_port: u16 = 9101,
     uws_port: u16 = 9102,
+    uws_deadline_port: u16 = 9103,
+    uws_deadline_ms: usize = 30_000,
+};
+
+const Peer = struct {
+    label: []const u8,
+    port: u16,
+    rate_path: []const u8,
 };
 
 fn terminateChild(io: std.Io, child: *std.process.Child) void {
@@ -156,6 +164,8 @@ pub fn main(init: std.process.Init) !void {
         .optimize = env.get("OPTIMIZE") orelse "ReleaseFast",
         .zws_port = @intCast(scripts.envInt(env, "ZWS_PORT", 9101)),
         .uws_port = @intCast(scripts.envInt(env, "UWS_PORT", 9102)),
+        .uws_deadline_port = @intCast(scripts.envInt(env, "UWS_DEADLINE_PORT", 9103)),
+        .uws_deadline_ms = scripts.envInt(env, "UWS_DEADLINE_MS", 30_000),
     };
 
     var stdout_buf: [256]u8 = undefined;
@@ -180,42 +190,66 @@ pub fn main(init: std.process.Init) !void {
 
     var uws_port_buf: [16]u8 = undefined;
     const uws_port_arg = try std.fmt.bufPrint(&uws_port_buf, "--port={d}", .{cfg.uws_port});
+    var uws_deadline_port_buf: [16]u8 = undefined;
+    var uws_deadline_ms_buf: [32]u8 = undefined;
+    const uws_deadline_port_arg = try std.fmt.bufPrint(&uws_deadline_port_buf, "--port={d}", .{cfg.uws_deadline_port});
+    const uws_deadline_ms_arg = try std.fmt.bufPrint(&uws_deadline_ms_buf, "--deadline-ms={d}", .{cfg.uws_deadline_ms});
 
     var zws_server_child = try spawnBackground(init.io, &.{ zws_server, zws_port_arg, zws_pipeline_arg, zws_size_arg }, root);
     defer terminateChild(init.io, &zws_server_child);
     var uws_server_child = try spawnBackground(init.io, &.{ uws_server, uws_port_arg }, root);
     defer terminateChild(init.io, &uws_server_child);
+    var uws_deadline_server_child = try spawnBackground(init.io, &.{ uws_server, uws_deadline_port_arg, uws_deadline_ms_arg }, root);
+    defer terminateChild(init.io, &uws_deadline_server_child);
 
     try waitForPort(init.io, cfg.zws_port, 10_000);
     try waitForPort(init.io, cfg.uws_port, 10_000);
+    try waitForPort(init.io, cfg.uws_deadline_port, 10_000);
 
     const zws_rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-zws.txt" });
     const uws_rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-uws.txt" });
+    const uws_deadline_rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-uws-deadline.txt" });
 
-    var zws_sum: f64 = 0;
-    var uws_sum: f64 = 0;
+    const peers = [_]Peer{
+        .{ .label = "zwebsocket", .port = cfg.zws_port, .rate_path = zws_rate_path },
+        .{ .label = "uWebSockets", .port = cfg.uws_port, .rate_path = uws_rate_path },
+        .{ .label = "uWebSockets+deadline", .port = cfg.uws_deadline_port, .rate_path = uws_deadline_rate_path },
+    };
+    var sums: [peers.len]f64 = @splat(0);
 
     try stdout.interface.print("== interleaved rounds ({d}) ==\n", .{cfg.rounds});
     for (0..cfg.rounds) |idx| {
-        try stdout.interface.print("[{d}/{d}] zwebsocket\n", .{ idx + 1, cfg.rounds });
-        const zws_rate = try runBenchRate(init.io, allocator, root, bench_bin, cfg, "zwebsocket", cfg.zws_port, zws_rate_path, init.minimal.environ);
-        zws_sum += zws_rate;
-        try stdout.interface.print("  zwebsocket: {d:.2} msg/s\n", .{zws_rate});
-
-        try stdout.interface.print("[{d}/{d}] uWebSockets\n", .{ idx + 1, cfg.rounds });
-        const uws_rate = try runBenchRate(init.io, allocator, root, bench_bin, cfg, "uWebSockets", cfg.uws_port, uws_rate_path, init.minimal.environ);
-        uws_sum += uws_rate;
-        try stdout.interface.print("  uWebSockets: {d:.2} msg/s\n", .{uws_rate});
+        for (peers, 0..) |peer, peer_idx| {
+            try stdout.interface.print("[{d}/{d}] {s}\n", .{ idx + 1, cfg.rounds, peer.label });
+            const rate = try runBenchRate(
+                init.io,
+                allocator,
+                root,
+                bench_bin,
+                cfg,
+                peer.label,
+                peer.port,
+                peer.rate_path,
+                init.minimal.environ,
+            );
+            sums[peer_idx] += rate;
+            try stdout.interface.print("  {s}: {d:.2} msg/s\n", .{ peer.label, rate });
+        }
     }
 
     const rounds_f = @as(f64, @floatFromInt(cfg.rounds));
-    const zws_avg = zws_sum / rounds_f;
-    const uws_avg = uws_sum / rounds_f;
-    const delta = zws_avg - uws_avg;
-    const pct = if (uws_avg == 0) 0 else (delta / uws_avg) * 100.0;
+    const zws_avg = sums[0] / rounds_f;
+    const uws_avg = sums[1] / rounds_f;
+    const uws_deadline_avg = sums[2] / rounds_f;
+    const plain_delta = zws_avg - uws_avg;
+    const plain_pct = if (uws_avg == 0) 0 else (plain_delta / uws_avg) * 100.0;
+    const deadline_delta = zws_avg - uws_deadline_avg;
+    const deadline_pct = if (uws_deadline_avg == 0) 0 else (deadline_delta / uws_deadline_avg) * 100.0;
 
     try stdout.interface.writeAll("\n== summary ==\n");
     try stdout.interface.print("zwebsocket avg: {d:.2} msg/s\n", .{zws_avg});
     try stdout.interface.print("uWebSockets avg: {d:.2} msg/s\n", .{uws_avg});
-    try stdout.interface.print("delta: {d:.2} msg/s ({d:.2}%)\n", .{ delta, pct });
+    try stdout.interface.print("uWebSockets+deadline avg: {d:.2} msg/s\n", .{uws_deadline_avg});
+    try stdout.interface.print("delta vs uWebSockets: {d:.2} msg/s ({d:.2}%)\n", .{ plain_delta, plain_pct });
+    try stdout.interface.print("delta vs uWebSockets+deadline: {d:.2} msg/s ({d:.2}%)\n", .{ deadline_delta, deadline_pct });
 }

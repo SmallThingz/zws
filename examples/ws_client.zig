@@ -19,7 +19,7 @@ fn usage(io: Io) !void {
         \\zwebsocket-client
         \\
         \\Usage:
-        \\  zig build example-client -- [options]
+        \\  zig build examples -Dexample=client -- [options]
         \\
         \\Options:
         \\  --host=127.0.0.1

@@ -1,8 +1,14 @@
 const std = @import("std");
 
+fn eql(a: []const u8, b: []const u8) bool {
+    return std.mem.eql(u8, a, b);
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
+    const example_choice = b.option([]const u8, "example", "Select one example: echo-server, frame-echo-server, client");
+    const interop_choice = b.option([]const u8, "interop", "Select one interop target: run, client, repeated-offer-client");
 
     const mod = b.addModule("zwebsocket", .{
         .root_source_file = b.path("src/root.zig"),
@@ -58,25 +64,12 @@ pub fn build(b: *std.Build) void {
     const compare_exe = b.addExecutable(.{
         .name = "zwebsocket-bench-compare",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmark/run_compare.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "zwebsocket", .module = mod },
-                .{ .name = "zws_support_common", .module = support_common },
-            },
-        }),
-    });
-    const install_compare = b.addInstallArtifact(compare_exe, .{});
-
-    const bench_ab_exe = b.addExecutable(.{
-        .name = "zwebsocket-bench-ab",
-        .root_module = b.createModule(.{
             .root_source_file = b.path("benchmark/run_ab.zig"),
             .target = target,
             .optimize = optimize,
         }),
     });
+    const install_compare = b.addInstallArtifact(compare_exe, .{});
 
     const echo_server_exe = b.addExecutable(.{
         .name = "zwebsocket-echo-server",
@@ -195,35 +188,25 @@ pub fn build(b: *std.Build) void {
     compare_run.step.dependOn(&install_bench_server.step);
     compare_run.step.dependOn(&install_compare.step);
     if (b.args) |args| compare_run.addArgs(args);
-    const compare_step = b.step("bench-compare", "Compare zwebsocket and uWebSockets");
+    const compare_step = b.step("bench-compare", "Run interleaved zwebsocket vs uWebSockets benchmark rounds");
     compare_step.dependOn(&compare_run.step);
 
-    const bench_ab_run = b.addRunArtifact(bench_ab_exe);
-    const bench_ab_step = b.step("bench-ab", "Run low-noise interleaved zwebsocket vs uWebSockets benchmark rounds");
-    bench_ab_step.dependOn(&bench_ab_run.step);
-
-    const bench_server_step = b.step("bench-server", "Build the standalone websocket benchmark server");
-    bench_server_step.dependOn(&install_bench_server.step);
-
-    const example_server_step = b.step("example-echo-server", "Build the example websocket echo server");
-    example_server_step.dependOn(&install_echo_server.step);
-
-    const example_frame_server_step = b.step("example-frame-echo-server", "Build the frame-oriented websocket echo server example");
-    example_frame_server_step.dependOn(&install_frame_echo_server.step);
-
-    const example_client_step = b.step("example-client", "Build the websocket client example");
-    example_client_step.dependOn(&install_client.step);
-
-    const examples_step = b.step("examples", "Build all zwebsocket examples");
-    examples_step.dependOn(&install_echo_server.step);
-    examples_step.dependOn(&install_frame_echo_server.step);
-    examples_step.dependOn(&install_client.step);
-
-    const interop_client_step = b.step("interop-client", "Build the websocket interoperability client");
-    interop_client_step.dependOn(&install_interop_client.step);
-
-    const repeated_offer_client_step = b.step("interop-repeated-offer-client", "Build the repeated permessage-deflate offer regression client");
-    repeated_offer_client_step.dependOn(&install_repeated_offer_client.step);
+    const examples_step = b.step("examples", "Build zwebsocket examples; use -Dexample=echo-server|frame-echo-server|client to select one");
+    if (example_choice) |choice| {
+        if (eql(choice, "echo-server")) {
+            examples_step.dependOn(&install_echo_server.step);
+        } else if (eql(choice, "frame-echo-server")) {
+            examples_step.dependOn(&install_frame_echo_server.step);
+        } else if (eql(choice, "client")) {
+            examples_step.dependOn(&install_client.step);
+        } else {
+            @panic("invalid -Dexample value; expected echo-server, frame-echo-server, or client");
+        }
+    } else {
+        examples_step.dependOn(&install_echo_server.step);
+        examples_step.dependOn(&install_frame_echo_server.step);
+        examples_step.dependOn(&install_client.step);
+    }
 
     const interop_run = b.addRunArtifact(interop_runner_exe);
     interop_run.step.dependOn(&install_echo_server.step);
@@ -232,8 +215,20 @@ pub fn build(b: *std.Build) void {
     interop_run.addArg(b.fmt("--server-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-echo-server")}));
     interop_run.addArg(b.fmt("--client-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-interop-client")}));
     interop_run.addArg(b.fmt("--repeated-client-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-repeated-pmd-offer-client")}));
-    const interop_step = b.step("interop", "Run the websocket interoperability matrix");
-    interop_step.dependOn(&interop_run.step);
+    const interop_step = b.step("interop", "Run interop or build an interop helper with -Dinterop=run|client|repeated-offer-client");
+    if (interop_choice) |choice| {
+        if (eql(choice, "run")) {
+            interop_step.dependOn(&interop_run.step);
+        } else if (eql(choice, "client")) {
+            interop_step.dependOn(&install_interop_client.step);
+        } else if (eql(choice, "repeated-offer-client")) {
+            interop_step.dependOn(&install_repeated_offer_client.step);
+        } else {
+            @panic("invalid -Dinterop value; expected run, client, or repeated-offer-client");
+        }
+    } else {
+        interop_step.dependOn(&interop_run.step);
+    }
 
     const soak_run = b.addRunArtifact(soak_runner_exe);
     soak_run.step.dependOn(&install_echo_server.step);

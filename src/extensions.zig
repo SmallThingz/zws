@@ -224,6 +224,19 @@ test "parsePerMessageDeflate iterator propagates malformed offers after valid al
     try std.testing.expectError(error.InvalidExtensionParameter, offers.next());
 }
 
+test "parsePerMessageDeflate iterator stays exhausted after reaching the end" {
+    var offers = parsePerMessageDeflate("foo, permessage-deflate");
+    try std.testing.expectEqualDeep(
+        PerMessageDeflate{
+            .server_no_context_takeover = false,
+            .client_no_context_takeover = false,
+        },
+        (try offers.next()).?,
+    );
+    try std.testing.expectEqual(@as(?PerMessageDeflate, null), try offers.next());
+    try std.testing.expectEqual(@as(?PerMessageDeflate, null), try offers.next());
+}
+
 test "parseWindowBits accepts RFC range only" {
     try std.testing.expectEqual(@as(u8, 8), try parseWindowBits("8"));
     try std.testing.expectEqual(@as(u8, 15), try parseWindowBits("15"));

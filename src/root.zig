@@ -170,6 +170,16 @@ test "fuzz replays every provided corpus input in non-fuzz builds" {
     try std.testing.expectEqual(@as(usize, 3), state.total_len);
 }
 
+test "public type aliases resolve to the specialized core implementations" {
+    try std.testing.expectEqualStrings(@typeName(ConnType(.{})), @typeName(Conn));
+    try std.testing.expectEqualStrings(@typeName(ConnType(.{ .role = .server })), @typeName(ServerConn));
+    try std.testing.expectEqualStrings(@typeName(ConnType(.{ .role = .client })), @typeName(ClientConn));
+    try std.testing.expectEqualStrings(
+        @typeName(conn.ConnWithHooks(.{}, observe.DefaultRuntimeHooks)),
+        @typeName(ConnTypeWithHooks(.{}, observe.DefaultRuntimeHooks)),
+    );
+}
+
 test {
     _ = @import("observe.zig");
     _ = @import("extensions.zig");

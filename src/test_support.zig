@@ -83,3 +83,16 @@ test "appendTestFrame masks payload bytes and writes 64-bit lengths" {
     try std.testing.expectEqual(payload_big[2] ^ mask[2], out.items[16]);
     try std.testing.expectEqual(payload_big[3] ^ mask[3], out.items[17]);
 }
+
+test "appendTestFrame writes masked zero-length continuation frames without payload bytes" {
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(std.testing.allocator);
+
+    const mask = [_]u8{ 0xaa, 0xbb, 0xcc, 0xdd };
+    try appendTestFrame(TestOpcode, &out, std.testing.allocator, .continuation, false, true, "", mask);
+
+    try std.testing.expectEqual(@as(u8, 0x00), out.items[0]);
+    try std.testing.expectEqual(@as(u8, 0x80), out.items[1]);
+    try std.testing.expectEqualSlices(u8, mask[0..], out.items[2..6]);
+    try std.testing.expectEqual(@as(usize, 6), out.items.len);
+}

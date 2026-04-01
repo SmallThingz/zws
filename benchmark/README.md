@@ -1,9 +1,10 @@
 # WebSocket Benchmarks
 
-This benchmark compares two standalone websocket echo servers on the same local machine:
+This benchmark compares standalone websocket echo servers on the same local machine:
 
 - `zwebsocket-bench-server`
 - `uWebSockets` via `benchmark/uws_server.cpp`
+- `uWebSockets` with a deadline-enabled websocket idle timeout via `benchmark/uws_server.cpp --deadline-ms=...`
 
 The client in `benchmark/bench.zig`:
 
@@ -38,25 +39,19 @@ Notes:
 - The `uWebSockets` benchmark build uses no TLS and no websocket compression.
 - The default workload is a small binary echo frame, which is a transport-focused benchmark rather than an application benchmark.
 
-## Cleaner A/B Harness
+## Harness
 
-`bench-compare` is useful for quick checks, but it also pays setup/build overhead every invocation.
-For lower-variance repeated measurements, use:
-
-```sh
-zig build bench-ab -Doptimize=ReleaseFast
-```
-
-This harness:
+`bench-compare` is the low-noise harness:
 
 - builds `zwebsocket` binaries once
 - builds `uWebSockets` benchmark server once
-- starts both servers once
-- runs strict interleaved rounds (`zwebsocket` then `uWebSockets`) and prints averages
+- starts all benchmark servers once
+- runs strict interleaved rounds (`zwebsocket`, `uWebSockets`, `uWebSockets+deadline`) and prints averages
 
 Environment overrides:
 
 ```sh
-ROUNDS=6 CONNS=16 ITERS=200000 WARMUP=10000 PIPELINE=8 MSG_SIZE=16 zig build bench-ab -Doptimize=ReleaseFast
-ROUNDS=6 CONNS=1 ITERS=150000 WARMUP=10000 PIPELINE=1 MSG_SIZE=16 zig build bench-ab -Doptimize=ReleaseFast
+ROUNDS=6 CONNS=16 ITERS=200000 WARMUP=10000 PIPELINE=8 MSG_SIZE=16 zig build bench-compare -Doptimize=ReleaseFast
+ROUNDS=6 CONNS=1 ITERS=150000 WARMUP=10000 PIPELINE=1 MSG_SIZE=16 zig build bench-compare -Doptimize=ReleaseFast
+UWS_DEADLINE_MS=30000 zig build bench-compare -Doptimize=ReleaseFast
 ```

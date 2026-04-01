@@ -84,22 +84,67 @@ pub const DefaultRuntimeHooks = struct {
     pub fn onEvent(_: *@This(), _: Event) void {}
 };
 
+fn isHookSelfPointer(comptime Param: type, comptime Hooks: type) bool {
+    const info = @typeInfo(Param);
+    if (info != .pointer) return false;
+    if (info.pointer.size != .one) return false;
+    return info.pointer.child == Hooks;
+}
+
+fn hasNowNsSignature(comptime Hooks: type) bool {
+    if (!@hasDecl(Hooks, "nowNs")) return false;
+    const fn_info = switch (@typeInfo(@TypeOf(Hooks.nowNs))) {
+        .@"fn" => |info| info,
+        else => return false,
+    };
+    if (fn_info.params.len != 1) return false;
+    const self_type = fn_info.params[0].type orelse return false;
+    if (!isHookSelfPointer(self_type, Hooks)) return false;
+    return fn_info.return_type == u64;
+}
+
+fn hasDeadlineSignature(comptime Hooks: type, comptime name: []const u8) bool {
+    if (!@hasDecl(Hooks, name)) return false;
+    const fn_info = switch (@typeInfo(@TypeOf(@field(Hooks, name)))) {
+        .@"fn" => |info| info,
+        else => return false,
+    };
+    if (fn_info.params.len != 2) return false;
+    const self_type = fn_info.params[0].type orelse return false;
+    if (!isHookSelfPointer(self_type, Hooks)) return false;
+    if (fn_info.params[1].type != ?u64) return false;
+    return fn_info.return_type == void;
+}
+
+fn hasOnEventSignature(comptime Hooks: type) bool {
+    if (!@hasDecl(Hooks, "onEvent")) return false;
+    const fn_info = switch (@typeInfo(@TypeOf(Hooks.onEvent))) {
+        .@"fn" => |info| info,
+        else => return false,
+    };
+    if (fn_info.params.len != 2) return false;
+    const self_type = fn_info.params[0].type orelse return false;
+    if (!isHookSelfPointer(self_type, Hooks)) return false;
+    if (fn_info.params[1].type != Event) return false;
+    return fn_info.return_type == void;
+}
+
 pub fn validateHooks(comptime Hooks: type) void {
     comptime {
-        if (!@hasDecl(Hooks, "nowNs")) {
-            @compileError(@typeName(Hooks) ++ " must define nowNs(self) u64");
+        if (!hasNowNsSignature(Hooks)) {
+            @compileError(@typeName(Hooks) ++ " must define nowNs(self: *Hooks or *const Hooks) u64");
         }
-        if (!@hasDecl(Hooks, "setReadDeadlineNs")) {
-            @compileError(@typeName(Hooks) ++ " must define setReadDeadlineNs(self, deadline_ns)");
+        if (!hasDeadlineSignature(Hooks, "setReadDeadlineNs")) {
+            @compileError(@typeName(Hooks) ++ " must define setReadDeadlineNs(self: *Hooks or *const Hooks, deadline_ns: ?u64) void");
         }
-        if (!@hasDecl(Hooks, "setWriteDeadlineNs")) {
-            @compileError(@typeName(Hooks) ++ " must define setWriteDeadlineNs(self, deadline_ns)");
+        if (!hasDeadlineSignature(Hooks, "setWriteDeadlineNs")) {
+            @compileError(@typeName(Hooks) ++ " must define setWriteDeadlineNs(self: *Hooks or *const Hooks, deadline_ns: ?u64) void");
         }
-        if (!@hasDecl(Hooks, "setFlushDeadlineNs")) {
-            @compileError(@typeName(Hooks) ++ " must define setFlushDeadlineNs(self, deadline_ns)");
+        if (!hasDeadlineSignature(Hooks, "setFlushDeadlineNs")) {
+            @compileError(@typeName(Hooks) ++ " must define setFlushDeadlineNs(self: *Hooks or *const Hooks, deadline_ns: ?u64) void");
         }
-        if (!@hasDecl(Hooks, "onEvent")) {
-            @compileError(@typeName(Hooks) ++ " must define onEvent(self, event)");
+        if (!hasOnEventSignature(Hooks)) {
+            @compileError(@typeName(Hooks) ++ " must define onEvent(self: *Hooks or *const Hooks, event: Event) void");
         }
     }
 }
@@ -131,4 +176,40 @@ test "validateHooks accepts typed hooks with the required methods" {
     };
 
     validateHooks(TestHooks);
+}
+
+test "hook signature helpers reject wrong runtime hook method shapes" {
+    const GoodConstHooks = struct {
+        fn nowNs(_: *const @This()) u64 {
+            return 1;
+        }
+
+        fn setReadDeadlineNs(_: *const @This(), _: ?u64) void {}
+
+        fn setWriteDeadlineNs(_: *const @This(), _: ?u64) void {}
+
+        fn setFlushDeadlineNs(_: *const @This(), _: ?u64) void {}
+
+        fn onEvent(_: *const @This(), _: Event) void {}
+    };
+    const BadNowReturn = struct {
+        fn nowNs(_: *const @This()) usize {
+            return 1;
+        }
+    };
+    const BadDeadlineParam = struct {
+        fn setReadDeadlineNs(_: *const @This(), _: u64) void {}
+    };
+    const BadOnEventParam = struct {
+        fn onEvent(_: *const @This(), _: FrameEvent) void {}
+    };
+
+    try std.testing.expect(hasNowNsSignature(GoodConstHooks));
+    try std.testing.expect(hasDeadlineSignature(GoodConstHooks, "setReadDeadlineNs"));
+    try std.testing.expect(hasDeadlineSignature(GoodConstHooks, "setWriteDeadlineNs"));
+    try std.testing.expect(hasDeadlineSignature(GoodConstHooks, "setFlushDeadlineNs"));
+    try std.testing.expect(hasOnEventSignature(GoodConstHooks));
+    try std.testing.expect(!hasNowNsSignature(BadNowReturn));
+    try std.testing.expect(!hasDeadlineSignature(BadDeadlineParam, "setReadDeadlineNs"));
+    try std.testing.expect(!hasOnEventSignature(BadOnEventParam));
 }

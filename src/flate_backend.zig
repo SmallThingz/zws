@@ -324,3 +324,12 @@ test "flateCounter rejects lengths that do not fit 32-bit counters" {
     try std.testing.expectEqual(@as(u32, 123), try flateCounter(123));
     try std.testing.expectError(error.CounterTooLarge, flateCounter(@as(usize, std.math.maxInt(u32)) + 1));
 }
+
+test "appendSyncFlushTail appends the RFC7692 sync-flush tail exactly once" {
+    const payload = [_]u8{ 1, 2, 3 };
+    const appended = try appendSyncFlushTail(std.testing.allocator, payload[0..]);
+    defer std.testing.allocator.free(appended);
+
+    try std.testing.expectEqualSlices(u8, payload[0..], appended[0..payload.len]);
+    try std.testing.expectEqualSlices(u8, sync_flush_tail[0..], appended[payload.len..]);
+}

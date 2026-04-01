@@ -18,7 +18,7 @@ fn usage(io: Io) !void {
         \\zwebsocket-echo-server
         \\
         \\Usage:
-        \\  zig build example-echo-server -- [options]
+        \\  zig build examples -Dexample=echo-server -- [options]
         \\
         \\Options:
         \\  --port=9001

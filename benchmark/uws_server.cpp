@@ -7,11 +7,24 @@
 
 int main(int argc, char **argv) {
     int port = 9002;
+    int idleTimeoutSeconds = 120;
+    bool deadlineEnabled = false;
     for (int i = 1; i < argc; i++) {
         std::string_view arg = argv[i];
         constexpr std::string_view prefix = "--port=";
+        constexpr std::string_view deadlinePrefix = "--deadline-ms=";
         if (arg.starts_with(prefix)) {
             std::from_chars(arg.data() + prefix.size(), arg.data() + arg.size(), port);
+        } else if (arg.starts_with(deadlinePrefix)) {
+            int deadlineMs = 0;
+            std::from_chars(arg.data() + deadlinePrefix.size(), arg.data() + arg.size(), deadlineMs);
+            if (deadlineMs > 0) {
+                deadlineEnabled = true;
+                idleTimeoutSeconds = (deadlineMs + 999) / 1000;
+                if (idleTimeoutSeconds < 8) {
+                    idleTimeoutSeconds = 8;
+                }
+            }
         }
     }
 
@@ -21,10 +34,10 @@ int main(int argc, char **argv) {
     app.ws<PerSocketData>("/*", {
         .compression = uWS::DISABLED,
         .maxPayloadLength = 64 * 1024,
-        .idleTimeout = 120,
+        .idleTimeout = static_cast<unsigned short>(idleTimeoutSeconds),
         .maxBackpressure = 64 * 1024,
         .closeOnBackpressureLimit = false,
-        .resetIdleTimeoutOnSend = false,
+        .resetIdleTimeoutOnSend = deadlineEnabled,
         .sendPingsAutomatically = false,
         .upgrade = nullptr,
         .open = [](auto * /*ws*/) {},

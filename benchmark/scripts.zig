@@ -1,28 +1,9 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const BenchConfig = struct {
-    port: u16,
-    host: []const u8 = "127.0.0.1",
-    path: []const u8 = "/",
-    conns: usize,
-    iters: usize,
-    warmup: usize,
-    pipeline: usize = 1,
-    msg_size: usize,
-    quiet: bool = true,
-};
-
 pub fn envInt(env: *const std.process.Environ.Map, name: []const u8, default: usize) usize {
     const v = env.get(name) orelse return default;
     return std.fmt.parseInt(usize, v, 10) catch default;
-}
-
-fn printLine(io: std.Io, line: []const u8) void {
-    var buf: [256]u8 = undefined;
-    var stdout = std.Io.File.stdout().writer(io, &buf);
-    stdout.interface.writeAll(line) catch {};
-    stdout.interface.writeAll("\n") catch {};
 }
 
 fn runChecked(io: std.Io, argv: []const []const u8, cwd: ?[]const u8, env_map: ?*const std.process.Environ.Map) !void {
@@ -42,54 +23,10 @@ fn runChecked(io: std.Io, argv: []const []const u8, cwd: ?[]const u8, env_map: ?
     }
 }
 
-fn spawnBackground(io: std.Io, argv: []const []const u8, cwd: ?[]const u8) !std.process.Child {
-    const cwd_opt: std.process.Child.Cwd = if (cwd) |p| .{ .path = p } else .inherit;
-    return try std.process.spawn(io, .{
-        .argv = argv,
-        .cwd = cwd_opt,
-        .stdin = .ignore,
-        .stdout = .ignore,
-        .stderr = .inherit,
-    });
-}
-
-fn terminateChild(io: std.Io, child: *std.process.Child) void {
-    if (child.id == null) return;
-    if (builtin.os.tag == .windows) {
-        child.kill(io);
-        return;
-    }
-    if (child.id) |pid| {
-        std.posix.kill(pid, .KILL) catch {};
-    }
-    _ = child.wait(io) catch {};
-}
-
 fn dirExists(io: std.Io, path: []const u8) bool {
     const dir = std.Io.Dir.openDirAbsolute(io, path, .{}) catch return false;
     dir.close(io);
     return true;
-}
-
-pub fn runZwebsocketExternal(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, root: []const u8, environ: std.process.Environ) !void {
-    printLine(io, "== zwebsocket ==");
-
-    const server_path = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zwebsocket-bench-server" });
-    defer allocator.free(server_path);
-    const bench_path = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zwebsocket-bench" });
-    defer allocator.free(bench_path);
-
-    var port_buf: [16]u8 = undefined;
-    var pipeline_buf: [32]u8 = undefined;
-    var size_buf: [32]u8 = undefined;
-    const port_arg = try std.fmt.bufPrint(&port_buf, "--port={d}", .{cfg.port});
-    const pipeline_arg = try std.fmt.bufPrint(&pipeline_buf, "--pipeline={d}", .{cfg.pipeline});
-    const size_arg = try std.fmt.bufPrint(&size_buf, "--msg-size={d}", .{cfg.msg_size});
-    var server = try spawnBackground(io, &.{ server_path, port_arg, pipeline_arg, size_arg }, root);
-    defer terminateChild(io, &server);
-
-    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(200), .awake);
-    try runBench(io, allocator, cfg, root, bench_path, "zwebsocket", environ);
 }
 
 fn ensureClone(io: std.Io, cwd: []const u8, dir: []const u8, url: []const u8) !void {
@@ -154,62 +91,4 @@ pub fn buildUwsServer(
     }, root, &env);
 
     return out_path;
-}
-
-pub fn runUwsExternal(io: std.Io, allocator: std.mem.Allocator, cfg: BenchConfig, root: []const u8, environ: std.process.Environ) !void {
-    printLine(io, "== uWebSockets ==");
-
-    const uws_dir = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "uWebSockets-bench" });
-    defer allocator.free(uws_dir);
-    const server_path = try buildUwsServer(io, allocator, root, uws_dir, environ);
-    defer allocator.free(server_path);
-
-    const bench_path = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zwebsocket-bench" });
-    defer allocator.free(bench_path);
-
-    var port_buf: [16]u8 = undefined;
-    const port_arg = try std.fmt.bufPrint(&port_buf, "--port={d}", .{cfg.port});
-    var server = try spawnBackground(io, &.{ server_path, port_arg }, root);
-    defer terminateChild(io, &server);
-
-    try std.Io.sleep(io, std.Io.Duration.fromMilliseconds(200), .awake);
-    try runBench(io, allocator, cfg, root, bench_path, "uWebSockets", environ);
-}
-
-fn runBench(
-    io: std.Io,
-    allocator: std.mem.Allocator,
-    cfg: BenchConfig,
-    root: []const u8,
-    bench_path: []const u8,
-    label: []const u8,
-    environ: std.process.Environ,
-) !void {
-    var conns_buf: [32]u8 = undefined;
-    var iters_buf: [32]u8 = undefined;
-    var warmup_buf: [32]u8 = undefined;
-    var pipeline_buf: [32]u8 = undefined;
-    var port_buf: [32]u8 = undefined;
-    var size_buf: [32]u8 = undefined;
-    var host_buf: [64]u8 = undefined;
-    var path_buf: [256]u8 = undefined;
-
-    const conns_arg = try std.fmt.bufPrint(&conns_buf, "--conns={d}", .{cfg.conns});
-    const iters_arg = try std.fmt.bufPrint(&iters_buf, "--iters={d}", .{cfg.iters});
-    const warmup_arg = try std.fmt.bufPrint(&warmup_buf, "--warmup={d}", .{cfg.warmup});
-    const pipeline_arg = try std.fmt.bufPrint(&pipeline_buf, "--pipeline={d}", .{cfg.pipeline});
-    const port_arg = try std.fmt.bufPrint(&port_buf, "--port={d}", .{cfg.port});
-    const size_arg = try std.fmt.bufPrint(&size_buf, "--msg-size={d}", .{cfg.msg_size});
-    const host_arg = try std.fmt.bufPrint(&host_buf, "--host={s}", .{cfg.host});
-    const path_arg = try std.fmt.bufPrint(&path_buf, "--path={s}", .{cfg.path});
-
-    var env = try std.process.Environ.createMap(environ, allocator);
-    defer env.deinit();
-    try env.put("BENCH_LABEL", label);
-
-    var argv: std.ArrayList([]const u8) = .empty;
-    defer argv.deinit(allocator);
-    try argv.appendSlice(allocator, &.{ bench_path, host_arg, port_arg, path_arg, conns_arg, iters_arg, warmup_arg, pipeline_arg, size_arg, "--quiet" });
-
-    try runChecked(io, argv.items, root, &env);
 }

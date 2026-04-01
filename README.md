@@ -53,19 +53,19 @@ try zws.writeServerHandshakeResponse(writer, accepted);
 For a full standalone echo server example:
 
 ```bash
-zig build example-echo-server -- --port=9001 --compression
+zig build examples -Dexample=echo-server -- --port=9001 --compression
 ```
 
 For a frame-oriented echo server that stays on `echoFrame(...)`:
 
 ```bash
-zig build example-frame-echo-server -- --port=9002
+zig build examples -Dexample=frame-echo-server -- --port=9002
 ```
 
 For a simple websocket client that performs the HTTP upgrade and then uses `zws.ClientConn`:
 
 ```bash
-zig build example-client -- --host=127.0.0.1 --port=9001 --message=hello
+zig build examples -Dexample=client -- --host=127.0.0.1 --port=9001 --message=hello
 ```
 
 ## 📦 Installation
@@ -126,7 +126,6 @@ Benchmark support lives under [`benchmark/`](./benchmark/).
 
 ```bash
 zig build bench-compare -Doptimize=ReleaseFast
-zig build bench-ab -Doptimize=ReleaseFast
 ```
 
 Environment overrides:
@@ -145,7 +144,6 @@ zig build interop
 zig build soak
 zig build validate
 zig build examples
-zig build bench-server
 zig build bench-compare -Doptimize=ReleaseFast
 ```
 

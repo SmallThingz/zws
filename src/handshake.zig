@@ -341,6 +341,38 @@ test "acceptServerHandshake negotiates permessage-deflate when enabled and offer
     );
 }
 
+test "permessage-deflate negotiation helpers preserve server policy and score client offers" {
+    const preferred = extensions.PerMessageDeflate{
+        .server_no_context_takeover = true,
+        .client_no_context_takeover = true,
+    };
+    const requested_plain = extensions.PerMessageDeflate{
+        .server_no_context_takeover = false,
+        .client_no_context_takeover = false,
+    };
+    const requested_client_no_takeover = extensions.PerMessageDeflate{
+        .server_no_context_takeover = false,
+        .client_no_context_takeover = true,
+    };
+
+    try std.testing.expectEqual(@as(usize, 0), perMessageDeflateOfferScore(requested_plain, preferred));
+    try std.testing.expectEqual(@as(usize, 1), perMessageDeflateOfferScore(requested_client_no_takeover, preferred));
+    try std.testing.expectEqualDeep(
+        extensions.PerMessageDeflate{
+            .server_no_context_takeover = true,
+            .client_no_context_takeover = false,
+        },
+        negotiatedPerMessageDeflateForOffer(requested_plain, preferred),
+    );
+    try std.testing.expectEqualDeep(
+        extensions.PerMessageDeflate{
+            .server_no_context_takeover = true,
+            .client_no_context_takeover = true,
+        },
+        negotiatedPerMessageDeflateForOffer(requested_client_no_takeover, preferred),
+    );
+}
+
 test "acceptServerHandshake rejects malformed permessage-deflate offers when negotiation is enabled" {
     var req = validRequest();
     req.sec_websocket_extensions = "permessage-deflate; server_max_window_bits=99";
