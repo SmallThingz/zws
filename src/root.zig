@@ -129,8 +129,6 @@ test "public type aliases resolve to the specialized core implementations" {
         @typeName(Conn.ConnWithHooks(.{}, Observe.DefaultRuntimeHooks)),
         @typeName(Conn.TypeWithHooks(.{}, Observe.DefaultRuntimeHooks)),
     );
-    try std.testing.expectEqualStrings(@typeName(Conn.Config), @typeName(Conn.Config));
-    try std.testing.expectEqualStrings(@typeName(Conn.Frame), @typeName(Conn.Frame));
     try std.testing.expectEqualStrings(@typeName(Observe.TimeoutConfig), @typeName(Observe.TimeoutConfig));
     try std.testing.expectEqualStrings(@typeName(Observe.IoPhase), @typeName(Observe.IoPhase));
     try std.testing.expectEqualStrings(@typeName(Handler.Response), @typeName(Handler.Response));

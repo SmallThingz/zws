@@ -65,7 +65,7 @@ For message-oriented application code, you can also run a typed handler loop wit
 - `Ctx.T()` gives typed access to user-owned per-loop/per-connection state.
 - Receive mode is configured through `Handler.Options.receive_mode`:
   - `.solid_slice`: handlers receive a fully assembled message slice from caller-provided message buffer.
-  - `.stream`: handlers pull chunks with `ctx.readChunk(...)` and can avoid full-message assembly in the library.
+  - `.stream`: handlers pull chunks with `ctx.readChunk(...)` and can avoid full-message assembly in the library. Compressed (`RSV1`) messages are rejected in this mode.
 - Supported sync return shapes:
   - `[]const u8`
   - `[][]const u8` / `[]const []const u8`
@@ -73,7 +73,6 @@ For message-oriented application code, you can also run a typed handler loop wit
   - structs with `body` (and optional `opcode`)
 
 Response writing stays on the core websocket writer path (`Conn.writeText` / `Conn.writeBinary` / fragmented frames for chunk arrays), and flushing is controlled by `Handler.Options.auto_flush`.
-Control replies (auto-pong / auto-close) can be flushed independently with `Handler.Options.flush_control_replies`.
 
 ### Buffering
 

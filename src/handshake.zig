@@ -120,15 +120,6 @@ pub fn acceptServerHandshake(
     req: Request,
     opts: Options,
 ) Error!Response {
-    return acceptServerHandshakeWithHooks(req, opts, .{});
-}
-
-pub fn acceptServerHandshakeWithHooks(
-    req: Request,
-    opts: Options,
-    hooks: anytype,
-) Error!Response {
-    _ = hooks;
     if (!std.mem.eql(u8, req.method, "GET")) return rejectHandshake(error.MethodNotGet);
     if (!req.is_http_11) return rejectHandshake(error.HttpVersionNotSupported);
 
@@ -225,16 +216,7 @@ pub fn serverHandshake(
     req: Request,
     opts: Options,
 ) (Error || Io.Writer.Error)!Response {
-    return serverHandshakeWithHooks(writer, req, opts, .{});
-}
-
-pub fn serverHandshakeWithHooks(
-    writer: *Io.Writer,
-    req: Request,
-    opts: Options,
-    hooks: anytype,
-) (Error || Io.Writer.Error)!Response {
-    const response = try acceptServerHandshakeWithHooks(req, opts, hooks);
+    const response = try acceptServerHandshake(req, opts);
     try writeServerHandshakeResponse(writer, response);
     return response;
 }
@@ -567,14 +549,8 @@ test "rejectHandshake returns the original error" {
     try std.testing.expectEqual(error.ExtensionsNotSupported, rejectHandshake(error.ExtensionsNotSupported));
 }
 
-test "handshake with hooks accepts arbitrary hook types" {
-    const Hooks = struct {
-        tag: u8 = 0,
-    };
-
-    var hooks: Hooks = .{ .tag = 1 };
-    _ = try acceptServerHandshakeWithHooks(validRequest(), .{}, &hooks);
+test "acceptServerHandshake rejects invalid methods" {
     var rejected_req = validRequest();
     rejected_req.method = "POST";
-    try std.testing.expectError(error.MethodNotGet, acceptServerHandshakeWithHooks(rejected_req, .{}, &hooks));
+    try std.testing.expectError(error.MethodNotGet, acceptServerHandshake(rejected_req, .{}));
 }
