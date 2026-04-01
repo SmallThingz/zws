@@ -2,41 +2,8 @@ const std = @import("std");
 const Io = std.Io;
 const extensions = @import("extensions.zig");
 
-pub const Header = struct {
-    name: []const u8,
-    value: []const u8,
-};
-
-pub const Request = struct {
-    method: []const u8,
-    is_http_11: bool,
-    connection: ?[]const u8 = null,
-    upgrade: ?[]const u8 = null,
-    sec_websocket_key: ?[]const u8 = null,
-    sec_websocket_version: ?[]const u8 = null,
-    sec_websocket_protocol: ?[]const u8 = null,
-    sec_websocket_extensions: ?[]const u8 = null,
-    origin: ?[]const u8 = null,
-    host: ?[]const u8 = null,
-};
-
-pub const Options = struct {
-    selected_subprotocol: ?[]const u8 = null,
-    reject_extensions: bool = false,
-    enable_permessage_deflate: bool = false,
-    permessage_deflate: extensions.PerMessageDeflate = .{},
-    extra_headers: []const Header = &.{},
-};
-
-pub const Response = struct {
-    accept_key: [28]u8,
-    selected_subprotocol: ?[]const u8,
-    selected_extensions: ?[]const u8 = null,
-    permessage_deflate: ?extensions.PerMessageDeflate = null,
-    extra_headers: []const Header,
-};
-
 pub const Error = error{
+    BadRequest,
     MethodNotGet,
     HttpVersionNotSupported,
     MissingConnectionHeader,
@@ -48,16 +15,38 @@ pub const Error = error{
     InvalidWebSocketKey,
     UnsupportedWebSocketVersion,
     ExtensionsNotSupported,
-    SubprotocolNotOffered,
 };
 
 const websocket_guid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+const Request = struct {
+    method: []const u8,
+    is_http_11: bool,
+    connection: ?[]const u8 = null,
+    upgrade: ?[]const u8 = null,
+    sec_websocket_key: ?[]const u8 = null,
+    sec_websocket_version: ?[]const u8 = null,
+    sec_websocket_extensions: ?[]const u8 = null,
+};
+
+const Accepted = struct {
+    accept_key: [28]u8,
+    permessage_deflate: ?extensions.PerMessageDeflate = null,
+};
+
+fn trimCR(line: []const u8) []const u8 {
+    if (line.len != 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
+    return line;
+}
+
+fn trimSpaces(value: []const u8) []const u8 {
+    return std.mem.trim(u8, value, " \t");
+}
+
 fn containsTokenIgnoreCase(value: []const u8, wanted: []const u8) bool {
     var it = std.mem.splitScalar(u8, value, ',');
     while (it.next()) |part| {
-        const token = std.mem.trim(u8, part, " \t");
-        if (std.ascii.eqlIgnoreCase(token, wanted)) return true;
+        if (std.ascii.eqlIgnoreCase(trimSpaces(part), wanted)) return true;
     }
     return false;
 }
@@ -71,13 +60,51 @@ fn validateClientKey(key: []const u8) bool {
     return true;
 }
 
-fn subprotocolWasOffered(offered: []const u8, selected: []const u8) bool {
-    var it = std.mem.splitScalar(u8, offered, ',');
-    while (it.next()) |part| {
-        const token = std.mem.trim(u8, part, " \t");
-        if (std.mem.eql(u8, token, selected)) return true;
+fn assignHeader(req: *Request, name: []const u8, value: []const u8) void {
+    if (std.ascii.eqlIgnoreCase(name, "connection")) {
+        req.connection = value;
+    } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
+        req.upgrade = value;
+    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
+        req.sec_websocket_key = value;
+    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
+        req.sec_websocket_version = value;
+    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-extensions")) {
+        req.sec_websocket_extensions = value;
     }
-    return false;
+}
+
+fn parseRequest(reader: *Io.Reader) (Error || Io.Reader.Error)!Request {
+    const line0_incl = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
+        error.StreamTooLong => return error.BadRequest,
+        error.EndOfStream => return error.EndOfStream,
+        error.ReadFailed => return error.ReadFailed,
+    };
+    const line0 = trimCR(line0_incl[0 .. line0_incl.len - 1]);
+
+    const sp1 = std.mem.indexOfScalar(u8, line0, ' ') orelse return error.BadRequest;
+    const sp2_rel = std.mem.indexOfScalar(u8, line0[sp1 + 1 ..], ' ') orelse return error.BadRequest;
+    const sp2 = sp1 + 1 + sp2_rel;
+
+    var req: Request = .{
+        .method = line0[0..sp1],
+        .is_http_11 = std.mem.eql(u8, line0[sp2 + 1 ..], "HTTP/1.1"),
+    };
+
+    while (true) {
+        const line_incl = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
+            error.StreamTooLong => return error.BadRequest,
+            error.EndOfStream => return error.EndOfStream,
+            error.ReadFailed => return error.ReadFailed,
+        };
+        const line = trimCR(line_incl[0 .. line_incl.len - 1]);
+        if (line.len == 0) break;
+
+        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadRequest;
+        assignHeader(&req, line[0..colon], trimSpaces(line[colon + 1 ..]));
+    }
+
+    return req;
 }
 
 fn negotiatedPerMessageDeflateForOffer(
@@ -85,9 +112,7 @@ fn negotiatedPerMessageDeflateForOffer(
     preferred: extensions.PerMessageDeflate,
 ) extensions.PerMessageDeflate {
     return .{
-        // The server can elect its own receive-side takeover policy.
         .server_no_context_takeover = preferred.server_no_context_takeover,
-        // The client-side policy must have been offered by the peer.
         .client_no_context_takeover = preferred.client_no_context_takeover and requested.client_no_context_takeover,
     };
 }
@@ -99,6 +124,67 @@ fn perMessageDeflateOfferScore(
     var score: usize = 0;
     if (preferred.client_no_context_takeover and requested.client_no_context_takeover) score += 1;
     return score;
+}
+
+fn negotiatePerMessageDeflate(header_value: ?[]const u8) Error!?extensions.PerMessageDeflate {
+    const offered = header_value orelse return null;
+    if (!extensions.offersPerMessageDeflate(offered)) return null;
+
+    const preferred: extensions.PerMessageDeflate = .{};
+    var offers = extensions.parsePerMessageDeflate(offered);
+    var negotiated: ?extensions.PerMessageDeflate = null;
+    var best_score: usize = 0;
+    while (offers.next() catch return error.ExtensionsNotSupported) |requested| {
+        const candidate = negotiatedPerMessageDeflateForOffer(requested, preferred);
+        const score = perMessageDeflateOfferScore(requested, preferred);
+        if (negotiated == null or score > best_score) {
+            negotiated = candidate;
+            best_score = score;
+        }
+    }
+    return negotiated;
+}
+
+fn acceptRequest(req: Request) Error!Accepted {
+    if (!std.mem.eql(u8, req.method, "GET")) return error.MethodNotGet;
+    if (!req.is_http_11) return error.HttpVersionNotSupported;
+
+    const connection = req.connection orelse return error.MissingConnectionHeader;
+    if (!containsTokenIgnoreCase(connection, "upgrade")) return error.InvalidConnectionHeader;
+
+    const upgrade_header = req.upgrade orelse return error.MissingUpgradeHeader;
+    if (!std.ascii.eqlIgnoreCase(trimSpaces(upgrade_header), "websocket")) return error.InvalidUpgradeHeader;
+
+    const key = trimSpaces(req.sec_websocket_key orelse return error.MissingWebSocketKey);
+    const version = trimSpaces(req.sec_websocket_version orelse return error.MissingWebSocketVersion);
+    if (!std.mem.eql(u8, version, "13")) return error.UnsupportedWebSocketVersion;
+
+    const accept_key = try computeAcceptKey(key);
+    return .{
+        .accept_key = accept_key,
+        .permessage_deflate = try negotiatePerMessageDeflate(req.sec_websocket_extensions),
+    };
+}
+
+fn writeResponse(
+    writer: *Io.Writer,
+    accept_key: [28]u8,
+    permessage_deflate: ?extensions.PerMessageDeflate,
+) Io.Writer.Error!void {
+    try writer.writeAll("HTTP/1.1 101 Switching Protocols\r\n");
+    try writer.writeAll("upgrade: websocket\r\n");
+    try writer.writeAll("connection: Upgrade\r\n");
+    try writer.writeAll("sec-websocket-accept: ");
+    try writer.writeAll(accept_key[0..]);
+    try writer.writeAll("\r\n");
+
+    if (permessage_deflate) |pmd| {
+        try writer.writeAll("sec-websocket-extensions: ");
+        try writer.writeAll(pmd.responseHeaderValue());
+        try writer.writeAll("\r\n");
+    }
+
+    try writer.writeAll("\r\n");
 }
 
 pub fn computeAcceptKey(client_key: []const u8) Error![28]u8 {
@@ -116,126 +202,24 @@ pub fn computeAcceptKey(client_key: []const u8) Error![28]u8 {
     return out;
 }
 
-pub fn acceptServerHandshake(
-    req: Request,
-    opts: Options,
-) Error!Response {
-    if (!std.mem.eql(u8, req.method, "GET")) return rejectHandshake(error.MethodNotGet);
-    if (!req.is_http_11) return rejectHandshake(error.HttpVersionNotSupported);
-
-    const connection = req.connection orelse return rejectHandshake(error.MissingConnectionHeader);
-    if (!containsTokenIgnoreCase(connection, "upgrade")) return rejectHandshake(error.InvalidConnectionHeader);
-
-    const upgrade = req.upgrade orelse return rejectHandshake(error.MissingUpgradeHeader);
-    if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, upgrade, " \t"), "websocket")) {
-        return rejectHandshake(error.InvalidUpgradeHeader);
-    }
-
-    const key = std.mem.trim(u8, req.sec_websocket_key orelse return rejectHandshake(error.MissingWebSocketKey), " \t");
-    const version = req.sec_websocket_version orelse return rejectHandshake(error.MissingWebSocketVersion);
-    if (!std.mem.eql(u8, std.mem.trim(u8, version, " \t"), "13")) {
-        return rejectHandshake(error.UnsupportedWebSocketVersion);
-    }
-
-    if (opts.reject_extensions and req.sec_websocket_extensions != null) {
-        return rejectHandshake(error.ExtensionsNotSupported);
-    }
-
-    var negotiated_permessage_deflate: ?extensions.PerMessageDeflate = null;
-    if (opts.enable_permessage_deflate) {
-        if (req.sec_websocket_extensions) |header_value| {
-            var offers = extensions.parsePerMessageDeflate(header_value);
-            var best_score: usize = 0;
-            while (offers.next() catch {
-                return rejectHandshake(error.ExtensionsNotSupported);
-            }) |requested| {
-                const candidate = negotiatedPerMessageDeflateForOffer(requested, opts.permessage_deflate);
-                const score = perMessageDeflateOfferScore(requested, opts.permessage_deflate);
-                if (negotiated_permessage_deflate == null or score > best_score) {
-                    negotiated_permessage_deflate = candidate;
-                    best_score = score;
-                }
-            }
-        }
-    }
-
-    if (opts.selected_subprotocol) |selected| {
-        const offered = req.sec_websocket_protocol orelse return rejectHandshake(error.SubprotocolNotOffered);
-        if (!subprotocolWasOffered(offered, selected)) return rejectHandshake(error.SubprotocolNotOffered);
-    }
-
-    const accept_key = computeAcceptKey(key) catch |err| {
-        return rejectHandshake(err);
-    };
-
-    const response: Response = .{
-        .accept_key = accept_key,
-        .selected_subprotocol = opts.selected_subprotocol,
-        .selected_extensions = if (negotiated_permessage_deflate) |pmd| pmd.responseHeaderValue() else null,
-        .permessage_deflate = negotiated_permessage_deflate,
-        .extra_headers = opts.extra_headers,
-    };
-    return response;
-}
-
-pub fn writeServerHandshakeResponse(
+pub fn upgrade(
+    reader: *Io.Reader,
     writer: *Io.Writer,
-    response: Response,
-) Io.Writer.Error!void {
-    try writer.writeAll("HTTP/1.1 101 Switching Protocols\r\n");
-    try writer.writeAll("upgrade: websocket\r\n");
-    try writer.writeAll("connection: Upgrade\r\n");
-    try writer.writeAll("sec-websocket-accept: ");
-    try writer.writeAll(response.accept_key[0..]);
-    try writer.writeAll("\r\n");
-
-    if (response.selected_subprotocol) |subprotocol| {
-        try writer.writeAll("sec-websocket-protocol: ");
-        try writer.writeAll(subprotocol);
-        try writer.writeAll("\r\n");
-    }
-
-    if (response.selected_extensions) |selected_extensions| {
-        try writer.writeAll("sec-websocket-extensions: ");
-        try writer.writeAll(selected_extensions);
-        try writer.writeAll("\r\n");
-    }
-
-    for (response.extra_headers) |header| {
-        try writer.writeAll(header.name);
-        try writer.writeAll(": ");
-        try writer.writeAll(header.value);
-        try writer.writeAll("\r\n");
-    }
-
-    try writer.writeAll("\r\n");
+) (Error || Io.Reader.Error || Io.Writer.Error)!?extensions.PerMessageDeflate {
+    const accepted = try acceptRequest(try parseRequest(reader));
+    try writeResponse(writer, accepted.accept_key, accepted.permessage_deflate);
+    return accepted.permessage_deflate;
 }
 
-pub fn serverHandshake(
-    writer: *Io.Writer,
-    req: Request,
-    opts: Options,
-) (Error || Io.Writer.Error)!Response {
-    const response = try acceptServerHandshake(req, opts);
-    try writeServerHandshakeResponse(writer, response);
-    return response;
-}
-
-fn rejectHandshake(err: Error) Error {
-    return err;
-}
-
-fn validRequest() Request {
-    return .{
-        .method = "GET",
-        .is_http_11 = true,
-        .connection = "keep-alive, Upgrade",
-        .upgrade = " websocket ",
-        .sec_websocket_key = "dGhlIHNhbXBsZSBub25jZQ==",
-        .sec_websocket_version = " 13 ",
-        .sec_websocket_protocol = "chat, superchat",
-        .host = "example.com",
-    };
+fn validRequest(comptime extra_headers: []const u8) []const u8 {
+    return "GET /chat HTTP/1.1\r\n" ++
+        "Host: example.com\r\n" ++
+        "Connection: keep-alive, Upgrade\r\n" ++
+        "Upgrade: websocket\r\n" ++
+        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
+        "Sec-WebSocket-Version: 13\r\n" ++
+        extra_headers ++
+        "\r\n";
 }
 
 test "computeAcceptKey matches RFC example" {
@@ -258,249 +242,161 @@ test "validateClientKey enforces valid base64 and 16 decoded bytes" {
     try std.testing.expect(!validateClientKey("dGhlIHNhbXBsZSBub25jZQ"));
 }
 
-test "subprotocolWasOffered matches exact token only" {
-    try std.testing.expect(subprotocolWasOffered("chat, superchat", "chat"));
-    try std.testing.expect(subprotocolWasOffered("chat, superchat", "superchat"));
-    try std.testing.expect(subprotocolWasOffered(" chat , , superchat ", "chat"));
-    try std.testing.expect(!subprotocolWasOffered("chatty, superchat", "chat"));
-    try std.testing.expect(!subprotocolWasOffered("", "chat"));
+test "parseRequest parses the upgrade request and trims header whitespace" {
+    var reader = Io.Reader.fixed(validRequest(
+        "Connection:  keep-alive, Upgrade \r\n" ++
+            "Upgrade:  websocket \r\n",
+    ));
+    const req = try parseRequest(&reader);
+    try std.testing.expectEqualStrings("GET", req.method);
+    try std.testing.expect(req.is_http_11);
+    try std.testing.expectEqualStrings("keep-alive, Upgrade", req.connection.?);
+    try std.testing.expectEqualStrings("websocket", req.upgrade.?);
+    try std.testing.expectEqualStrings("dGhlIHNhbXBsZSBub25jZQ==", req.sec_websocket_key.?);
+    try std.testing.expectEqualStrings("13", req.sec_websocket_version.?);
+}
+
+test "parseRequest rejects malformed request lines and headers" {
+    {
+        var reader = Io.Reader.fixed("BROKEN\r\n\r\n");
+        try std.testing.expectError(error.BadRequest, parseRequest(&reader));
+    }
+    {
+        var reader = Io.Reader.fixed("GET / HTTP/1.1\r\nbroken-header\r\n\r\n");
+        try std.testing.expectError(error.BadRequest, parseRequest(&reader));
+    }
 }
 
 test "computeAcceptKey rejects invalid client keys" {
     try std.testing.expectError(error.InvalidWebSocketKey, computeAcceptKey("invalid"));
 }
 
-test "acceptServerHandshake accepts trimmed valid request without subprotocol selection" {
-    const response = try acceptServerHandshake(validRequest(), .{});
-    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", response.accept_key[0..]);
-    try std.testing.expect(response.selected_subprotocol == null);
-    try std.testing.expectEqual(@as(usize, 0), response.extra_headers.len);
+test "acceptRequest validates a basic websocket upgrade" {
+    var reader = Io.Reader.fixed(validRequest(""));
+    const accepted = try acceptRequest(try parseRequest(&reader));
+    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accepted.accept_key[0..]);
+    try std.testing.expect(accepted.permessage_deflate == null);
 }
 
-test "acceptServerHandshake trims websocket key before validation" {
-    var req = validRequest();
-    req.sec_websocket_key = " \tdGhlIHNhbXBsZSBub25jZQ== \t";
-
-    const response = try acceptServerHandshake(req, .{});
-    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", response.accept_key[0..]);
-}
-
-test "acceptServerHandshake allows extensions unless configured to reject them" {
-    var req = validRequest();
-    req.sec_websocket_extensions = "permessage-deflate";
-
-    const response = try acceptServerHandshake(req, .{});
-    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", response.accept_key[0..]);
-    try std.testing.expect(response.permessage_deflate == null);
-}
-
-test "acceptServerHandshake negotiates permessage-deflate when enabled and offered" {
-    var req = validRequest();
-    req.sec_websocket_extensions = "permessage-deflate; client_max_window_bits, x-test";
-
-    const response = try acceptServerHandshake(req, .{
-        .enable_permessage_deflate = true,
-    });
-    try std.testing.expectEqualStrings(
-        "permessage-deflate; server_no_context_takeover",
-        response.selected_extensions.?,
+test "acceptRequest trims websocket key before validation" {
+    var reader = Io.Reader.fixed(
+        "GET /chat HTTP/1.1\r\n" ++
+            "Connection: Upgrade\r\n" ++
+            "Upgrade: websocket\r\n" ++
+            "Sec-WebSocket-Key:  dGhlIHNhbXBsZSBub25jZQ== \r\n" ++
+            "Sec-WebSocket-Version: 13\r\n" ++
+            "\r\n",
     );
-    try std.testing.expect(response.permessage_deflate != null);
-    try std.testing.expectEqualDeep(
-        extensions.PerMessageDeflate{
-            .server_no_context_takeover = true,
-            .client_no_context_takeover = false,
-        },
-        response.permessage_deflate.?,
-    );
+    const accepted = try acceptRequest(try parseRequest(&reader));
+    try std.testing.expectEqualStrings("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=", accepted.accept_key[0..]);
 }
 
-test "permessage-deflate negotiation helpers preserve server policy and score client offers" {
-    const preferred = extensions.PerMessageDeflate{
-        .server_no_context_takeover = true,
-        .client_no_context_takeover = true,
-    };
-    const requested_plain = extensions.PerMessageDeflate{
-        .server_no_context_takeover = false,
-        .client_no_context_takeover = false,
-    };
-    const requested_client_no_takeover = extensions.PerMessageDeflate{
-        .server_no_context_takeover = false,
-        .client_no_context_takeover = true,
-    };
+test "acceptRequest ignores non-websocket extension offers" {
+    var reader = Io.Reader.fixed(validRequest("Sec-WebSocket-Extensions: x-test\r\n"));
+    const accepted = try acceptRequest(try parseRequest(&reader));
+    try std.testing.expect(accepted.permessage_deflate == null);
+}
 
-    try std.testing.expectEqual(@as(usize, 0), perMessageDeflateOfferScore(requested_plain, preferred));
-    try std.testing.expectEqual(@as(usize, 1), perMessageDeflateOfferScore(requested_client_no_takeover, preferred));
-    try std.testing.expectEqualDeep(
-        extensions.PerMessageDeflate{
-            .server_no_context_takeover = true,
-            .client_no_context_takeover = false,
-        },
-        negotiatedPerMessageDeflateForOffer(requested_plain, preferred),
-    );
+test "acceptRequest negotiates permessage-deflate when offered" {
+    var reader = Io.Reader.fixed(validRequest("Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n"));
+    const accepted = try acceptRequest(try parseRequest(&reader));
     try std.testing.expectEqualDeep(
         extensions.PerMessageDeflate{
             .server_no_context_takeover = true,
             .client_no_context_takeover = true,
         },
-        negotiatedPerMessageDeflateForOffer(requested_client_no_takeover, preferred),
+        accepted.permessage_deflate.?,
     );
 }
 
-test "acceptServerHandshake rejects malformed permessage-deflate offers when negotiation is enabled" {
-    var req = validRequest();
-    req.sec_websocket_extensions = "permessage-deflate; server_max_window_bits=99";
-
-    try std.testing.expectError(error.ExtensionsNotSupported, acceptServerHandshake(req, .{
-        .enable_permessage_deflate = true,
-    }));
+test "acceptRequest rejects malformed permessage-deflate offers" {
+    var reader = Io.Reader.fixed(validRequest("Sec-WebSocket-Extensions: permessage-deflate; server_max_window_bits=99\r\n"));
+    try std.testing.expectError(error.ExtensionsNotSupported, acceptRequest(try parseRequest(&reader)));
 }
 
-test "acceptServerHandshake accepts repeated permessage-deflate offers as alternatives" {
-    var req = validRequest();
-    req.sec_websocket_extensions = "permessage-deflate, permessage-deflate; client_no_context_takeover";
-
-    const response = try acceptServerHandshake(req, .{
-        .enable_permessage_deflate = true,
-    });
-    try std.testing.expect(response.permessage_deflate != null);
-    try std.testing.expectEqualStrings(
-        "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
-        response.selected_extensions.?,
-    );
+test "acceptRequest accepts repeated permessage-deflate offers as alternatives" {
+    var reader = Io.Reader.fixed(validRequest(
+        "Sec-WebSocket-Extensions: permessage-deflate, permessage-deflate; client_no_context_takeover\r\n",
+    ));
+    const accepted = try acceptRequest(try parseRequest(&reader));
     try std.testing.expectEqualDeep(
         extensions.PerMessageDeflate{
             .server_no_context_takeover = true,
             .client_no_context_takeover = true,
         },
-        response.permessage_deflate.?,
+        accepted.permessage_deflate.?,
     );
 }
 
-test "acceptServerHandshake rejects duplicate permessage-deflate tokens in a response parse path" {
-    try std.testing.expectError(
-        error.DuplicateExtensionOffer,
-        extensions.parsePerMessageDeflateFirst(
-            "permessage-deflate, permessage-deflate; client_no_context_takeover",
-        ),
-    );
-}
-
-test "acceptServerHandshake accepts connection token with extra commas and spaces" {
-    var req = validRequest();
-    req.connection = "keep-alive, , Upgrade ,";
-
-    const response = try acceptServerHandshake(req, .{});
-    try std.testing.expect(response.selected_subprotocol == null);
-}
-
-test "acceptServerHandshake reports all validation errors" {
+test "acceptRequest reports all validation errors" {
     {
-        var req = validRequest();
-        req.method = "POST";
-        try std.testing.expectError(error.MethodNotGet, acceptServerHandshake(req, .{}));
+        const req: Request = .{ .method = "POST", .is_http_11 = true };
+        try std.testing.expectError(error.MethodNotGet, acceptRequest(req));
     }
     {
-        var req = validRequest();
-        req.is_http_11 = false;
-        try std.testing.expectError(error.HttpVersionNotSupported, acceptServerHandshake(req, .{}));
+        const req: Request = .{ .method = "GET", .is_http_11 = false };
+        try std.testing.expectError(error.HttpVersionNotSupported, acceptRequest(req));
     }
     {
-        var req = validRequest();
-        req.connection = null;
-        try std.testing.expectError(error.MissingConnectionHeader, acceptServerHandshake(req, .{}));
+        const req: Request = .{ .method = "GET", .is_http_11 = true };
+        try std.testing.expectError(error.MissingConnectionHeader, acceptRequest(req));
     }
     {
-        var req = validRequest();
-        req.connection = "keep-alive";
-        try std.testing.expectError(error.InvalidConnectionHeader, acceptServerHandshake(req, .{}));
+        const req: Request = .{ .method = "GET", .is_http_11 = true, .connection = "close" };
+        try std.testing.expectError(error.InvalidConnectionHeader, acceptRequest(req));
     }
     {
-        var req = validRequest();
-        req.upgrade = null;
-        try std.testing.expectError(error.MissingUpgradeHeader, acceptServerHandshake(req, .{}));
+        const req: Request = .{ .method = "GET", .is_http_11 = true, .connection = "Upgrade" };
+        try std.testing.expectError(error.MissingUpgradeHeader, acceptRequest(req));
     }
     {
-        var req = validRequest();
-        req.upgrade = "h2c";
-        try std.testing.expectError(error.InvalidUpgradeHeader, acceptServerHandshake(req, .{}));
+        const req: Request = .{ .method = "GET", .is_http_11 = true, .connection = "Upgrade", .upgrade = "h2c" };
+        try std.testing.expectError(error.InvalidUpgradeHeader, acceptRequest(req));
     }
     {
-        var req = validRequest();
-        req.sec_websocket_key = null;
-        try std.testing.expectError(error.MissingWebSocketKey, acceptServerHandshake(req, .{}));
+        const req: Request = .{ .method = "GET", .is_http_11 = true, .connection = "Upgrade", .upgrade = "websocket" };
+        try std.testing.expectError(error.MissingWebSocketKey, acceptRequest(req));
     }
     {
-        var req = validRequest();
-        req.sec_websocket_key = "short";
-        try std.testing.expectError(error.InvalidWebSocketKey, acceptServerHandshake(req, .{}));
+        const req: Request = .{
+            .method = "GET",
+            .is_http_11 = true,
+            .connection = "Upgrade",
+            .upgrade = "websocket",
+            .sec_websocket_key = "invalid",
+            .sec_websocket_version = "13",
+        };
+        try std.testing.expectError(error.InvalidWebSocketKey, acceptRequest(req));
     }
     {
-        var req = validRequest();
-        req.sec_websocket_version = null;
-        try std.testing.expectError(error.MissingWebSocketVersion, acceptServerHandshake(req, .{}));
+        const req: Request = .{
+            .method = "GET",
+            .is_http_11 = true,
+            .connection = "Upgrade",
+            .upgrade = "websocket",
+            .sec_websocket_key = "dGhlIHNhbXBsZSBub25jZQ==",
+        };
+        try std.testing.expectError(error.MissingWebSocketVersion, acceptRequest(req));
     }
     {
-        var req = validRequest();
-        req.sec_websocket_version = "12";
-        try std.testing.expectError(error.UnsupportedWebSocketVersion, acceptServerHandshake(req, .{}));
-    }
-    {
-        var req = validRequest();
-        req.sec_websocket_extensions = "permessage-deflate";
-        try std.testing.expectError(error.ExtensionsNotSupported, acceptServerHandshake(req, .{
-            .reject_extensions = true,
-        }));
-    }
-    {
-        var req = validRequest();
-        req.sec_websocket_protocol = null;
-        try std.testing.expectError(error.SubprotocolNotOffered, acceptServerHandshake(req, .{
-            .selected_subprotocol = "chat",
-        }));
+        const req: Request = .{
+            .method = "GET",
+            .is_http_11 = true,
+            .connection = "Upgrade",
+            .upgrade = "websocket",
+            .sec_websocket_key = "dGhlIHNhbXBsZSBub25jZQ==",
+            .sec_websocket_version = "12",
+        };
+        try std.testing.expectError(error.UnsupportedWebSocketVersion, acceptRequest(req));
     }
 }
 
-test "acceptServerHandshake requires exact offered subprotocol token" {
-    var req = validRequest();
-    req.sec_websocket_protocol = " chat , superchat ";
-    const response = try acceptServerHandshake(req, .{
-        .selected_subprotocol = "superchat",
-        .extra_headers = &.{.{ .name = "x-extra", .value = "1" }},
-    });
-    try std.testing.expectEqualStrings("superchat", response.selected_subprotocol.?);
-    try std.testing.expectEqual(@as(usize, 1), response.extra_headers.len);
-    try std.testing.expectError(error.SubprotocolNotOffered, acceptServerHandshake(req, .{
-        .selected_subprotocol = "CHAT",
-    }));
-}
-
-test "server handshake validates and writes response" {
-    var out: [512]u8 = undefined;
-    var writer = Io.Writer.fixed(out[0..]);
-    _ = try serverHandshake(&writer, validRequest(), .{
-        .selected_subprotocol = "chat",
-        .extra_headers = &.{.{ .name = "x-test", .value = "1" }},
-    });
-
-    const got = out[0..writer.end];
-    try std.testing.expect(std.mem.indexOf(u8, got, "HTTP/1.1 101 Switching Protocols\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "sec-websocket-protocol: chat\r\n") != null);
-    try std.testing.expect(std.mem.indexOf(u8, got, "x-test: 1\r\n") != null);
-}
-
-test "writeServerHandshakeResponse omits optional headers when absent" {
+test "upgrade writes the server response without optional headers when extensions are absent" {
+    var reader = Io.Reader.fixed(validRequest(""));
     var out: [256]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
-    try writeServerHandshakeResponse(&writer, .{
-        .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
-        .selected_subprotocol = null,
-        .selected_extensions = null,
-        .permessage_deflate = null,
-        .extra_headers = &.{},
-    });
-
+    const negotiated = try upgrade(&reader, &writer);
+    try std.testing.expect(negotiated == null);
     try std.testing.expectEqualStrings(
         "HTTP/1.1 101 Switching Protocols\r\n" ++
             "upgrade: websocket\r\n" ++
@@ -511,46 +407,34 @@ test "writeServerHandshakeResponse omits optional headers when absent" {
     );
 }
 
-test "writeServerHandshakeResponse preserves header order for subprotocol and extras" {
+test "upgrade writes the negotiated permessage-deflate header" {
+    var reader = Io.Reader.fixed(validRequest(
+        "Sec-WebSocket-Extensions: permessage-deflate; client_no_context_takeover\r\n",
+    ));
     var out: [384]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
-    try writeServerHandshakeResponse(&writer, .{
-        .accept_key = ("s3pPLMBiTxaQ9kYGzzhZRbK+xOo=").*,
-        .selected_subprotocol = "chat",
-        .selected_extensions = "permessage-deflate; server_no_context_takeover; client_no_context_takeover",
-        .permessage_deflate = .{},
-        .extra_headers = &.{
-            .{ .name = "x-first", .value = "1" },
-            .{ .name = "x-second", .value = "2" },
+    const negotiated = (try upgrade(&reader, &writer)).?;
+    try std.testing.expectEqualDeep(
+        extensions.PerMessageDeflate{
+            .server_no_context_takeover = true,
+            .client_no_context_takeover = true,
         },
-    });
-
+        negotiated,
+    );
     try std.testing.expectEqualStrings(
         "HTTP/1.1 101 Switching Protocols\r\n" ++
             "upgrade: websocket\r\n" ++
             "connection: Upgrade\r\n" ++
             "sec-websocket-accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n" ++
-            "sec-websocket-protocol: chat\r\n" ++
             "sec-websocket-extensions: permessage-deflate; server_no_context_takeover; client_no_context_takeover\r\n" ++
-            "x-first: 1\r\n" ++
-            "x-second: 2\r\n" ++
             "\r\n",
         out[0..writer.end],
     );
 }
 
-test "serverHandshake propagates writer errors" {
+test "upgrade propagates writer errors" {
+    var reader = Io.Reader.fixed(validRequest(""));
     var out: [8]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
-    try std.testing.expectError(error.WriteFailed, serverHandshake(&writer, validRequest(), .{}));
-}
-
-test "rejectHandshake returns the original error" {
-    try std.testing.expectEqual(error.ExtensionsNotSupported, rejectHandshake(error.ExtensionsNotSupported));
-}
-
-test "acceptServerHandshake rejects invalid methods" {
-    var rejected_req = validRequest();
-    rejected_req.method = "POST";
-    try std.testing.expectError(error.MethodNotGet, acceptServerHandshake(rejected_req, .{}));
+    try std.testing.expectError(error.WriteFailed, upgrade(&reader, &writer));
 }

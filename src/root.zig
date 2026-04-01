@@ -3,7 +3,7 @@
 //! The hot-path API is `Conn`, which exposes:
 //! - low-level frame streaming (`beginFrame`, `readFrameChunk`, `readFrameAll`, `discardFrame`)
 //! - convenience helpers (`readFrame`, `readMessage`, `writeFrame`, `writeText`, `writeBinary`)
-//! - strict server handshake validation (`Handshake.acceptServerHandshake`, `Handshake.writeServerHandshakeResponse`)
+//! - strict server upgrade handling (`Handshake.upgrade`)
 //!
 //! `Conn.Type` exposes the comptime-specialized connection type constructor.
 //! `Conn.Default`, `Conn.Server`, and `Conn.Client` are convenient aliases for
@@ -14,7 +14,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 pub const Protocol = @import("protocol.zig");
-pub const Handshake = @import("handshake.zig");
+const handshake = @import("handshake.zig");
+pub const Handshake = struct {
+    pub const Error = handshake.Error;
+    pub const computeAcceptKey = handshake.computeAcceptKey;
+    pub const upgrade = handshake.upgrade;
+};
 pub const Observe = @import("observe.zig");
 pub const Extensions = @import("extensions.zig");
 pub const Conn = @import("conn.zig");

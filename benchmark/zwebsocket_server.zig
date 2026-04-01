@@ -38,6 +38,41 @@ fn responseFrameLen(payload_len: usize) usize {
     return header_len + payload_len;
 }
 
+fn echoOne(conn: *BenchConn, scratch: []u8) !bool {
+    if (try conn.readFrameBorrowed()) |frame| {
+        switch (frame.header.opcode) {
+            .ping => try conn.writePong(frame.payload),
+            .pong => {},
+            .close => {
+                const parsed = try zws.Conn.parseClosePayload(frame.payload, false);
+                conn.writeClose(parsed.code, parsed.reason) catch |err| switch (err) {
+                    error.ConnectionClosed => {},
+                    else => return err,
+                };
+                return true;
+            },
+            else => try conn.writeFrame(frame.header.opcode, frame.payload, frame.header.fin, frame.header.compressed),
+        }
+        return false;
+    }
+
+    const frame = try conn.readFrame(scratch);
+    switch (frame.header.opcode) {
+        .ping => try conn.writePong(frame.payload),
+        .pong => {},
+        .close => {
+            const parsed = try zws.Conn.parseClosePayload(frame.payload, false);
+            conn.writeClose(parsed.code, parsed.reason) catch |err| switch (err) {
+                error.ConnectionClosed => {},
+                else => return err,
+            };
+            return true;
+        },
+        else => try conn.writeFrame(frame.header.opcode, frame.payload, frame.header.fin, frame.header.compressed),
+    }
+    return false;
+}
+
 fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize, msg_size: usize) Io.Cancelable!void {
     defer stream.close(io);
     common.setTcpNoDelay(&stream);
@@ -55,8 +90,7 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize, msg_size: usiz
     var sr = stream.reader(io, read_storage[0..read_buf_len]);
     var sw = stream.writer(io, write_storage[0..write_buf_len]);
 
-    const req = common.parseHandshakeRequest(&sr.interface) catch return;
-    _ = zws.Handshake.serverHandshake(&sw.interface, req, .{}) catch return;
+    _ = zws.Handshake.upgrade(&sr.interface, &sw.interface) catch return;
     sw.interface.flush() catch return;
 
     var conn = BenchConn.init(&sr.interface, &sw.interface, .{});
@@ -64,11 +98,11 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize, msg_size: usiz
     var payload_buf: [64 * 1024]u8 = undefined;
     var buffered_frames: usize = 0;
     while (true) {
-        const echoed = conn.echoFrame(payload_buf[0..]) catch |err| switch (err) {
+        const closed = echoOne(&conn, payload_buf[0..]) catch |err| switch (err) {
             error.EndOfStream => return,
             else => return,
         };
-        if (echoed.opcode == .close) {
+        if (closed) {
             sw.interface.flush() catch {};
             return;
         }

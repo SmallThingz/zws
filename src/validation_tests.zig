@@ -11,12 +11,12 @@ fn fuzzMalformedFrames(_: void, smith: *std.testing.Smith) !void {
     var sink: [256]u8 = undefined;
     var writer = Io.Writer.fixed(sink[0..]);
     var conn = zws.Conn.Default.init(&reader, &writer, .{});
-    var scratch: [128]u8 = undefined;
 
     var steps: usize = 0;
     while (steps < 8) : (steps += 1) {
         const before_seek = reader.seek;
-        _ = conn.echoFrame(scratch[0..]) catch break;
+        _ = conn.beginFrame() catch break;
+        conn.discardFrame() catch break;
         if (reader.seek == before_seek and !conn.recv_active) break;
     }
 }

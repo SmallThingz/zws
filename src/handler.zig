@@ -27,18 +27,14 @@ pub const Response = struct {
     body: Body = .none,
 };
 
-pub fn SliceContext(comptime ConnType: type) type {
+pub fn SliceContext(comptime ConnType: type, comptime StateType: type) type {
     return struct {
         io: Io,
         conn: *ConnType,
-        user: *anyopaque,
+        state: *StateType,
         message: conn.Message,
 
         const Self = @This();
-
-        pub fn T(self: *const Self, comptime StateType: type) *StateType {
-            return @ptrCast(@alignCast(self.user));
-        }
 
         pub fn respond(self: *Self, value: anytype) anyerror!void {
             const normalized = normalizeResponse(value);
@@ -51,18 +47,14 @@ pub fn SliceContext(comptime ConnType: type) type {
     };
 }
 
-pub fn StreamContext(comptime ConnType: type) type {
+pub fn StreamContext(comptime ConnType: type, comptime StateType: type) type {
     return struct {
         io: Io,
         conn: *ConnType,
-        user: *anyopaque,
+        state: *StateType,
         stream: *StreamReader(ConnType),
 
         const Self = @This();
-
-        pub fn T(self: *const Self, comptime StateType: type) *StateType {
-            return @ptrCast(@alignCast(self.user));
-        }
 
         pub fn opcode(self: *const Self) conn.MessageOpcode {
             return self.stream.opcode;
@@ -159,12 +151,12 @@ pub fn run(
     comptime opts: Options,
     io: Io,
     conn_ptr: anytype,
-    user: anytype,
+    state_ptr: anytype,
     message_buf: []u8,
     comptime handler: anytype,
 ) anyerror!void {
     const ConnType = pointerChildType(@TypeOf(conn_ptr), "conn_ptr");
-    const user_ptr = asAnyOpaquePtr(user);
+    const StateType = pointerChildType(@TypeOf(state_ptr), "state_ptr");
 
     if (comptime opts.receive_mode == .solid_slice) {
         while (true) {
@@ -173,10 +165,10 @@ pub fn run(
                 else => return err,
             };
 
-            var ctx: SliceContext(ConnType) = .{
+            var ctx: SliceContext(ConnType, StateType) = .{
                 .io = io,
                 .conn = conn_ptr,
-                .user = user_ptr,
+                .state = state_ptr,
                 .message = message,
             };
             try processHandlerResult(opts, io, conn_ptr, message.opcode, handler, &ctx);
@@ -189,10 +181,10 @@ pub fn run(
             else => return err,
         };
         var stream = StreamReader(ConnType).init(conn_ptr, start);
-        var ctx: StreamContext(ConnType) = .{
+        var ctx: StreamContext(ConnType, StateType) = .{
             .io = io,
             .conn = conn_ptr,
-            .user = user_ptr,
+            .state = state_ptr,
             .stream = &stream,
         };
         try processHandlerResult(opts, io, conn_ptr, start.opcode, handler, &ctx);
@@ -299,11 +291,7 @@ fn callHandler(comptime ReturnType: type, comptime handler: anytype, io: Io, ctx
 fn handlerFnInfo(comptime HandlerType: type) std.builtin.Type.Fn {
     return switch (@typeInfo(HandlerType)) {
         .@"fn" => |fn_info| fn_info,
-        .pointer => |ptr_info| switch (@typeInfo(ptr_info.child)) {
-            .@"fn" => |fn_info| fn_info,
-            else => @compileError("handler must be a function or a pointer to function"),
-        },
-        else => @compileError("handler must be a function or a pointer to function"),
+        else => @compileError("handler must be a comptime function (fn), not a function pointer"),
     };
 }
 
@@ -334,16 +322,16 @@ fn writeChunkedBody(conn_ptr: anytype, opcode: conn.MessageOpcode, chunks: []con
     };
 
     if (chunks.len == 0) {
-        try conn_ptr.writeFrame(first_opcode, "", true);
-        return;
-    }
+            try conn_ptr.writeFrame(first_opcode, "", true, false);
+            return;
+        }
 
     for (chunks, 0..) |chunk, idx| {
         const fin = idx + 1 == chunks.len;
         if (idx == 0) {
-            try conn_ptr.writeFrame(first_opcode, chunk, fin);
+            try conn_ptr.writeFrame(first_opcode, chunk, fin, false);
         } else {
-            try conn_ptr.writeFrame(.continuation, chunk, fin);
+            try conn_ptr.writeFrame(.continuation, chunk, fin, false);
         }
     }
 }
@@ -420,15 +408,6 @@ fn pointerChildType(comptime PointerType: type, comptime label: []const u8) type
     return info.pointer.child;
 }
 
-fn asAnyOpaquePtr(ptr: anytype) *anyopaque {
-    const PtrType = @TypeOf(ptr);
-    const info = @typeInfo(PtrType);
-    if (info != .pointer or info.pointer.size != .one) {
-        @compileError("user state must be a single-item pointer");
-    }
-    return @ptrCast(ptr);
-}
-
 test "run solid-slice mode invokes handler and writes byte-slice response" {
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(std.testing.allocator);
@@ -448,9 +427,8 @@ test "run solid-slice mode invokes handler and writes byte-slice response" {
     var state: State = .{};
 
     const H = struct {
-        fn handle(ctx: *SliceContext(conn.Server)) []const u8 {
-            const st = ctx.T(State);
-            st.calls += 1;
+        fn handle(ctx: *SliceContext(conn.Server, State)) []const u8 {
+            ctx.state.calls += 1;
             std.testing.expectEqual(conn.MessageOpcode.text, ctx.message.opcode) catch unreachable;
             std.testing.expectEqualStrings("ping", ctx.message.payload) catch unreachable;
             return "pong";
@@ -487,7 +465,7 @@ test "run solid-slice mode accepts struct responses with body and opcode" {
         body: []const u8,
     };
     const H = struct {
-        fn handle(_: *SliceContext(conn.Server)) R {
+        fn handle(_: *SliceContext(conn.Server, u8)) R {
             return .{
                 .opcode = .binary,
                 .body = "abc",
@@ -521,7 +499,7 @@ test "run solid-slice mode writes chunked response bodies as fragmented frames" 
 
     const chunks = [_][]const u8{ "a", "bc", "def" };
     const H = struct {
-        fn handle(_: *SliceContext(conn.Server)) []const []const u8 {
+        fn handle(_: *SliceContext(conn.Server, u8)) []const []const u8 {
             return chunks[0..];
         }
     };
@@ -560,17 +538,16 @@ test "run stream mode reads fragmented messages without internal message assembl
     var state: State = .{};
 
     const H = struct {
-        fn handle(ctx: *StreamContext(conn.Server)) ![]const u8 {
+        fn handle(ctx: *StreamContext(conn.Server, State)) ![]const u8 {
             var tmp: [2]u8 = undefined;
-            const st = ctx.T(State);
-            st.len = 0;
+            ctx.state.len = 0;
             while (true) {
                 const chunk = try ctx.readChunk(tmp[0..]);
                 if (chunk.len == 0) break;
-                @memcpy(st.buf[st.len..][0..chunk.len], chunk);
-                st.len += chunk.len;
+                @memcpy(ctx.state.buf[ctx.state.len..][0..chunk.len], chunk);
+                ctx.state.len += chunk.len;
             }
-            return st.buf[0..st.len];
+            return ctx.state.buf[0..ctx.state.len];
         }
     };
 
@@ -609,7 +586,7 @@ test "run accepts handlers that take io and return error unions" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(io_param: Io, _: *SliceContext(conn.Server)) ![]const u8 {
+        fn handle(io_param: Io, _: *SliceContext(conn.Server, u8)) ![]const u8 {
             _ = io_param;
             return "done";
         }
@@ -630,7 +607,7 @@ test "run closes with 1011 on handler error by default" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(_: *SliceContext(conn.Server)) error{HandlerFailed}!void {
+        fn handle(_: *SliceContext(conn.Server, u8)) error{HandlerFailed}!void {
             return error.HandlerFailed;
         }
     };
@@ -660,7 +637,7 @@ test "run can skip 1011 close on handler error when configured" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(_: *SliceContext(conn.Server)) error{HandlerFailed}!void {
+        fn handle(_: *SliceContext(conn.Server, u8)) error{HandlerFailed}!void {
             return error.HandlerFailed;
         }
     };
@@ -681,7 +658,7 @@ test "run supports struct responses with empty body" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(_: *SliceContext(conn.Server)) struct { body: void } {
+        fn handle(_: *SliceContext(conn.Server, u8)) struct { body: void } {
             return .{ .body = {} };
         }
     };
@@ -705,7 +682,7 @@ test "run stream mode discards unread message tail before continuing" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(ctx: *StreamContext(conn.Server)) ![]const u8 {
+        fn handle(ctx: *StreamContext(conn.Server, u8)) ![]const u8 {
             var tmp: [2]u8 = undefined;
             const first = try ctx.readChunk(tmp[0..]);
             try std.testing.expectEqualStrings("he", first);
@@ -750,7 +727,7 @@ test "run stream mode rejects compressed messages" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(_: *StreamContext(conn.Server)) !void {}
+        fn handle(_: *StreamContext(conn.Server, u8)) !void {}
     };
     var state: u8 = 0;
     try std.testing.expectError(

@@ -6,7 +6,6 @@ const Io = common.Io;
 
 const Config = struct {
     port: u16 = 9002,
-    compression: bool = false,
     max_frame_payload_len: u64 = 128 * 1024,
 };
 
@@ -21,15 +20,49 @@ fn usage(io: Io) !void {
         \\
         \\Options:
         \\  --port=9002
-        \\  --compression
         \\  --max-frame=131072
         \\  --help
         \\
-        \\This example stays on the frame API and uses `echoFrame(...)` instead of
+        \\This example stays on the frame API and echoes frames directly instead of
         \\reassembling full messages with `readMessage(...)`.
         \\
     );
     try stdout.interface.flush();
+}
+
+fn echoOne(conn: anytype, scratch: []u8) !bool {
+    if (try conn.readFrameBorrowed()) |frame| {
+        switch (frame.header.opcode) {
+            .ping => try conn.writePong(frame.payload),
+            .pong => {},
+            .close => {
+                const parsed = try zws.Conn.parseClosePayload(frame.payload, true);
+                conn.writeClose(parsed.code, parsed.reason) catch |err| switch (err) {
+                    error.ConnectionClosed => {},
+                    else => return err,
+                };
+                return true;
+            },
+            else => try conn.writeFrame(frame.header.opcode, frame.payload, frame.header.fin, frame.header.compressed),
+        }
+        return false;
+    }
+
+    const frame = try conn.readFrame(scratch);
+    switch (frame.header.opcode) {
+        .ping => try conn.writePong(frame.payload),
+        .pong => {},
+        .close => {
+            const parsed = try zws.Conn.parseClosePayload(frame.payload, true);
+            conn.writeClose(parsed.code, parsed.reason) catch |err| switch (err) {
+                error.ConnectionClosed => {},
+                else => return err,
+            };
+            return true;
+        },
+        else => try conn.writeFrame(frame.header.opcode, frame.payload, frame.header.fin, frame.header.compressed),
+    }
+    return false;
 }
 
 fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
@@ -43,15 +76,12 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void
     var sr = stream.reader(io, &read_buf);
     var sw = stream.writer(io, &write_buf);
 
-    const req = common.parseHandshakeRequest(&sr.interface) catch return;
-    const accepted = zws.Handshake.serverHandshake(&sw.interface, req, .{
-        .enable_permessage_deflate = cfg.compression,
-    }) catch return;
+    const negotiated_permessage_deflate = zws.Handshake.upgrade(&sr.interface, &sw.interface) catch return;
     sw.interface.flush() catch return;
 
     var conn = zws.Conn.Server.init(&sr.interface, &sw.interface, .{
         .max_frame_payload_len = cfg.max_frame_payload_len,
-        .permessage_deflate = if (accepted.permessage_deflate) |pmd|
+        .permessage_deflate = if (negotiated_permessage_deflate) |pmd|
             .{
                 .allocator = std.heap.smp_allocator,
                 .negotiated = pmd,
@@ -62,13 +92,14 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void
     });
 
     while (true) {
-        _ = conn.echoFrame(scratch[0..]) catch |err| switch (err) {
+        const closed = echoOne(&conn, scratch[0..]) catch |err| switch (err) {
             error.EndOfStream, error.ConnectionClosed => return,
             else => {
                 common.closeForProtocolError(&conn, &sw.interface, err);
                 return;
             },
         };
+        if (closed) return;
         sw.interface.flush() catch return;
     }
 }
@@ -87,7 +118,6 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         if (std.mem.eql(u8, arg, "--compression")) {
-            cfg.compression = true;
             continue;
         }
         if (common.parseKeyVal(arg)) |kv| {

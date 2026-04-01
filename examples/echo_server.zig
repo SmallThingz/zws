@@ -6,7 +6,6 @@ const Io = common.Io;
 
 const Config = struct {
     port: u16 = 9001,
-    compression: bool = false,
     max_frame_payload_len: u64 = 1024 * 1024,
     max_message_payload_len: usize = 1024 * 1024,
 };
@@ -22,7 +21,6 @@ fn usage(io: Io) !void {
         \\
         \\Options:
         \\  --port=9001
-        \\  --compression
         \\  --max-frame=1048576
         \\  --max-message=1048576
         \\  --help
@@ -41,16 +39,13 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void
     var sr = stream.reader(io, &read_buf);
     var sw = stream.writer(io, &write_buf);
 
-    const req = common.parseHandshakeRequest(&sr.interface) catch return;
-    const accepted = zws.Handshake.serverHandshake(&sw.interface, req, .{
-        .enable_permessage_deflate = cfg.compression,
-    }) catch return;
+    const negotiated_permessage_deflate = zws.Handshake.upgrade(&sr.interface, &sw.interface) catch return;
     sw.interface.flush() catch return;
 
     const conn_cfg: zws.Conn.Config = .{
         .max_frame_payload_len = cfg.max_frame_payload_len,
         .max_message_payload_len = cfg.max_message_payload_len,
-        .permessage_deflate = if (accepted.permessage_deflate) |pmd|
+        .permessage_deflate = if (negotiated_permessage_deflate) |pmd|
             .{
                 .allocator = std.heap.smp_allocator,
                 .negotiated = pmd,
@@ -93,7 +88,6 @@ pub fn main(init: std.process.Init) !void {
             return;
         }
         if (std.mem.eql(u8, arg, "--compression")) {
-            cfg.compression = true;
             continue;
         }
         if (common.parseKeyVal(arg)) |kv| {

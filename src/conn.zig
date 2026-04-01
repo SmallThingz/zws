@@ -99,11 +99,6 @@ pub const BorrowedFrame = struct {
     payload: []u8,
 };
 
-pub const EchoResult = struct {
-    opcode: Opcode,
-    payload_len: usize,
-};
-
 const ParsedHeader = struct {
     header: FrameHeader,
     header_len: usize,
@@ -122,6 +117,7 @@ pub const Type = Conn;
 /// and runtime hook implementation.
 pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
     const expects_masked = static.role == .server;
+    const sends_masked = static.role == .client;
     const auto_pong = static.auto_pong;
     const auto_reply_close = static.auto_reply_close;
     const validate_utf8 = static.validate_utf8;
@@ -129,28 +125,34 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
     const permessage_deflate_context_takeover = static.permessage_deflate_context_takeover;
     const permessage_deflate_min_payload_len = static.permessage_deflate_min_payload_len;
     const permessage_deflate_require_compression_gain = static.permessage_deflate_require_compression_gain;
+    const HooksField = if (runtime_hooks) Hooks else void;
+    const MaskPrngField = if (sends_masked) std.Random.DefaultPrng else void;
+    const RecvMaskField = if (expects_masked) [mask_len]u8 else void;
+    const RecvMaskOffsetField = if (expects_masked) usize else void;
+    const SendTakeoverField = if (permessage_deflate_context_takeover) ?flate_backend.TakeoverDeflater else void;
+    const RecvTakeoverField = if (permessage_deflate_context_takeover) ?flate_backend.TakeoverInflater else void;
     if (comptime runtime_hooks) observe.validateHooks(Hooks);
 
     return struct {
         reader: *Io.Reader,
         writer: *Io.Writer,
         config: Config,
-        hooks: Hooks,
-        mask_prng: std.Random.DefaultPrng,
+        hooks: HooksField = if (runtime_hooks) undefined else {},
+        mask_prng: MaskPrngField = if (sends_masked) undefined else {},
 
         recv_active: bool = false,
         recv_header: FrameHeader = undefined,
         recv_remaining: u64 = 0,
-        recv_mask: [mask_len]u8 = .{0} ** mask_len,
-        recv_mask_offset: usize = 0,
+        recv_mask: RecvMaskField = if (expects_masked) .{0} ** mask_len else {},
+        recv_mask_offset: RecvMaskOffsetField = if (expects_masked) 0 else {},
         recv_fragment_opcode: ?MessageOpcode = null,
         recv_fragment_compressed: bool = false,
 
         send_fragment_opcode: ?MessageOpcode = null,
         close_sent: bool = false,
         close_received: bool = false,
-        send_takeover: ?flate_backend.TakeoverDeflater = null,
-        recv_takeover: ?flate_backend.TakeoverInflater = null,
+        send_takeover: SendTakeoverField = if (permessage_deflate_context_takeover) null else {},
+        recv_takeover: RecvTakeoverField = if (permessage_deflate_context_takeover) null else {},
 
         const Self = @This();
         const masked_write_scratch_len = 4096;
@@ -172,8 +174,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                 .reader = reader,
                 .writer = writer,
                 .config = config,
-                .hooks = hooks,
-                .mask_prng = std.Random.DefaultPrng.init(seed),
+                .hooks = if (runtime_hooks) hooks else {},
+                .mask_prng = if (sends_masked) std.Random.DefaultPrng.init(seed) else {},
             };
         }
 
@@ -190,13 +192,15 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            if (self.send_takeover) |*deflater| {
-                deflater.deinit();
-                self.send_takeover = null;
-            }
-            if (self.recv_takeover) |*inflater| {
-                inflater.deinit();
-                self.recv_takeover = null;
+            if (comptime permessage_deflate_context_takeover) {
+                if (self.send_takeover) |*deflater| {
+                    deflater.deinit();
+                    self.send_takeover = null;
+                }
+                if (self.recv_takeover) |*inflater| {
+                    inflater.deinit();
+                    self.recv_takeover = null;
+                }
             }
         }
 
@@ -306,8 +310,10 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             self.recv_active = true;
             self.recv_header = parsed.header;
             self.recv_remaining = parsed.header.payload_len;
-            self.recv_mask = parsed.mask;
-            self.recv_mask_offset = 0;
+            if (comptime expects_masked) {
+                self.recv_mask = parsed.mask;
+                self.recv_mask_offset = 0;
+            }
             return self.recv_header;
         }
 
@@ -352,10 +358,14 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             const remaining = std.math.cast(usize, self.recv_remaining) orelse std.math.maxInt(usize);
             const n: usize = @min(dest.len, remaining);
             try self.readSliceAllTimed(dest[0..n]);
-            if (self.recv_header.masked) applyMask(dest[0..n], self.recv_mask, self.recv_mask_offset);
+            if (comptime expects_masked) {
+                applyMask(dest[0..n], self.recv_mask, self.recv_mask_offset);
+            }
 
             self.recv_remaining -= n;
-            self.recv_mask_offset += n;
+            if (comptime expects_masked) {
+                self.recv_mask_offset += n;
+            }
 
             if (self.recv_remaining == 0) self.finishActiveFrame();
             return dest[0..n];
@@ -465,21 +475,14 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             }
         }
 
-        pub fn echoFrame(self: *Self, scratch: []u8) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!EchoResult {
-            if (try self.readFrameBorrowed()) |frame| {
-                return try self.echoFramePayload(frame.header, frame.payload);
-            }
-            const frame = try self.readFrame(scratch);
-            return try self.echoFramePayload(frame.header, frame.payload);
-        }
-
         pub fn writeFrame(
             self: *Self,
             opcode: Opcode,
             payload: []const u8,
             fin: bool,
+            compressed: bool,
         ) (ProtocolError || Io.Writer.Error)!void {
-            try self.writeFrameInternal(opcode, payload, fin, false);
+            try self.writeFrameInternal(opcode, payload, fin, compressed);
         }
 
         fn writeFrameInternal(
@@ -519,7 +522,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                 header_len += 8;
             }
 
-            if (comptime !expects_masked) {
+            if (comptime sends_masked) {
                 var mask: [mask_len]u8 = undefined;
                 self.mask_prng.random().bytes(mask[0..]);
                 @memcpy(header_buf[header_len..][0..4], mask[0..]);
@@ -617,11 +620,26 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
 
         fn parseHeaderBytes(self: *Self, bytes: []const u8) ProtocolError!?ParsedHeader {
             if (bytes.len < 2) return null;
-            const compressed = (bytes[0] & 0x40) != 0;
-            if ((bytes[0] & 0x30) != 0) return error.ReservedBitsSet;
+            const HeaderByte0 = packed struct(u8) {
+                opcode: u4,
+                rsv3: u1,
+                rsv2: u1,
+                rsv1: u1,
+                fin: u1,
+            };
+            const HeaderByte1 = packed struct(u8) {
+                payload_len: u7,
+                masked: u1,
+            };
+
+            const b0: HeaderByte0 = @bitCast(bytes[0]);
+            const b1: HeaderByte1 = @bitCast(bytes[1]);
+
+            const compressed = b0.rsv1 != 0;
+            if (b0.rsv2 != 0 or b0.rsv3 != 0) return error.ReservedBitsSet;
             if (compressed and self.config.permessage_deflate == null) return error.ReservedBitsSet;
 
-            const opcode: Opcode = switch (@as(u4, @truncate(bytes[0]))) {
+            const opcode: Opcode = switch (b0.opcode) {
                 0x0 => .continuation,
                 0x1 => .text,
                 0x2 => .binary,
@@ -630,14 +648,14 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                 0xA => .pong,
                 else => return error.UnknownOpcode,
             };
-            const fin = (bytes[0] & 0x80) != 0;
-            const masked = (bytes[1] & 0x80) != 0;
+            const fin = b0.fin != 0;
+            const masked = b1.masked != 0;
             if (masked != expects_masked) return error.MaskBitInvalid;
 
             const header_len = neededHeaderLen(bytes[1]);
             if (bytes.len < header_len) return null;
 
-            var payload_len: u64 = bytes[1] & 0x7f;
+            var payload_len: u64 = b1.payload_len;
             var idx: usize = 2;
             if (payload_len == 126) {
                 payload_len = std.mem.readInt(u16, bytes[idx..][0..2], .big);
@@ -669,7 +687,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
 
             var mask: [mask_len]u8 = .{0} ** mask_len;
             if (masked) {
-                mask = bytes[idx..][0..mask_len].*;
+                const mask_u32 = std.mem.readInt(u32, bytes[idx..][0..mask_len], .big);
+                std.mem.writeInt(u32, mask[0..], mask_u32, .big);
             }
 
             return .{
@@ -682,18 +701,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                 },
                 .header_len = header_len,
                 .mask = mask,
-            };
-        }
-
-        fn echoFramePayload(self: *Self, header: FrameHeader, payload: []const u8) (ProtocolError || Io.Writer.Error)!EchoResult {
-            if (proto.isControl(header.opcode)) {
-                _ = try self.handleControlFrame(header.opcode, payload, true, false);
-            } else {
-                try self.writeFrameInternal(header.opcode, payload, header.fin, header.compressed);
-            }
-            return .{
-                .opcode = header.opcode,
-                .payload_len = payload.len,
             };
         }
 
@@ -717,7 +724,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
 
         fn writeControlFrame(self: *Self, opcode: Opcode, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
             if (payload.len > control_payload_max_len) return error.ControlFrameTooLarge;
-            try self.writeFrame(opcode, payload, true);
+            try self.writeFrame(opcode, payload, true, false);
         }
 
         fn flushAutoControlReply(self: *Self) (ProtocolError || Io.Writer.Error)!void {
@@ -844,6 +851,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         fn ensureSendTakeoverDeflater(self: *Self) ProtocolError!*flate_backend.TakeoverDeflater {
+            if (comptime !permessage_deflate_context_takeover) unreachable;
             if (self.send_takeover == null) {
                 self.send_takeover = undefined;
                 errdefer self.send_takeover = null;
@@ -858,6 +866,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         fn ensureRecvTakeoverInflater(self: *Self) *flate_backend.TakeoverInflater {
+            if (comptime !permessage_deflate_context_takeover) unreachable;
             if (self.recv_takeover == null) {
                 self.recv_takeover = .{};
                 self.recv_takeover.?.init();
@@ -866,6 +875,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         fn inflateMessageTakeover(self: *Self, compressed_payload: []const u8, dest: []u8) flate_backend.InflateError![]u8 {
+            if (comptime !permessage_deflate_context_takeover) unreachable;
             const inflater = self.ensureRecvTakeoverInflater();
             return inflater.inflateMessage(compressionAllocator(self), compressed_payload, dest);
         }
@@ -911,7 +921,9 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             const header = self.recv_header;
             self.recv_active = false;
             self.recv_remaining = 0;
-            self.recv_mask_offset = 0;
+            if (comptime expects_masked) {
+                self.recv_mask_offset = 0;
+            }
             self.noteConsumedFrame(header);
         }
     };
@@ -1203,7 +1215,7 @@ test "generic writeFrame rejects oversized control payloads" {
 
     var payload: [126]u8 = undefined;
     @memset(payload[0..], 'x');
-    try std.testing.expectError(error.ControlFrameTooLarge, conn.writeFrame(.ping, payload[0..], true));
+    try std.testing.expectError(error.ControlFrameTooLarge, conn.writeFrame(.ping, payload[0..], true, false));
 }
 
 test "init produces distinct mask streams for different connections" {
@@ -1810,9 +1822,9 @@ test "writeFrame supports extended lengths and sequencing rules" {
         var writer = Io.Writer.fixed(out[0..]);
         var reader = Io.Reader.fixed(""[0..]);
         var conn = Conn(.{}).init(&reader, &writer, .{});
-        try conn.writeFrame(.text, "hel", false);
-        try std.testing.expectError(error.FragmentWriteInProgress, conn.writeFrame(.binary, "x", true));
-        try conn.writeFrame(.continuation, "lo", true);
+        try conn.writeFrame(.text, "hel", false, false);
+        try std.testing.expectError(error.FragmentWriteInProgress, conn.writeFrame(.binary, "x", true, false));
+        try conn.writeFrame(.continuation, "lo", true, false);
         try conn.writeBinary("x");
         try std.testing.expectEqualSlices(u8, &.{
             0x01, 0x03, 'h', 'e', 'l',
@@ -1825,8 +1837,16 @@ test "writeFrame supports extended lengths and sequencing rules" {
         var writer = Io.Writer.fixed(out[0..]);
         var reader = Io.Reader.fixed(""[0..]);
         var conn = Conn(.{}).init(&reader, &writer, .{});
-        try std.testing.expectError(error.UnexpectedContinuationWrite, conn.writeFrame(.continuation, "x", true));
-        try std.testing.expectError(error.ControlFrameFragmented, conn.writeFrame(.ping, "", false));
+        try std.testing.expectError(error.UnexpectedContinuationWrite, conn.writeFrame(.continuation, "x", true, false));
+        try std.testing.expectError(error.ControlFrameFragmented, conn.writeFrame(.ping, "", false, false));
+    }
+    {
+        var out: [8]u8 = undefined;
+        var writer = Io.Writer.fixed(out[0..]);
+        var reader = Io.Reader.fixed(""[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
+        try conn.writeFrame(.text, "", true, true);
+        try std.testing.expectEqualSlices(u8, &.{ 0xC1, 0x00 }, out[0..writer.end]);
     }
     {
         var payload: [126]u8 = undefined;
@@ -2001,125 +2021,6 @@ test "readFrameBorrowed returns null for payload sizes that cannot fit in usize"
     var conn = Conn(.{}).init(&reader, &writer, .{});
 
     try std.testing.expect((try conn.readFrameBorrowed()) == null);
-}
-
-test "echoFrame preserves fragmentation and mirrors close payload" {
-    var wire: std.ArrayList(u8) = .empty;
-    defer wire.deinit(std.testing.allocator);
-    try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "hel", .{ 1, 2, 3, 4 });
-    try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, "lo", .{ 5, 6, 7, 8 });
-    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, &.{ 0x03, 0xE8, 'b', 'y', 'e' }, .{ 9, 10, 11, 12 });
-
-    var reader = Io.Reader.fixed(wire.items);
-    var out: [64]u8 = undefined;
-    var writer = Io.Writer.fixed(out[0..]);
-    var conn = Conn(.{}).init(&reader, &writer, .{});
-    var scratch: [16]u8 = undefined;
-
-    try std.testing.expectEqual(Opcode.text, (try conn.echoFrame(scratch[0..])).opcode);
-    try std.testing.expectEqual(Opcode.continuation, (try conn.echoFrame(scratch[0..])).opcode);
-    try std.testing.expectEqual(Opcode.close, (try conn.echoFrame(scratch[0..])).opcode);
-    try std.testing.expect(conn.close_received);
-    try std.testing.expect(conn.close_sent);
-    try std.testing.expectEqualSlices(u8, &.{
-        0x01, 0x03, 'h',  'e', 'l',
-        0x80, 0x02, 'l',  'o', 0x88,
-        0x05, 0x03, 0xE8, 'b', 'y',
-        'e',
-    }, out[0..writer.end]);
-}
-
-test "echoFrame falls back to scratch buffer when borrowing is unavailable" {
-    var wire: std.ArrayList(u8) = .empty;
-    defer wire.deinit(std.testing.allocator);
-    try appendTestFrame(&wire, std.testing.allocator, .binary, true, true, "abc", .{ 1, 2, 3, 4 });
-
-    var base_reader = Io.Reader.fixed(wire.items);
-    var indirect_buffer: [6]u8 = undefined;
-    var indirect = std.testing.ReaderIndirect.init(&base_reader, indirect_buffer[0..]);
-
-    var out: [16]u8 = undefined;
-    var writer = Io.Writer.fixed(out[0..]);
-    var conn = Conn(.{}).init(&indirect.interface, &writer, .{});
-    var scratch: [8]u8 = undefined;
-
-    const echoed = try conn.echoFrame(scratch[0..]);
-    try std.testing.expectEqual(Opcode.binary, echoed.opcode);
-    try std.testing.expectEqual(@as(usize, 3), echoed.payload_len);
-    try std.testing.expectEqualSlices(u8, &.{ 0x82, 0x03, 'a', 'b', 'c' }, out[0..writer.end]);
-}
-
-test "echoFrame ignores pong frames without writing output" {
-    var wire: std.ArrayList(u8) = .empty;
-    defer wire.deinit(std.testing.allocator);
-    try appendTestFrame(&wire, std.testing.allocator, .pong, true, true, "!", .{ 1, 2, 3, 4 });
-
-    var reader = Io.Reader.fixed(wire.items);
-    var out: [8]u8 = undefined;
-    var writer = Io.Writer.fixed(out[0..]);
-    var conn = Conn(.{}).init(&reader, &writer, .{});
-    var scratch: [4]u8 = undefined;
-
-    const echoed = try conn.echoFrame(scratch[0..]);
-    try std.testing.expectEqual(Opcode.pong, echoed.opcode);
-    try std.testing.expectEqual(@as(usize, 1), echoed.payload_len);
-    try std.testing.expectEqual(@as(usize, 0), writer.end);
-}
-
-test "echoFrame validates close payload even after local close was sent" {
-    var wire: std.ArrayList(u8) = .empty;
-    defer wire.deinit(std.testing.allocator);
-    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, &.{0x03}, .{ 1, 2, 3, 4 });
-
-    var reader = Io.Reader.fixed(wire.items);
-    var out: [16]u8 = undefined;
-    var writer = Io.Writer.fixed(out[0..]);
-    var conn = Conn(.{}).init(&reader, &writer, .{});
-    try conn.writeClose(null, "");
-
-    var scratch: [8]u8 = undefined;
-    try std.testing.expectError(error.InvalidClosePayload, conn.echoFrame(scratch[0..]));
-}
-
-test "echoFrame clears fragmented receive state when a close interrupts a message" {
-    var wire: std.ArrayList(u8) = .empty;
-    defer wire.deinit(std.testing.allocator);
-    try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "abc", .{ 1, 2, 3, 4 });
-    try appendTestFrame(&wire, std.testing.allocator, .close, true, true, "", .{ 5, 6, 7, 8 });
-
-    var reader = Io.Reader.fixed(wire.items);
-    var out: [8]u8 = undefined;
-    var writer = Io.Writer.fixed(out[0..]);
-    var conn = Conn(.{}).init(&reader, &writer, .{});
-    var scratch: [8]u8 = undefined;
-
-    try std.testing.expectEqual(Opcode.text, (try conn.echoFrame(scratch[0..])).opcode);
-    try std.testing.expect(conn.recv_fragment_opcode != null);
-    try std.testing.expectEqual(Opcode.close, (try conn.echoFrame(scratch[0..])).opcode);
-    try std.testing.expect(conn.close_received);
-    try std.testing.expect(conn.recv_fragment_opcode == null);
-    try std.testing.expectEqualSlices(u8, &.{
-        0x01, 0x03, 'a', 'b', 'c',
-        0x88, 0x00,
-    }, out[0..writer.end]);
-}
-
-test "echoFrame ignores ping frames after a local close has already been sent" {
-    var wire: std.ArrayList(u8) = .empty;
-    defer wire.deinit(std.testing.allocator);
-    try appendTestFrame(&wire, std.testing.allocator, .ping, true, true, "!", .{ 1, 2, 3, 4 });
-
-    var reader = Io.Reader.fixed(wire.items);
-    var out: [8]u8 = undefined;
-    var writer = Io.Writer.fixed(out[0..]);
-    var conn = Conn(.{}).init(&reader, &writer, .{});
-    try conn.writeClose(null, "");
-
-    var scratch: [4]u8 = undefined;
-    const echoed = try conn.echoFrame(scratch[0..]);
-    try std.testing.expectEqual(Opcode.ping, echoed.opcode);
-    try std.testing.expectEqual(@as(usize, 1), echoed.payload_len);
-    try std.testing.expectEqualSlices(u8, &.{ 0x88, 0x00 }, out[0..writer.end]);
 }
 
 test "readMessage accepts empty text messages" {

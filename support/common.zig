@@ -39,52 +39,6 @@ pub fn setTcpNoDelay(stream: *const std.Io.net.Stream) void {
     ) catch {};
 }
 
-pub fn assignHandshakeHeader(req: *zws.Handshake.Request, name: []const u8, value: []const u8) void {
-    if (std.ascii.eqlIgnoreCase(name, "connection")) {
-        req.connection = value;
-    } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
-        req.upgrade = value;
-    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
-        req.sec_websocket_key = value;
-    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
-        req.sec_websocket_version = value;
-    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-protocol")) {
-        req.sec_websocket_protocol = value;
-    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-extensions")) {
-        req.sec_websocket_extensions = value;
-    } else if (std.ascii.eqlIgnoreCase(name, "origin")) {
-        req.origin = value;
-    } else if (std.ascii.eqlIgnoreCase(name, "host")) {
-        req.host = value;
-    }
-}
-
-pub fn parseHandshakeRequest(r: *Io.Reader) !zws.Handshake.Request {
-    const line0_incl = try r.takeDelimiterInclusive('\n');
-    const line0 = line0_incl[0 .. line0_incl.len - 1];
-    const request_line = trimCR(line0);
-
-    const sp1 = std.mem.indexOfScalar(u8, request_line, ' ') orelse return error.BadRequest;
-    const sp2_rel = std.mem.indexOfScalar(u8, request_line[sp1 + 1 ..], ' ') orelse return error.BadRequest;
-    const sp2 = sp1 + 1 + sp2_rel;
-
-    var req: zws.Handshake.Request = .{
-        .method = request_line[0..sp1],
-        .is_http_11 = std.mem.eql(u8, request_line[sp2 + 1 ..], "HTTP/1.1"),
-    };
-
-    while (true) {
-        const line_incl = try r.takeDelimiterInclusive('\n');
-        const line = trimCR(line_incl[0 .. line_incl.len - 1]);
-        if (line.len == 0) break;
-
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadRequest;
-        assignHandshakeHeader(&req, line[0..colon], trimSpaces(line[colon + 1 ..]));
-    }
-
-    return req;
-}
-
 pub fn closeForProtocolError(conn: *zws.Conn.Server, writer: *Io.Writer, err: anyerror) void {
     const close_code: ?u16 = switch (err) {
         error.MessageTooLarge, error.FrameTooLarge => 1009,
@@ -185,62 +139,6 @@ test "trimCR and trimSpaces normalize header text" {
     try std.testing.expectEqualStrings("line", trimCR("line"));
     try std.testing.expectEqualStrings("value", trimSpaces(" \tvalue\t "));
     try std.testing.expectEqualStrings("", trimSpaces(" \t "));
-}
-
-test "assignHandshakeHeader maps known websocket headers case-insensitively" {
-    var req: zws.Handshake.Request = .{
-        .method = "GET",
-        .is_http_11 = true,
-    };
-    assignHandshakeHeader(&req, "CoNnEcTiOn", "Upgrade");
-    assignHandshakeHeader(&req, "upgrade", "websocket");
-    assignHandshakeHeader(&req, "SEC-WEBSOCKET-KEY", "dGhlIHNhbXBsZSBub25jZQ==");
-    assignHandshakeHeader(&req, "sec-websocket-version", "13");
-    assignHandshakeHeader(&req, "sec-websocket-protocol", "chat");
-    assignHandshakeHeader(&req, "sec-websocket-extensions", "permessage-deflate");
-    assignHandshakeHeader(&req, "origin", "https://example.com");
-    assignHandshakeHeader(&req, "host", "example.com");
-    assignHandshakeHeader(&req, "x-unknown", "ignored");
-
-    try std.testing.expectEqualStrings("Upgrade", req.connection.?);
-    try std.testing.expectEqualStrings("websocket", req.upgrade.?);
-    try std.testing.expectEqualStrings("dGhlIHNhbXBsZSBub25jZQ==", req.sec_websocket_key.?);
-    try std.testing.expectEqualStrings("13", req.sec_websocket_version.?);
-    try std.testing.expectEqualStrings("chat", req.sec_websocket_protocol.?);
-    try std.testing.expectEqualStrings("permessage-deflate", req.sec_websocket_extensions.?);
-    try std.testing.expectEqualStrings("https://example.com", req.origin.?);
-    try std.testing.expectEqualStrings("example.com", req.host.?);
-}
-
-test "parseHandshakeRequest parses request line and websocket headers" {
-    const raw =
-        "GET /chat HTTP/1.1\r\n" ++
-        "Host: example.com\r\n" ++
-        "Connection: keep-alive, Upgrade\r\n" ++
-        "Upgrade: websocket\r\n" ++
-        "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" ++
-        "Sec-WebSocket-Version: 13\r\n" ++
-        "\r\n";
-    var reader = Io.Reader.fixed(raw);
-    const req = try parseHandshakeRequest(&reader);
-    try std.testing.expectEqualStrings("GET", req.method);
-    try std.testing.expect(req.is_http_11);
-    try std.testing.expectEqualStrings("example.com", req.host.?);
-    try std.testing.expectEqualStrings("keep-alive, Upgrade", req.connection.?);
-    try std.testing.expectEqualStrings("websocket", req.upgrade.?);
-    try std.testing.expectEqualStrings("dGhlIHNhbXBsZSBub25jZQ==", req.sec_websocket_key.?);
-    try std.testing.expectEqualStrings("13", req.sec_websocket_version.?);
-}
-
-test "parseHandshakeRequest rejects malformed input" {
-    {
-        var reader = Io.Reader.fixed("GET /chat HTTP/1.1\r\nbad-header\r\n\r\n");
-        try std.testing.expectError(error.BadRequest, parseHandshakeRequest(&reader));
-    }
-    {
-        var reader = Io.Reader.fixed("BROKEN\r\n\r\n");
-        try std.testing.expectError(error.BadRequest, parseHandshakeRequest(&reader));
-    }
 }
 
 test "buildClientHandshakeRequest toggles permessage-deflate header" {
