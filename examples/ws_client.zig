@@ -30,7 +30,7 @@ fn usage(io: Io) !void {
         \\  --help
         \\
         \\This example performs the HTTP websocket client handshake manually and
-        \\then switches to `zws.ClientConn` for frame/message I/O.
+        \\then switches to `zws.Conn.Client` for frame/message I/O.
         \\
     );
     try stdout.interface.flush();
@@ -85,10 +85,10 @@ pub fn main(init: std.process.Init) !void {
     const reply = try common.performClientHandshake(&sr.interface, &sw.interface, request);
 
     const negotiated_permessage_deflate = if (reply.selected_extensions) |header|
-        try zws.parsePerMessageDeflateFirst(header)
+        try zws.Extensions.parsePerMessageDeflateFirst(header)
     else
         null;
-    var conn = zws.ClientConn.init(&sr.interface, &sw.interface, .{
+    var conn = zws.Conn.Client.init(&sr.interface, &sw.interface, .{
         .permessage_deflate = if (negotiated_permessage_deflate) |pmd|
             .{
                 .allocator = init.gpa,

@@ -8,11 +8,11 @@
 
 The public exports in `src/root.zig` are the supported package API:
 
-- handshake types and functions
-- `ConnType`, `Conn`, `ServerConn`, `ClientConn`
+- `Handshake`
+- `Conn`
 - frame/message read and write helpers
-- `PerMessageDeflate` and `PerMessageDeflateConfig`
-- timeout and observability types (`TimeoutConfig`, `DefaultRuntimeHooks`, `ObserveEvent`)
+- `Extensions.PerMessageDeflate` and `Conn.PerMessageDeflateConfig`
+- timeout and observability types (`Observe.TimeoutConfig`, `Observe.DefaultRuntimeHooks`, `Observe.Event`)
 
 Within a patch release, those symbols and their documented semantics should not break.
 
@@ -20,7 +20,7 @@ Within a patch release, those symbols and their documented semantics should not 
 
 These areas are still allowed to evolve more aggressively before `1.0`:
 
-- the exact shape of `Config` and `StaticConfig` if a feature needs another field
+- the exact shape of `Conn.Config` and `Conn.StaticConfig` if a feature needs another field
 - compression tuning knobs beyond the negotiated `permessage-deflate` parameters
 - validation/build helper steps under `zig build`
 
@@ -63,11 +63,11 @@ The connection API assumes buffered I/O.
 
 ### Timeouts
 
-Timeouts are configured per connection through `Config.timeouts`.
+Timeouts are configured per connection through `Conn.Config.timeouts`.
 
 - `read_ns`, `write_ns`, and `flush_ns` bound individual blocking operations
-- `ConnTypeWithHooks(..., Hooks)` lets the embedding framework provide the elapsed-time source and deadline mapping
-- `Conn`, `ServerConn`, `ClientConn`, and plain handshake helpers use `DefaultRuntimeHooks`
+- `Conn.TypeWithHooks(..., Hooks)` lets the embedding framework provide the elapsed-time source and deadline mapping
+- `Conn.Default`, `Conn.Server`, `Conn.Client`, and plain handshake helpers use `Observe.DefaultRuntimeHooks`
 
 Without custom hooks, timeout enforcement is cooperative: the library can detect an operation ran longer than budget once that operation returns. With hook-provided deadline methods, the framework can map the same budget into socket or runtime deadlines so blocking I/O can fail promptly.
 
@@ -75,8 +75,8 @@ Without custom hooks, timeout enforcement is cooperative: the library can detect
 
 The library exposes an optional event stream through typed runtime hooks.
 
-- connection flows can use `ConnTypeWithHooks(.{ ... }, Hooks)` plus `initWithHooks(...)`
-- handshake-only flows can use `acceptServerHandshakeWithHooks(...)` and `serverHandshakeWithHooks(...)`
+- connection flows can use `Conn.TypeWithHooks(.{ ... }, Hooks)` plus `initWithHooks(...)`
+- handshake-only flows can use `Handshake.acceptServerHandshakeWithHooks(...)` and `Handshake.serverHandshakeWithHooks(...)`
 - hook types provide `nowNs`, `setReadDeadlineNs`, `setWriteDeadlineNs`, `setFlushDeadlineNs`, and `onEvent`
 
 Current event coverage includes:
@@ -93,14 +93,14 @@ Current event coverage includes:
 
 `permessage-deflate` is optional.
 
-- enable it during the handshake with `ServerHandshakeOptions.enable_permessage_deflate`
-- propagate the negotiated `ServerHandshakeResponse.permessage_deflate` into `Config.permessage_deflate`
+- enable it during the handshake with `Handshake.Options.enable_permessage_deflate`
+- propagate the negotiated `Handshake.Response.permessage_deflate` into `Conn.Config.permessage_deflate`
 - compressed message I/O uses `std.compress.flate` for RFC7692 framing and optional context-takeover support
-- compression remains disabled by default (`Config.permessage_deflate = null`)
-- outgoing compressed writes are opt-in (`PerMessageDeflateConfig.compress_outgoing = false` by default)
-- context takeover runtime support is disabled by default (`StaticConfig.permessage_deflate_context_takeover = false`)
-- enable takeover support by instantiating `ConnType(.{ .permessage_deflate_context_takeover = true, ... })`
-- when enabled, `StaticConfig` has conservative compile-time defaults:
+- compression remains disabled by default (`Conn.Config.permessage_deflate = null`)
+- outgoing compressed writes are opt-in (`Conn.PerMessageDeflateConfig.compress_outgoing = false` by default)
+- context takeover runtime support is disabled by default (`Conn.StaticConfig.permessage_deflate_context_takeover = false`)
+- enable takeover support by instantiating `Conn.Type(.{ .permessage_deflate_context_takeover = true, ... })`
+- when enabled, `Conn.StaticConfig` has conservative compile-time defaults:
   - `permessage_deflate_min_payload_len = 64`
   - `permessage_deflate_require_compression_gain = true`
 
@@ -119,7 +119,7 @@ For a real integration reference, use:
 
 - `examples/echo_server.zig` for a message-oriented raw-stream server
 - `examples/frame_echo_server.zig` for a frame-oriented raw-stream server
-- `examples/ws_client.zig` for a client-side handshake plus `ClientConn` flow
+- `examples/ws_client.zig` for a client-side handshake plus `Conn.Client` flow
 
 Production callers should still decide their own:
 

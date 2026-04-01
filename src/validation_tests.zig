@@ -10,7 +10,7 @@ fn fuzzMalformedFrames(_: void, smith: *std.testing.Smith) !void {
     var reader = Io.Reader.fixed(input_buf[0..len]);
     var sink: [256]u8 = undefined;
     var writer = Io.Writer.fixed(sink[0..]);
-    var conn = zws.Conn.init(&reader, &writer, .{});
+    var conn = zws.Conn.Default.init(&reader, &writer, .{});
     var scratch: [128]u8 = undefined;
 
     var steps: usize = 0;
@@ -52,7 +52,7 @@ test "property random client/server frame roundtrips preserve payload and opcode
         var out: [512]u8 = undefined;
         var client_writer = Io.Writer.fixed(out[0..]);
         var empty_reader = Io.Reader.fixed(""[0..]);
-        var client = zws.ClientConn.init(&empty_reader, &client_writer, .{});
+        var client = zws.Conn.Client.init(&empty_reader, &client_writer, .{});
         if (is_text) {
             try client.writeText(payload);
         } else {
@@ -62,10 +62,10 @@ test "property random client/server frame roundtrips preserve payload and opcode
         var server_reader = Io.Reader.fixed(out[0..client_writer.end]);
         var sink: [0]u8 = .{};
         var server_writer = Io.Writer.fixed(sink[0..]);
-        var server = zws.ServerConn.init(&server_reader, &server_writer, .{});
+        var server = zws.Conn.Server.init(&server_reader, &server_writer, .{});
         const frame = try server.readFrame(payload);
 
-        try std.testing.expectEqual(if (is_text) zws.Opcode.text else zws.Opcode.binary, frame.header.opcode);
+        try std.testing.expectEqual(if (is_text) zws.Protocol.Opcode.text else zws.Protocol.Opcode.binary, frame.header.opcode);
         try std.testing.expectEqualStrings(payload, frame.payload);
     }
 }
@@ -83,18 +83,18 @@ test "property random fragmented masked reads reconstruct message bytes" {
 
         var wire: std.ArrayList(u8) = .empty;
         defer wire.deinit(std.testing.allocator);
-        try test_support.appendTestFrame(zws.Opcode, &wire, std.testing.allocator, .binary, split_at == total_len, true, payload[0..split_at], .{ 1, 2, 3, 4 });
+        try test_support.appendTestFrame(zws.Protocol.Opcode, &wire, std.testing.allocator, .binary, split_at == total_len, true, payload[0..split_at], .{ 1, 2, 3, 4 });
         if (split_at != total_len) {
-            try test_support.appendTestFrame(zws.Opcode, &wire, std.testing.allocator, .continuation, true, true, payload[split_at..], .{ 5, 6, 7, 8 });
+            try test_support.appendTestFrame(zws.Protocol.Opcode, &wire, std.testing.allocator, .continuation, true, true, payload[split_at..], .{ 5, 6, 7, 8 });
         }
 
         var reader = Io.Reader.fixed(wire.items);
         var sink: [0]u8 = .{};
         var writer = Io.Writer.fixed(sink[0..]);
-        var conn = zws.ServerConn.init(&reader, &writer, .{});
+        var conn = zws.Conn.Server.init(&reader, &writer, .{});
         const message = try conn.readMessage(payload);
 
-        try std.testing.expectEqual(zws.MessageOpcode.binary, message.opcode);
+        try std.testing.expectEqual(zws.Protocol.MessageOpcode.binary, message.opcode);
         try std.testing.expectEqualSlices(u8, payload, message.payload);
     }
 }

@@ -44,12 +44,12 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void
     var sw = stream.writer(io, &write_buf);
 
     const req = common.parseHandshakeRequest(&sr.interface) catch return;
-    const accepted = zws.serverHandshake(&sw.interface, req, .{
+    const accepted = zws.Handshake.serverHandshake(&sw.interface, req, .{
         .enable_permessage_deflate = cfg.compression,
     }) catch return;
     sw.interface.flush() catch return;
 
-    var conn = zws.ServerConn.init(&sr.interface, &sw.interface, .{
+    var conn = zws.Conn.Server.init(&sr.interface, &sw.interface, .{
         .max_frame_payload_len = cfg.max_frame_payload_len,
         .permessage_deflate = if (accepted.permessage_deflate) |pmd|
             .{

@@ -3,7 +3,7 @@ const zws = @import("zwebsocket");
 const common = @import("zws_support_common");
 
 const Io = std.Io;
-const BenchConn = zws.ConnType(.{
+const BenchConn = zws.Conn.Type(.{
     .role = .server,
     .auto_pong = false,
     .auto_reply_close = false,
@@ -56,7 +56,7 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize, msg_size: usiz
     var sw = stream.writer(io, write_storage[0..write_buf_len]);
 
     const req = common.parseHandshakeRequest(&sr.interface) catch return;
-    _ = zws.serverHandshake(&sw.interface, req, .{}) catch return;
+    _ = zws.Handshake.serverHandshake(&sw.interface, req, .{}) catch return;
     sw.interface.flush() catch return;
 
     var conn = BenchConn.init(&sr.interface, &sw.interface, .{});

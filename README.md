@@ -14,8 +14,8 @@ Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame ho
 - 📦 **Low-allocation reads**: stream frames chunk-by-chunk, read full frames, or borrow buffered payload slices when they fit.
 - 🧠 **Strict protocol checks**: rejects malformed control frames, invalid close payloads, bad UTF-8, bad mask bits, and non-minimal extended lengths.
 - 🗜 **`permessage-deflate`**: handshake negotiation plus compressed message read/write support, with `server_no_context_takeover` and `client_no_context_takeover`.
-- 🧠 **Optional context takeover**: compile-time `ConnType` toggle (`permessage_deflate_context_takeover`) enables cross-message compression state when negotiated.
-- 🎛 **Per-message compression policy**: compile-time `ConnType` knobs decide when messages are compressed (`permessage_deflate_min_payload_len`, `permessage_deflate_require_compression_gain`).
+- 🧠 **Optional context takeover**: compile-time `Conn.Type` toggle (`permessage_deflate_context_takeover`) enables cross-message compression state when negotiated.
+- 🎛 **Per-message compression policy**: compile-time `Conn.Type` knobs decide when messages are compressed (`permessage_deflate_min_payload_len`, `permessage_deflate_require_compression_gain`).
 - ⏱ **Timeout hooks**: optional read, write, and flush time budgets with typed runtime hooks for framework-owned transports.
 - 👀 **Observability hooks**: optional typed event stream for handshakes, frame/message flow, control frames, protocol failures, and timeout events.
 - 🔁 **Convenience helpers**: `readMessage`, `echoFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, and `writeClose`.
@@ -30,7 +30,7 @@ const std = @import("std");
 const zws = @import("zwebsocket");
 
 fn runEcho(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
-    var conn = zws.ServerConn.init(reader, writer, .{});
+    var conn = zws.Conn.Server.init(reader, writer, .{});
     var scratch: [4096]u8 = undefined;
 
     while (true) {
@@ -46,8 +46,8 @@ fn runEcho(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
 For explicit handshake validation on a raw stream:
 
 ```zig
-const accepted = try zws.acceptServerHandshake(req, .{});
-try zws.writeServerHandshakeResponse(writer, accepted);
+const accepted = try zws.Handshake.acceptServerHandshake(req, .{});
+try zws.Handshake.writeServerHandshakeResponse(writer, accepted);
 ```
 
 For a full standalone echo server example:
@@ -62,7 +62,7 @@ For a frame-oriented echo server that stays on `echoFrame(...)`:
 zig build examples -Dexample=frame-echo-server -- --port=9002
 ```
 
-For a simple websocket client that performs the HTTP upgrade and then uses `zws.ClientConn`:
+For a simple websocket client that performs the HTTP upgrade and then uses `zws.Conn.Client`:
 
 ```bash
 zig build examples -Dexample=client -- --host=127.0.0.1 --port=9001 --message=hello
@@ -88,8 +88,8 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
 
 ## 🧩 Library API (At a Glance)
 
-- `zws.ConnType(.{ ... })` creates a websocket connection type specialized for a fixed role and policy set.
-- `zws.Conn`, `zws.ServerConn`, and `zws.ClientConn` are the common aliases.
+- `zws.Conn.Type(.{ ... })` creates a websocket connection type specialized for a fixed role and policy set.
+- `zws.Conn.Default`, `zws.Conn.Server`, and `zws.Conn.Client` are the common aliases.
 - Low-level read path:
   `beginFrame`, `readFrameChunk`, `readFrameAll`, `discardFrame`, `readFrameBorrowed`.
 - Convenience read path:
@@ -97,11 +97,11 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
 - Write path:
   `writeFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, `writeClose`, `flush`.
 - Handshake path:
-  `computeAcceptKey`, `acceptServerHandshake`, `writeServerHandshakeResponse`, `serverHandshake`.
+  `Handshake.computeAcceptKey`, `Handshake.acceptServerHandshake`, `Handshake.writeServerHandshakeResponse`, `Handshake.serverHandshake`.
 - Compression path:
-  `PerMessageDeflate`, `PerMessageDeflateConfig`, `ServerHandshakeResponse.permessage_deflate`, `Config.permessage_deflate`.
+  `Extensions.PerMessageDeflate`, `Conn.PerMessageDeflateConfig`, `Handshake.Response.permessage_deflate`, `Conn.Config.permessage_deflate`.
 - Runtime hooks:
-  `TimeoutConfig`, `DefaultRuntimeHooks`, `ConnTypeWithHooks(...)`, `acceptServerHandshakeWithHooks(...)`, `serverHandshakeWithHooks(...)`, `ObserveEvent`.
+  `Observe.TimeoutConfig`, `Observe.DefaultRuntimeHooks`, `Conn.TypeWithHooks(...)`, `Handshake.acceptServerHandshakeWithHooks(...)`, `Handshake.serverHandshakeWithHooks(...)`, `Observe.Event`.
 
 ## 📚 Docs
 
@@ -140,6 +140,7 @@ For benchmark details, see [`benchmark/README.md`](./benchmark/README.md).
 
 ```bash
 zig build test
+zig build bench -- --conns=1 --iters=2000 --warmup=100
 zig build interop
 zig build soak
 zig build validate
@@ -155,8 +156,8 @@ zig build bench-compare -Doptimize=ReleaseFast
 - Connection state is synchronous and stream-oriented.
 - `permessage-deflate` is implemented and negotiated when enabled.
 - Compression is disabled by default (`Config.permessage_deflate = null`).
-- Even when negotiated, outgoing compression is opt-in (`PerMessageDeflateConfig.compress_outgoing = false` by default).
-- Context takeover support is disabled by default (`StaticConfig.permessage_deflate_context_takeover = false`).
-- When enabled, `StaticConfig` defaults (`permessage_deflate_min_payload_len = 64`, `permessage_deflate_require_compression_gain = true`) skip tiny messages and avoid non-beneficial compression.
+- Even when negotiated, outgoing compression is opt-in (`Conn.PerMessageDeflateConfig.compress_outgoing = false` by default).
+- Context takeover support is disabled by default (`Conn.StaticConfig.permessage_deflate_context_takeover = false`).
+- When enabled, `Conn.StaticConfig` defaults (`permessage_deflate_min_payload_len = 64`, `permessage_deflate_require_compression_gain = true`) skip tiny messages and avoid non-beneficial compression.
 - No TLS or HTTP server framework is bundled; use the raw stream API or the example server as the integration point.
 - `permessage-deflate` framing is implemented with `std.compress.flate` (both non-takeover and optional context-takeover paths).

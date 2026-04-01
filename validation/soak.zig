@@ -123,10 +123,10 @@ fn runWorker(args: WorkerArgs) !void {
     const reply = try common.performClientHandshake(&sr.interface, &sw.interface, request);
 
     const negotiated = if (reply.selected_extensions) |header|
-        try zws.parsePerMessageDeflateFirst(header)
+        try zws.Extensions.parsePerMessageDeflateFirst(header)
     else
         null;
-    var conn = zws.ClientConn.init(&sr.interface, &sw.interface, .{
+    var conn = zws.Conn.Client.init(&sr.interface, &sw.interface, .{
         .permessage_deflate = if (negotiated) |pmd|
             .{
                 .allocator = std.heap.smp_allocator,

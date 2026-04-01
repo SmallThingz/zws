@@ -4,6 +4,11 @@ fn eql(a: []const u8, b: []const u8) bool {
     return std.mem.eql(u8, a, b);
 }
 
+fn makeNoOp(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = step;
+    _ = options;
+}
+
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -46,6 +51,15 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const install_bench = b.addInstallArtifact(bench_exe, .{});
+
+    const bench_runner_exe = b.addExecutable(.{
+        .name = "zwebsocket-bench-runner",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmark/run_bench.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
 
     const bench_server_exe = b.addExecutable(.{
         .name = "zwebsocket-bench-server",
@@ -173,12 +187,15 @@ pub fn build(b: *std.Build) void {
     install_step.dependOn(&install_interop_client.step);
     install_step.dependOn(&install_repeated_offer_client.step);
 
+    b.getUninstallStep().makeFn = makeNoOp;
+
     const test_step = b.step("test", "Run zwebsocket tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_support_tests.step);
 
-    const bench_run = b.addRunArtifact(bench_exe);
+    const bench_run = b.addRunArtifact(bench_runner_exe);
     bench_run.step.dependOn(&install_bench.step);
+    bench_run.step.dependOn(&install_bench_server.step);
     if (b.args) |args| bench_run.addArgs(args);
     const bench_step = b.step("bench", "Run the websocket benchmark client");
     bench_step.dependOn(&bench_run.step);

@@ -78,10 +78,10 @@ pub fn main(init: std.process.Init) !void {
     const reply = try common.performClientHandshake(&sr.interface, &sw.interface, request);
 
     const negotiated_permessage_deflate = if (reply.selected_extensions) |header|
-        try zws.parsePerMessageDeflateFirst(header)
+        try zws.Extensions.parsePerMessageDeflateFirst(header)
     else
         null;
-    const conn_cfg: zws.Config = .{
+    const conn_cfg: zws.Conn.Config = .{
         .permessage_deflate = if (negotiated_permessage_deflate) |pmd|
             .{
                 .allocator = init.gpa,
@@ -91,7 +91,7 @@ pub fn main(init: std.process.Init) !void {
         else
             null,
     };
-    var conn = zws.ClientConn.init(&sr.interface, &sw.interface, conn_cfg);
+    var conn = zws.Conn.Client.init(&sr.interface, &sw.interface, conn_cfg);
 
     const text_payload =
         "zwebsocket interop text payload with enough repetition to exercise permessage-deflate";

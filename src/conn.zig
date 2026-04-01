@@ -39,6 +39,8 @@ pub const ProtocolError = error{
     OutOfMemory,
 };
 
+pub const Error = ProtocolError;
+
 pub const StaticConfig = struct {
     role: Role = .server,
     auto_pong: bool = true,
@@ -113,6 +115,8 @@ const ParsedHeader = struct {
 pub fn Conn(comptime static: StaticConfig) type {
     return ConnWithHooks(static, observe.DefaultRuntimeHooks);
 }
+
+pub const Type = Conn;
 
 /// Creates a websocket connection type specialized for a fixed role, policy,
 /// and runtime hook implementation.
@@ -468,30 +472,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                 const header = try self.beginFrame();
                 if (proto.isControl(header.opcode)) {
                     const payload = try self.readFrameAll(control_buf[0..]);
-                    self.observeControlReceived(header.opcode, payload);
-                    switch (header.opcode) {
-                        .ping => if (comptime auto_pong) {
-                            if (!self.close_sent) {
-                                try self.writePong(payload);
-                                try self.flushAutoControlReply();
-                                self.emit(.{ .auto_pong_sent = .{ .payload_len = payload.len } });
-                            }
-                        },
-                        .pong => {},
-                        .close => {
-                            self.close_received = true;
-                            self.recv_fragment_opcode = null;
-                            self.recv_fragment_compressed = false;
-                            const close_frame = try parseClosePayload(payload, validate_utf8);
-                            if (comptime auto_reply_close) {
-                                if (!self.close_sent) {
-                                    try self.writeClose(close_frame.code, close_frame.reason);
-                                    try self.flushAutoControlReply();
-                                }
-                            }
-                            return error.ConnectionClosed;
-                        },
-                        else => unreachable,
+                    if (try self.handleControlFrame(header.opcode, payload, auto_reply_close, true)) {
+                        return error.ConnectionClosed;
                     }
                     continue;
                 }
@@ -511,8 +493,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
 
                     const frame_len = std.math.cast(usize, header.payload_len) orelse {
                         try self.discardFrame();
-                        if (try self.discardRemainingMessage()) return error.ConnectionClosed;
-                        return error.MessageTooLarge;
+                        return try self.failMessageTooLarge();
                     };
                     const start = list.items.len;
                     list.resize(compressionAllocator(self), start + frame_len) catch return error.OutOfMemory;
@@ -535,15 +516,13 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
 
                 if (header.payload_len > buf.len - total_len) {
                     try self.discardFrame();
-                    if (try self.discardRemainingMessage()) return error.ConnectionClosed;
-                    return error.MessageTooLarge;
+                    return try self.failMessageTooLarge();
                 }
                 const chunk = try self.readFrameAll(buf[total_len..]);
                 total_len += chunk.len;
 
                 if (total_len > self.config.max_message_payload_len) {
-                    if (try self.discardRemainingMessage()) return error.ConnectionClosed;
-                    return error.MessageTooLarge;
+                    return try self.failMessageTooLarge();
                 }
                 if (!header.fin) continue;
 
@@ -786,23 +765,10 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         fn echoFramePayload(self: *Self, header: FrameHeader, payload: []const u8) (ProtocolError || Io.Writer.Error)!EchoResult {
-            if (proto.isControl(header.opcode)) self.observeControlReceived(header.opcode, payload);
-            switch (header.opcode) {
-                .continuation, .text, .binary => try self.writeFrameInternal(header.opcode, payload, header.fin, header.compressed),
-                .ping => if (!self.close_sent) {
-                    try self.writeControlFrame(.pong, payload);
-                    self.emit(.{ .auto_pong_sent = .{ .payload_len = payload.len } });
-                },
-                .pong => {},
-                .close => {
-                    self.close_received = true;
-                    self.recv_fragment_opcode = null;
-                    self.recv_fragment_compressed = false;
-                    const close_frame = try parseClosePayload(payload, validate_utf8);
-                    if (!self.close_sent) {
-                        try self.writeClose(close_frame.code, close_frame.reason);
-                    }
-                },
+            if (proto.isControl(header.opcode)) {
+                _ = try self.handleControlFrame(header.opcode, payload, true, false);
+            } else {
+                try self.writeFrameInternal(header.opcode, payload, header.fin, header.compressed);
             }
             return .{
                 .opcode = header.opcode,
@@ -821,30 +787,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                 }
 
                 const payload = try self.readFrameAll(control_buf[0..]);
-                self.observeControlReceived(header.opcode, payload);
-                switch (header.opcode) {
-                    .ping => if (comptime auto_pong) {
-                        if (!self.close_sent) {
-                            try self.writePong(payload);
-                            try self.flushAutoControlReply();
-                            self.emit(.{ .auto_pong_sent = .{ .payload_len = payload.len } });
-                        }
-                    },
-                    .pong => {},
-                    .close => {
-                        self.close_received = true;
-                        self.recv_fragment_opcode = null;
-                        self.recv_fragment_compressed = false;
-                        const close_frame = try parseClosePayload(payload, validate_utf8);
-                        if (comptime auto_reply_close) {
-                            if (!self.close_sent) {
-                                try self.writeClose(close_frame.code, close_frame.reason);
-                                try self.flushAutoControlReply();
-                            }
-                        }
-                        return true;
-                    },
-                    else => unreachable,
+                if (try self.handleControlFrame(header.opcode, payload, auto_reply_close, true)) {
+                    return true;
                 }
             }
             return false;
@@ -862,6 +806,59 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             // bytes piggyback on this flush as well, so a pending write is pushed out on
             // the next incoming ping without requiring a separate explicit flush first.
             try self.flushTimed();
+        }
+
+        fn failMessageTooLarge(self: *Self) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!noreturn {
+            if (try self.discardRemainingMessage()) return error.ConnectionClosed;
+            return error.MessageTooLarge;
+        }
+
+        fn handleControlFrame(
+            self: *Self,
+            opcode: Opcode,
+            payload: []const u8,
+            comptime reply_close: bool,
+            comptime flush_reply: bool,
+        ) (ProtocolError || Io.Writer.Error)!bool {
+            self.observeControlReceived(opcode, payload);
+            switch (opcode) {
+                .ping => {
+                    try self.autoReplyPing(payload, flush_reply);
+                    return false;
+                },
+                .pong => return false,
+                .close => {
+                    try self.handleCloseFrame(payload, reply_close, flush_reply);
+                    return true;
+                },
+                else => unreachable,
+            }
+        }
+
+        fn autoReplyPing(self: *Self, payload: []const u8, comptime flush_reply: bool) (ProtocolError || Io.Writer.Error)!void {
+            if (comptime !auto_pong) return;
+            if (self.close_sent) return;
+            try self.writePong(payload);
+            if (comptime flush_reply) try self.flushAutoControlReply();
+            self.emit(.{ .auto_pong_sent = .{ .payload_len = payload.len } });
+        }
+
+        fn handleCloseFrame(
+            self: *Self,
+            payload: []const u8,
+            comptime reply_close: bool,
+            comptime flush_reply: bool,
+        ) (ProtocolError || Io.Writer.Error)!void {
+            self.close_received = true;
+            self.recv_fragment_opcode = null;
+            self.recv_fragment_compressed = false;
+            const close_frame = try parseClosePayload(payload, validate_utf8);
+            if (comptime reply_close) {
+                if (!self.close_sent) {
+                    try self.writeClose(close_frame.code, close_frame.reason);
+                    if (comptime flush_reply) try self.flushAutoControlReply();
+                }
+            }
         }
 
         fn inflateMessage(self: *Self, compressed_payload: []const u8, dest: []u8) ProtocolError![]u8 {
@@ -1001,6 +998,10 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
     };
 }
+
+pub const TypeWithHooks = ConnWithHooks;
+pub const Server = Conn(.{ .role = .server });
+pub const Client = Conn(.{ .role = .client });
 
 fn validateUtf8IfEnabled(comptime enabled: bool, payload: []const u8) ProtocolError!void {
     if (comptime enabled) {

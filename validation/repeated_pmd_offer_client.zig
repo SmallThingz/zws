@@ -61,8 +61,8 @@ pub fn main(init: std.process.Init) !void {
         selected_extensions,
     )) return error.BadHandshake;
 
-    const negotiated = (try zws.parsePerMessageDeflateFirst(selected_extensions)) orelse return error.BadHandshake;
-    var conn = zws.ClientConn.init(&sr.interface, &sw.interface, .{
+    const negotiated = (try zws.Extensions.parsePerMessageDeflateFirst(selected_extensions)) orelse return error.BadHandshake;
+    var conn = zws.Conn.Client.init(&sr.interface, &sw.interface, .{
         .permessage_deflate = .{
             .allocator = init.gpa,
             .negotiated = negotiated,

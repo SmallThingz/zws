@@ -3,71 +3,20 @@
 //! The hot-path API is `Conn`, which exposes:
 //! - low-level frame streaming (`beginFrame`, `readFrameChunk`, `readFrameAll`, `discardFrame`)
 //! - convenience helpers (`readFrame`, `readMessage`, `writeFrame`, `writeText`, `writeBinary`)
-//! - strict server handshake validation (`acceptServerHandshake`, `writeServerHandshakeResponse`)
+//! - strict server handshake validation (`Handshake.acceptServerHandshake`, `Handshake.writeServerHandshakeResponse`)
 //!
-//! `ConnType` exposes the comptime-specialized connection type constructor.
-//! `Conn`, `ServerConn`, and `ClientConn` are convenient aliases for common
-//! configurations.
-const proto = @import("protocol.zig");
-const handshake = @import("handshake.zig");
-const conn = @import("conn.zig");
-const extensions = @import("extensions.zig");
-const observe = @import("observe.zig");
+//! `Conn.Type` exposes the comptime-specialized connection type constructor.
+//! `Conn.Default`, `Conn.Server`, and `Conn.Client` are convenient aliases for
+//! common configurations. Supporting protocol/extension/observe types live
+//! under `Protocol`, `Extensions`, and `Observe`.
 const std = @import("std");
 const builtin = @import("builtin");
 
-pub const Role = proto.Role;
-pub const Opcode = proto.Opcode;
-pub const MessageOpcode = proto.MessageOpcode;
-pub const CloseCode = proto.CloseCode;
-pub const isControl = proto.isControl;
-pub const isData = proto.isData;
-pub const isValidCloseCode = proto.isValidCloseCode;
-
-pub const Header = handshake.Header;
-pub const ServerHandshakeRequest = handshake.ServerHandshakeRequest;
-pub const ServerHandshakeOptions = handshake.ServerHandshakeOptions;
-pub const ServerHandshakeResponse = handshake.ServerHandshakeResponse;
-pub const HandshakeError = handshake.HandshakeError;
-pub const TimeoutConfig = observe.TimeoutConfig;
-pub const DefaultRuntimeHooks = observe.DefaultRuntimeHooks;
-pub const IoPhase = observe.IoPhase;
-pub const ObserveEvent = observe.Event;
-pub const ObserveFrameEvent = observe.FrameEvent;
-pub const ObserveMessageEvent = observe.MessageEvent;
-pub const ObservePayloadEvent = observe.PayloadEvent;
-pub const ObserveCloseEvent = observe.CloseEvent;
-pub const ObserveTimeoutEvent = observe.TimeoutEvent;
-pub const ObserveErrorEvent = observe.ErrorEvent;
-pub const ObserveHandshakeAcceptedEvent = observe.HandshakeAcceptedEvent;
-pub const PerMessageDeflate = extensions.PerMessageDeflate;
-pub const PerMessageDeflateOfferIterator = extensions.PerMessageDeflateOfferIterator;
-pub const offersPerMessageDeflate = extensions.offersPerMessageDeflate;
-pub const parsePerMessageDeflate = extensions.parsePerMessageDeflate;
-pub const parsePerMessageDeflateFirst = extensions.parsePerMessageDeflateFirst;
-pub const computeAcceptKey = handshake.computeAcceptKey;
-pub const acceptServerHandshake = handshake.acceptServerHandshake;
-pub const acceptServerHandshakeWithHooks = handshake.acceptServerHandshakeWithHooks;
-pub const writeServerHandshakeResponse = handshake.writeServerHandshakeResponse;
-pub const serverHandshake = handshake.serverHandshake;
-pub const serverHandshakeWithHooks = handshake.serverHandshakeWithHooks;
-
-pub const StaticConfig = conn.StaticConfig;
-pub const Config = conn.Config;
-pub const PerMessageDeflateConfig = conn.PerMessageDeflateConfig;
-pub const ProtocolError = conn.ProtocolError;
-pub const FrameHeader = conn.FrameHeader;
-pub const Frame = conn.Frame;
-pub const Message = conn.Message;
-pub const CloseFrame = conn.CloseFrame;
-pub const BorrowedFrame = conn.BorrowedFrame;
-pub const EchoResult = conn.EchoResult;
-pub const ConnType = conn.Conn;
-pub const ConnTypeWithHooks = conn.ConnWithHooks;
-pub const Conn = conn.Conn(.{});
-pub const ServerConn = conn.Conn(.{ .role = .server });
-pub const ClientConn = conn.Conn(.{ .role = .client });
-pub const parseClosePayload = conn.parseClosePayload;
+pub const Protocol = @import("protocol.zig");
+pub const Handshake = @import("handshake.zig");
+pub const Observe = @import("observe.zig");
+pub const Extensions = @import("extensions.zig");
+pub const Conn = @import("conn.zig");
 
 pub fn fuzz(
     context: anytype,
@@ -171,13 +120,17 @@ test "fuzz replays every provided corpus input in non-fuzz builds" {
 }
 
 test "public type aliases resolve to the specialized core implementations" {
-    try std.testing.expectEqualStrings(@typeName(ConnType(.{})), @typeName(Conn));
-    try std.testing.expectEqualStrings(@typeName(ConnType(.{ .role = .server })), @typeName(ServerConn));
-    try std.testing.expectEqualStrings(@typeName(ConnType(.{ .role = .client })), @typeName(ClientConn));
+    try std.testing.expectEqualStrings(@typeName(Conn.Conn(.{})), @typeName(Conn.Default));
+    try std.testing.expectEqualStrings(@typeName(Conn.Conn(.{ .role = .server })), @typeName(Conn.Server));
+    try std.testing.expectEqualStrings(@typeName(Conn.Conn(.{ .role = .client })), @typeName(Conn.Client));
     try std.testing.expectEqualStrings(
-        @typeName(conn.ConnWithHooks(.{}, observe.DefaultRuntimeHooks)),
-        @typeName(ConnTypeWithHooks(.{}, observe.DefaultRuntimeHooks)),
+        @typeName(Conn.ConnWithHooks(.{}, Observe.DefaultRuntimeHooks)),
+        @typeName(Conn.TypeWithHooks(.{}, Observe.DefaultRuntimeHooks)),
     );
+    try std.testing.expectEqualStrings(@typeName(Conn.Config), @typeName(Conn.Config));
+    try std.testing.expectEqualStrings(@typeName(Conn.Frame), @typeName(Conn.Frame));
+    try std.testing.expectEqualStrings(@typeName(Observe.Event), @typeName(Observe.Event));
+    try std.testing.expectEqualStrings(@typeName(Observe.TimeoutConfig), @typeName(Observe.TimeoutConfig));
 }
 
 test {

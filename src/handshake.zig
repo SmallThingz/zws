@@ -8,7 +8,7 @@ pub const Header = struct {
     value: []const u8,
 };
 
-pub const ServerHandshakeRequest = struct {
+pub const Request = struct {
     method: []const u8,
     is_http_11: bool,
     connection: ?[]const u8 = null,
@@ -21,7 +21,7 @@ pub const ServerHandshakeRequest = struct {
     host: ?[]const u8 = null,
 };
 
-pub const ServerHandshakeOptions = struct {
+pub const Options = struct {
     selected_subprotocol: ?[]const u8 = null,
     reject_extensions: bool = false,
     enable_permessage_deflate: bool = false,
@@ -29,7 +29,7 @@ pub const ServerHandshakeOptions = struct {
     extra_headers: []const Header = &.{},
 };
 
-pub const ServerHandshakeResponse = struct {
+pub const Response = struct {
     accept_key: [28]u8,
     selected_subprotocol: ?[]const u8,
     selected_extensions: ?[]const u8 = null,
@@ -37,7 +37,7 @@ pub const ServerHandshakeResponse = struct {
     extra_headers: []const Header,
 };
 
-pub const HandshakeError = error{
+pub const Error = error{
     MethodNotGet,
     HttpVersionNotSupported,
     MissingConnectionHeader,
@@ -102,7 +102,7 @@ fn perMessageDeflateOfferScore(
     return score;
 }
 
-pub fn computeAcceptKey(client_key: []const u8) HandshakeError![28]u8 {
+pub fn computeAcceptKey(client_key: []const u8) Error![28]u8 {
     if (!validateClientKey(client_key)) return error.InvalidWebSocketKey;
 
     var sha1 = std.crypto.hash.Sha1.init(.{});
@@ -118,18 +118,18 @@ pub fn computeAcceptKey(client_key: []const u8) HandshakeError![28]u8 {
 }
 
 pub fn acceptServerHandshake(
-    req: ServerHandshakeRequest,
-    opts: ServerHandshakeOptions,
-) HandshakeError!ServerHandshakeResponse {
+    req: Request,
+    opts: Options,
+) Error!Response {
     var hooks: observe.DefaultRuntimeHooks = .{};
     return acceptServerHandshakeWithHooks(req, opts, &hooks);
 }
 
 pub fn acceptServerHandshakeWithHooks(
-    req: ServerHandshakeRequest,
-    opts: ServerHandshakeOptions,
+    req: Request,
+    opts: Options,
     hooks: anytype,
-) HandshakeError!ServerHandshakeResponse {
+) Error!Response {
     if (!std.mem.eql(u8, req.method, "GET")) return rejectHandshake(hooks, error.MethodNotGet);
     if (!req.is_http_11) return rejectHandshake(hooks, error.HttpVersionNotSupported);
 
@@ -178,7 +178,7 @@ pub fn acceptServerHandshakeWithHooks(
         return rejectHandshake(hooks, err);
     };
 
-    const response: ServerHandshakeResponse = .{
+    const response: Response = .{
         .accept_key = accept_key,
         .selected_subprotocol = opts.selected_subprotocol,
         .selected_extensions = if (negotiated_permessage_deflate) |pmd| pmd.responseHeaderValue() else null,
@@ -195,7 +195,7 @@ pub fn acceptServerHandshakeWithHooks(
 
 pub fn writeServerHandshakeResponse(
     writer: *Io.Writer,
-    response: ServerHandshakeResponse,
+    response: Response,
 ) Io.Writer.Error!void {
     try writer.writeAll("HTTP/1.1 101 Switching Protocols\r\n");
     try writer.writeAll("upgrade: websocket\r\n");
@@ -228,30 +228,30 @@ pub fn writeServerHandshakeResponse(
 
 pub fn serverHandshake(
     writer: *Io.Writer,
-    req: ServerHandshakeRequest,
-    opts: ServerHandshakeOptions,
-) (HandshakeError || Io.Writer.Error)!ServerHandshakeResponse {
+    req: Request,
+    opts: Options,
+) (Error || Io.Writer.Error)!Response {
     var hooks: observe.DefaultRuntimeHooks = .{};
     return serverHandshakeWithHooks(writer, req, opts, &hooks);
 }
 
 pub fn serverHandshakeWithHooks(
     writer: *Io.Writer,
-    req: ServerHandshakeRequest,
-    opts: ServerHandshakeOptions,
+    req: Request,
+    opts: Options,
     hooks: anytype,
-) (HandshakeError || Io.Writer.Error)!ServerHandshakeResponse {
+) (Error || Io.Writer.Error)!Response {
     const response = try acceptServerHandshakeWithHooks(req, opts, hooks);
     try writeServerHandshakeResponse(writer, response);
     return response;
 }
 
-fn rejectHandshake(hooks: anytype, err: HandshakeError) HandshakeError {
+fn rejectHandshake(hooks: anytype, err: Error) Error {
     hooks.onEvent(.{ .handshake_rejected = .{ .name = @errorName(err) } });
     return err;
 }
 
-fn validRequest() ServerHandshakeRequest {
+fn validRequest() Request {
     return .{
         .method = "GET",
         .is_http_11 = true,

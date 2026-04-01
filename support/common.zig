@@ -39,7 +39,7 @@ pub fn setTcpNoDelay(stream: *const std.Io.net.Stream) void {
     ) catch {};
 }
 
-pub fn assignHandshakeHeader(req: *zws.ServerHandshakeRequest, name: []const u8, value: []const u8) void {
+pub fn assignHandshakeHeader(req: *zws.Handshake.Request, name: []const u8, value: []const u8) void {
     if (std.ascii.eqlIgnoreCase(name, "connection")) {
         req.connection = value;
     } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
@@ -59,7 +59,7 @@ pub fn assignHandshakeHeader(req: *zws.ServerHandshakeRequest, name: []const u8,
     }
 }
 
-pub fn parseHandshakeRequest(r: *Io.Reader) !zws.ServerHandshakeRequest {
+pub fn parseHandshakeRequest(r: *Io.Reader) !zws.Handshake.Request {
     const line0_incl = try r.takeDelimiterInclusive('\n');
     const line0 = line0_incl[0 .. line0_incl.len - 1];
     const request_line = trimCR(line0);
@@ -68,7 +68,7 @@ pub fn parseHandshakeRequest(r: *Io.Reader) !zws.ServerHandshakeRequest {
     const sp2_rel = std.mem.indexOfScalar(u8, request_line[sp1 + 1 ..], ' ') orelse return error.BadRequest;
     const sp2 = sp1 + 1 + sp2_rel;
 
-    var req: zws.ServerHandshakeRequest = .{
+    var req: zws.Handshake.Request = .{
         .method = request_line[0..sp1],
         .is_http_11 = std.mem.eql(u8, request_line[sp2 + 1 ..], "HTTP/1.1"),
     };
@@ -85,7 +85,7 @@ pub fn parseHandshakeRequest(r: *Io.Reader) !zws.ServerHandshakeRequest {
     return req;
 }
 
-pub fn closeForProtocolError(conn: *zws.ServerConn, writer: *Io.Writer, err: anyerror) void {
+pub fn closeForProtocolError(conn: *zws.Conn.Server, writer: *Io.Writer, err: anyerror) void {
     const close_code: ?u16 = switch (err) {
         error.MessageTooLarge, error.FrameTooLarge => 1009,
         error.InvalidUtf8 => 1007,
@@ -160,7 +160,7 @@ pub fn performClientHandshake(sr: *Io.Reader, sw: *Io.Writer, request: []const u
         }
     }
 
-    const expected = try zws.computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ==");
+    const expected = try zws.Handshake.computeAcceptKey("dGhlIHNhbXBsZSBub25jZQ==");
     if (reply.accept_key == null or !std.mem.eql(u8, reply.accept_key.?, expected[0..])) {
         return error.BadHandshake;
     }
@@ -188,7 +188,7 @@ test "trimCR and trimSpaces normalize header text" {
 }
 
 test "assignHandshakeHeader maps known websocket headers case-insensitively" {
-    var req: zws.ServerHandshakeRequest = .{
+    var req: zws.Handshake.Request = .{
         .method = "GET",
         .is_http_11 = true,
     };
@@ -292,7 +292,7 @@ test "closeForProtocolError maps protocol failures to close frames" {
     var empty_reader = Io.Reader.fixed(""[0..]);
     var out: [64]u8 = undefined;
     var writer = Io.Writer.fixed(out[0..]);
-    var conn = zws.ServerConn.init(&empty_reader, &writer, .{});
+    var conn = zws.Conn.Server.init(&empty_reader, &writer, .{});
 
     closeForProtocolError(&conn, &writer, error.InvalidUtf8);
     try std.testing.expectEqual(@as(usize, 4), writer.end);
@@ -304,7 +304,7 @@ test "closeForProtocolError maps protocol failures to close frames" {
     var empty_reader_2 = Io.Reader.fixed(""[0..]);
     var out_2: [16]u8 = undefined;
     var writer_2 = Io.Writer.fixed(out_2[0..]);
-    var conn_2 = zws.ServerConn.init(&empty_reader_2, &writer_2, .{});
+    var conn_2 = zws.Conn.Server.init(&empty_reader_2, &writer_2, .{});
     closeForProtocolError(&conn_2, &writer_2, error.OutOfMemory);
     try std.testing.expectEqual(@as(usize, 0), writer_2.end);
 }
