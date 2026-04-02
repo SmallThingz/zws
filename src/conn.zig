@@ -131,6 +131,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
     const MaskPrngField = if (sends_masked) std.Random.DefaultPrng else void;
     const RecvMaskField = if (expects_masked) [mask_len]u8 else void;
     const RecvMaskOffsetField = if (expects_masked) usize else void;
+    const RecvFragmentCompressedField = if (supports_permessage_deflate) bool else void;
     const SendTakeoverField = if (supports_permessage_deflate and permessage_deflate_context_takeover) ?flate_backend.TakeoverDeflater else void;
     const RecvTakeoverField = if (supports_permessage_deflate and permessage_deflate_context_takeover) ?flate_backend.TakeoverInflater else void;
     if (comptime runtime_hooks) observe.validateHooks(Hooks);
@@ -150,7 +151,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         recv_mask: RecvMaskField = if (expects_masked) .{0} ** mask_len else {},
         recv_mask_offset: RecvMaskOffsetField = if (expects_masked) 0 else {},
         recv_fragment_opcode: ?MessageOpcode = null,
-        recv_fragment_compressed: bool = false,
+        recv_fragment_compressed: RecvFragmentCompressedField = if (supports_permessage_deflate) false else {},
 
         send_fragment_opcode: ?MessageOpcode = null,
         close_sent: bool = false,
@@ -431,7 +432,10 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                     continue;
                 }
 
-                if (!parsed.header.fin or parsed.header.compressed or parsed.header.opcode == .continuation) return null;
+                if (!parsed.header.fin or parsed.header.opcode == .continuation) return null;
+                if (comptime supports_permessage_deflate) {
+                    if (parsed.header.compressed) return null;
+                }
 
                 const message_opcode = proto.messageOpcode(parsed.header.opcode) orelse return null;
                 const payload_len: usize = std.math.cast(usize, parsed.header.payload_len) orelse return null;
@@ -457,7 +461,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         pub fn readMessage(self: *Self, buf: []u8) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!Message {
             var total_len: usize = 0;
             var message_opcode: ?MessageOpcode = self.recv_fragment_opcode;
-            var message_compressed = self.recv_fragment_compressed;
+            var message_compressed = if (supports_permessage_deflate) self.recv_fragment_compressed else false;
             var compressed_payload: ?std.ArrayList(u8) = null;
             defer if (compressed_payload) |*list| list.deinit(compressionAllocator(self));
             var control_buf: [control_payload_max_len]u8 = undefined;
@@ -474,7 +478,9 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
 
                 if (message_opcode == null) {
                     message_opcode = proto.messageOpcode(header.opcode) orelse unreachable;
-                    message_compressed = header.compressed;
+                    if (comptime supports_permessage_deflate) {
+                        message_compressed = header.compressed;
+                    }
                 }
 
                 if (message_compressed) {
@@ -840,7 +846,9 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         ) (ProtocolError || Io.Writer.Error)!void {
             self.close_received = true;
             self.recv_fragment_opcode = null;
-            self.recv_fragment_compressed = false;
+            if (comptime supports_permessage_deflate) {
+                self.recv_fragment_compressed = false;
+            }
             const close_frame = try parseClosePayload(payload, validate_utf8);
             if (comptime reply_close) {
                 if (!self.close_sent) {
@@ -971,15 +979,21 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             if (!header.fin) {
                 if (proto.messageOpcode(header.opcode)) |message_opcode| {
                     self.recv_fragment_opcode = message_opcode;
-                    self.recv_fragment_compressed = header.compressed;
+                    if (comptime supports_permessage_deflate) {
+                        self.recv_fragment_compressed = header.compressed;
+                    }
                 }
                 return;
             }
             if (header.opcode == .continuation) {
                 self.recv_fragment_opcode = null;
-                self.recv_fragment_compressed = false;
+                if (comptime supports_permessage_deflate) {
+                    self.recv_fragment_compressed = false;
+                }
             } else if (proto.isData(header.opcode)) {
-                self.recv_fragment_compressed = false;
+                if (comptime supports_permessage_deflate) {
+                    self.recv_fragment_compressed = false;
+                }
             }
         }
 

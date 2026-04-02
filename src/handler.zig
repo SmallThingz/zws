@@ -362,6 +362,7 @@ fn runAsync(
 }
 
 fn beginMessageStream(c: anytype) anyerror!MessageStart {
+    const ConnType = pointerChildType(@TypeOf(c), "c");
     var control_buf: [125]u8 = undefined;
     while (true) {
         const header = try c.beginFrame();
@@ -371,7 +372,9 @@ fn beginMessageStream(c: anytype) anyerror!MessageStart {
             continue;
         }
         const opcode = proto.messageOpcode(header.opcode) orelse return error.UnexpectedContinuation;
-        if (header.compressed) return error.InvalidCompressedMessage;
+        if (comptime ConnType.static_config.supports_permessage_deflate) {
+            if (header.compressed) return error.InvalidCompressedMessage;
+        }
         return .{
             .opcode = opcode,
             .fin = header.fin,
