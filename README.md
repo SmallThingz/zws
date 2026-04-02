@@ -170,15 +170,16 @@ ROUNDS=2 BENCH_TIMEOUT_MS=120000 ZWS_DEADLINE_MS=30000 UWS_DEADLINE_MS=30000 zig
 
 Source: `benchmark/results/latest.json`
 
-Config: host=`127.0.0.1` path=`/` rounds=1 single_conns=1 multi_conns=16 iters=60000 warmup=5000 pipeline_depth=8 msg_size=16 bench_timeout_ms=120000 zws_deadline_ms=30000 uws_deadline_ms=30000
+Config: host=`127.0.0.1` path=`/` rounds=1 single_conns=1 multi_conns=16 iters=10000 warmup=1000 pipeline_depth=8 msg_size=16 bench_timeout_ms=120000 zws_deadline_ms=30000 uws_deadline_ms=30000
 
-| Suite | zws-sync | zws-sync+dl | zws-async | zws-async+dl | uWS-sync | uWS-sync+dl | uWS-async | uWS-async+dl |
-|---|---:|---:|---:|---:|---:|---:|---:|---:|
-| single / non-pipelined | 136910.51 | 162568.63 | 28263.64 | 76404.61 | 155372.38 | 139337.31 | 136973.65 | 103428.53 |
-| single / pipelined | 812394.22 | 787715.82 | 195596.69 | 195317.06 | 929998.54 | 793077.64 | 406430.71 | 432947.74 |
-| multi / non-pipelined | 856857.09 | 829669.27 | 275267.27 | 340137.29 | 404832.23 | 410253.08 | 358696.10 | 340278.46 |
-| multi / pipelined | 5138470.71 | 4857316.75 | 1011156.32 | 961521.95 | 2976591.34 | 2939704.74 | 524228.10 | 521011.75 |
+| Suite | sync | sync+dl | async | async+dl |
+|---|---:|---:|---:|---:|
+| single / non-pipelined | -21.17% | -22.46% | +20.14% | +64.72% |
+| single / pipelined | -27.17% | +38.84% | +149.73% | +101.16% |
+| multi / non-pipelined | +124.03% | +372.37% | +211.12% | +150.70% |
+| multi / pipelined | +116.61% | +93.45% | +985.90% | +734.63% |
 
+Values show `zws` vs matching `uWS` throughput delta.
 Fairness notes: all peers use the same benchmark client, identical per-suite client settings, and the matrix runs strict interleaved rounds for every peer inside each suite.
 <!-- BENCH_COMPARE:END -->
 

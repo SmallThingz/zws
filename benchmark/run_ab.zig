@@ -400,6 +400,65 @@ fn renderResultsMarkdown(
     return out.toOwnedSlice();
 }
 
+fn renderComparisonMarkdown(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    results: []const SuiteResult,
+    source_json_rel_path: []const u8,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+
+    try w.print("Source: `{s}`\n\n", .{source_json_rel_path});
+    try w.print(
+        "Config: host=`{s}` path=`{s}` rounds={d} single_conns={d} multi_conns={d} iters={d} warmup={d} pipeline_depth={d} msg_size={d} bench_timeout_ms={d} zws_deadline_ms={d} uws_deadline_ms={d}\n\n",
+        .{
+            cfg.host,
+            cfg.path,
+            cfg.rounds,
+            cfg.single_conns,
+            cfg.multi_conns,
+            cfg.iters,
+            cfg.warmup,
+            cfg.pipelined_depth,
+            cfg.msg_size,
+            cfg.bench_timeout_ms,
+            cfg.zws_deadline_ms,
+            cfg.uws_deadline_ms,
+        },
+    );
+    try w.writeAll("| Suite | sync | sync+dl | async | async+dl |\n");
+    try w.writeAll("|---|---:|---:|---:|---:|\n");
+    for (results) |result| {
+        try w.print("| {s} | ", .{result.suite.label});
+        try writeDeltaCell(w, result.averages[0], result.averages[4]);
+        try w.writeAll(" | ");
+        try writeDeltaCell(w, result.averages[1], result.averages[5]);
+        try w.writeAll(" | ");
+        try writeDeltaCell(w, result.averages[2], result.averages[6]);
+        try w.writeAll(" | ");
+        try writeDeltaCell(w, result.averages[3], result.averages[7]);
+        try w.writeAll(" |\n");
+    }
+    try w.writeAll("\nValues show `zws` vs matching `uWS` throughput delta.\n");
+    try w.writeAll("Fairness notes: all peers use the same benchmark client, identical per-suite client settings, and the matrix runs strict interleaved rounds for every peer inside each suite.\n");
+    return out.toOwnedSlice();
+}
+
+fn writeDeltaCell(writer: *std.Io.Writer, ours: f64, theirs: f64) !void {
+    if (theirs == 0 or !std.math.isFinite(ours) or !std.math.isFinite(theirs)) {
+        try writer.writeAll("n/a");
+        return;
+    }
+    const delta = ((ours / theirs) - 1.0) * 100.0;
+    if (delta >= 0) {
+        try writer.print("+{d:.2}%", .{delta});
+    } else {
+        try writer.print("{d:.2}%", .{delta});
+    }
+}
+
 fn writeArtifacts(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -410,8 +469,10 @@ fn writeArtifacts(
 ) !void {
     const full_md = try renderResultsMarkdown(allocator, cfg, peers, results, "benchmark/results/latest.json", true);
     defer allocator.free(full_md);
-    const summary_md = try renderResultsMarkdown(allocator, cfg, peers, results, "benchmark/results/latest.json", false);
-    defer allocator.free(summary_md);
+    const benchmark_summary_md = try renderResultsMarkdown(allocator, cfg, peers, results, "benchmark/results/latest.json", false);
+    defer allocator.free(benchmark_summary_md);
+    const root_summary_md = try renderComparisonMarkdown(allocator, cfg, results, "benchmark/results/latest.json");
+    defer allocator.free(root_summary_md);
 
     const snapshot: ReadmeSnapshot = .{
         .generated_awake_ns = nowAwakeNs(io),
@@ -456,7 +517,15 @@ fn writeArtifacts(
     };
     try json_stream.write(snapshot);
 
-    try scripts.writeCompareArtifactsAndSyncReadme(io, allocator, root, summary_md, full_md, json_writer.written());
+    try scripts.writeCompareArtifactsAndSyncReadme(
+        io,
+        allocator,
+        root,
+        root_summary_md,
+        benchmark_summary_md,
+        full_md,
+        json_writer.written(),
+    );
 }
 
 fn runSuite(

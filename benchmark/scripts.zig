@@ -163,7 +163,13 @@ fn updateReadmeSectionAtPath(
     _ = try writeFileIfChanged(io, allocator, path, out.items);
 }
 
-fn syncReadmes(io: std.Io, allocator: std.mem.Allocator, root: []const u8, replacement: []const u8) !void {
+fn syncReadmes(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    root_replacement: []const u8,
+    benchmark_replacement: []const u8,
+) !void {
     const root_readme_path = try std.fs.path.join(allocator, &.{ root, "README.md" });
     defer allocator.free(root_readme_path);
     try updateReadmeSectionAtPath(
@@ -172,7 +178,7 @@ fn syncReadmes(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repla
         root_readme_path,
         RootReadmeBenchCompareStartMarker,
         RootReadmeBenchCompareEndMarker,
-        replacement,
+        root_replacement,
     );
 
     const benchmark_readme_path = try std.fs.path.join(allocator, &.{ root, "benchmark", "README.md" });
@@ -183,7 +189,7 @@ fn syncReadmes(io: std.Io, allocator: std.mem.Allocator, root: []const u8, repla
         benchmark_readme_path,
         BenchmarkReadmeBenchCompareStartMarker,
         BenchmarkReadmeBenchCompareEndMarker,
-        replacement,
+        benchmark_replacement,
     );
 }
 
@@ -191,7 +197,8 @@ pub fn writeCompareArtifactsAndSyncReadme(
     io: std.Io,
     allocator: std.mem.Allocator,
     root: []const u8,
-    summary_md: []const u8,
+    root_summary_md: []const u8,
+    benchmark_summary_md: []const u8,
     full_md: []const u8,
     json: []const u8,
 ) !void {
@@ -207,5 +214,5 @@ pub fn writeCompareArtifactsAndSyncReadme(
     defer allocator.free(md_path);
     _ = try writeFileIfChanged(io, allocator, md_path, full_md);
 
-    try syncReadmes(io, allocator, root, summary_md);
+    try syncReadmes(io, allocator, root, root_summary_md, benchmark_summary_md);
 }
