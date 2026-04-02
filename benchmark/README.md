@@ -55,10 +55,10 @@ Config: host=`127.0.0.1` path=`/` rounds=1 single_conns=1 multi_conns=16 iters=1
 
 | Suite | zws-sync | zws-sync+dl | zws-async | zws-async+dl | uWS-sync | uWS-sync+dl | uWS-async | uWS-async+dl |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| single / non-pipelined | 131045.62 | 107044.58 | 171256.69 | 176494.15 | 166233.09 | 138049.91 | 142549.87 | 107145.61 |
-| single / pipelined | 647469.71 | 985602.03 | 962860.82 | 807887.24 | 888976.92 | 709880.70 | 385566.89 | 401616.60 |
-| multi / non-pipelined | 908431.30 | 856306.59 | 901715.15 | 765390.24 | 405491.84 | 181278.08 | 289830.35 | 305299.79 |
-| multi / pipelined | 5683084.16 | 4673606.43 | 5488460.46 | 3831580.03 | 2623667.55 | 2415958.07 | 505431.36 | 459077.08 |
+| single / non-pipelined | 139085.54 | 128635.18 | 161432.17 | 167977.58 | 119853.35 | 167902.59 | 122270.87 | 122840.95 |
+| single / pipelined | 392443.38 | 813879.58 | 1017902.46 | 909408.29 | 975390.60 | 725284.66 | 319092.63 | 398577.84 |
+| multi / non-pipelined | 765231.80 | 733158.93 | 804311.41 | 732028.01 | 404972.05 | 416493.72 | 378398.48 | 374977.17 |
+| multi / pipelined | 5271946.61 | 4381020.89 | 5369743.96 | 4864972.39 | 2914964.83 | 2734686.85 | 548342.21 | 532420.56 |
 
 Fairness notes: all peers use the same benchmark client, identical per-suite client settings, and the matrix runs strict interleaved rounds for every peer inside each suite.
 <!-- BENCH_COMPARE:END -->

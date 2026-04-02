@@ -174,10 +174,10 @@ Config: host=`127.0.0.1` path=`/` rounds=1 single_conns=1 multi_conns=16 iters=1
 
 | Suite | sync | sync+dl | async | async+dl |
 |---|---:|---:|---:|---:|
-| single / non-pipelined | -21.17% | -22.46% | +20.14% | +64.72% |
-| single / pipelined | -27.17% | +38.84% | +149.73% | +101.16% |
-| multi / non-pipelined | +124.03% | +372.37% | +211.12% | +150.70% |
-| multi / pipelined | +116.61% | +93.45% | +985.90% | +734.63% |
+| single / non-pipelined | +16.05% | -23.39% | +32.03% | +36.74% |
+| single / pipelined | -59.77% | +12.22% | +219.00% | +128.16% |
+| multi / non-pipelined | +88.96% | +76.03% | +112.56% | +95.22% |
+| multi / pipelined | +80.86% | +60.20% | +879.27% | +813.75% |
 
 Values show `zws` vs matching `uWS` throughput delta.
 Fairness notes: all peers use the same benchmark client, identical per-suite client settings, and the matrix runs strict interleaved rounds for every peer inside each suite.
