@@ -798,6 +798,7 @@ fn AsyncShared(comptime ConnType: type) type {
             defer self.mutex.unlock(self.io);
             return self.shutdown_writes;
         }
+
     };
 }
 
@@ -818,6 +819,8 @@ fn AsyncOutput(comptime ConnType: type) type {
             self.shared.write_mutex.lockUncancelable(self.shared.io);
             defer self.shared.write_mutex.unlock(self.shared.io);
             if (self.shared.shutdown_writes) return error.ConnectionClosed;
+            if (self.shared.conn.writer.buffered().len == 0) return;
+            if (self.shared.conn.reader.bufferedLen() != 0) return;
             try self.shared.conn.flush();
         }
 
