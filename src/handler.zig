@@ -319,6 +319,12 @@ pub fn runAsync(
         const slot = &scratch.slots[slot_index];
         read_conn.close_sent = conn_ptr.close_sent;
 
+        shared.flushBeforeRead() catch |err| {
+            shared.releaseSlot(slot);
+            _ = shared.recordError(err);
+            break;
+        };
+
         const message = read_conn.readMessage(slot.message_buf[0..]) catch |err| switch (err) {
             error.EndOfStream => {
                 shared.releaseSlot(slot);
@@ -351,6 +357,10 @@ pub fn runAsync(
 
     shared.stopAccepting(false);
     shared.waitIdle();
+
+    shared.flushPendingOutput() catch |err| {
+        _ = shared.recordError(err);
+    };
 
     if (shared.firstError()) |err| return err;
 }
@@ -436,11 +446,6 @@ fn processAsyncHandlerResult(comptime opts: AsyncOptions, io: Io, ctx: anytype, 
             try writeResult(ctx, raw);
         },
     }
-    ctx.flush() catch |err| {
-        if (err == error.ConnectionClosed and ctx._output.shared.shutdownWrites()) return;
-        _ = ctx._output.shared.recordError(err);
-        return err;
-    };
 }
 
 fn writeResult(ctx: anytype, value: anytype) anyerror!void {
@@ -797,6 +802,23 @@ fn AsyncShared(comptime ConnType: type) type {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return self.shutdown_writes;
+        }
+
+        fn flushBeforeRead(self: *Self) anyerror!void {
+            self.write_mutex.lockUncancelable(self.io);
+            defer self.write_mutex.unlock(self.io);
+            if (self.shutdown_writes) return;
+            if (self.conn.writer.buffered().len == 0) return;
+            if (self.conn.reader.bufferedLen() != 0) return;
+            try self.conn.flush();
+        }
+
+        fn flushPendingOutput(self: *Self) anyerror!void {
+            self.write_mutex.lockUncancelable(self.io);
+            defer self.write_mutex.unlock(self.io);
+            if (self.shutdown_writes) return;
+            if (self.conn.writer.buffered().len == 0) return;
+            try self.conn.flush();
         }
     };
 }
