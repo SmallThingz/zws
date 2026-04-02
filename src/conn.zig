@@ -47,6 +47,7 @@ pub const StaticConfig = struct {
     auto_reply_close: bool = true,
     validate_utf8: bool = true,
     runtime_hooks: bool = true,
+    supports_permessage_deflate: bool = true,
     /// Enables runtime support for cross-message permessage-deflate context takeover.
     /// When false, each compressed message is treated as independent.
     permessage_deflate_context_takeover: bool = false,
@@ -122,6 +123,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
     const auto_reply_close = static.auto_reply_close;
     const validate_utf8 = static.validate_utf8;
     const runtime_hooks = static.runtime_hooks;
+    const supports_permessage_deflate = static.supports_permessage_deflate;
     const permessage_deflate_context_takeover = static.permessage_deflate_context_takeover;
     const permessage_deflate_min_payload_len = static.permessage_deflate_min_payload_len;
     const permessage_deflate_require_compression_gain = static.permessage_deflate_require_compression_gain;
@@ -129,8 +131,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
     const MaskPrngField = if (sends_masked) std.Random.DefaultPrng else void;
     const RecvMaskField = if (expects_masked) [mask_len]u8 else void;
     const RecvMaskOffsetField = if (expects_masked) usize else void;
-    const SendTakeoverField = if (permessage_deflate_context_takeover) ?flate_backend.TakeoverDeflater else void;
-    const RecvTakeoverField = if (permessage_deflate_context_takeover) ?flate_backend.TakeoverInflater else void;
+    const SendTakeoverField = if (supports_permessage_deflate and permessage_deflate_context_takeover) ?flate_backend.TakeoverDeflater else void;
+    const RecvTakeoverField = if (supports_permessage_deflate and permessage_deflate_context_takeover) ?flate_backend.TakeoverInflater else void;
     if (comptime runtime_hooks) observe.validateHooks(Hooks);
 
     return struct {
@@ -153,8 +155,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         send_fragment_opcode: ?MessageOpcode = null,
         close_sent: bool = false,
         close_received: bool = false,
-        send_takeover: SendTakeoverField = if (permessage_deflate_context_takeover) null else {},
-        recv_takeover: RecvTakeoverField = if (permessage_deflate_context_takeover) null else {},
+        send_takeover: SendTakeoverField = if (supports_permessage_deflate and permessage_deflate_context_takeover) null else {},
+        recv_takeover: RecvTakeoverField = if (supports_permessage_deflate and permessage_deflate_context_takeover) null else {},
 
         const Self = @This();
         const masked_write_scratch_len = 4096;
@@ -194,7 +196,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         pub fn deinit(self: *Self) void {
-            if (comptime permessage_deflate_context_takeover) {
+            if (comptime supports_permessage_deflate and permessage_deflate_context_takeover) {
                 if (self.send_takeover) |*deflater| {
                     deflater.deinit();
                     self.send_takeover = null;
@@ -476,6 +478,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                 }
 
                 if (message_compressed) {
+                    if (comptime !supports_permessage_deflate) unreachable;
                     var list = if (compressed_payload) |*existing|
                         existing
                     else blk: {
@@ -608,6 +611,10 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         fn writeMessage(self: *Self, opcode: Opcode, payload: []const u8) (ProtocolError || Io.Writer.Error)!void {
+            if (comptime !supports_permessage_deflate) {
+                try self.writeFrameInternal(opcode, payload, true, false);
+                return;
+            }
             const pmd = self.config.permessage_deflate;
             if (pmd == null or payload.len == 0 or !pmd.?.compress_outgoing) {
                 try self.writeFrameInternal(opcode, payload, true, false);
@@ -690,7 +697,10 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
 
             const compressed = b0.rsv1 != 0;
             if (b0.rsv2 != 0 or b0.rsv3 != 0) return error.ReservedBitsSet;
-            if (compressed and self.config.permessage_deflate == null) return error.ReservedBitsSet;
+            if (compressed) {
+                if (comptime !supports_permessage_deflate) return error.ReservedBitsSet;
+                if (self.config.permessage_deflate == null) return error.ReservedBitsSet;
+            }
 
             const opcode: Opcode = switch (b0.opcode) {
                 0x0 => .continuation,
@@ -841,7 +851,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         fn inflateMessage(self: *Self, compressed_payload: []const u8, dest: []u8) ProtocolError![]u8 {
-            if (comptime permessage_deflate_context_takeover) {
+            if (comptime supports_permessage_deflate and permessage_deflate_context_takeover) {
                 if (self.shouldUseIncomingContextTakeover()) {
                     const inflated_takeover = self.inflateMessageTakeover(compressed_payload, dest) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -865,7 +875,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         fn deflateMessage(self: *Self, payload: []const u8) ProtocolError![]u8 {
-            if (comptime permessage_deflate_context_takeover) {
+            if (comptime supports_permessage_deflate and permessage_deflate_context_takeover) {
                 if (self.shouldUseOutgoingContextTakeover()) {
                     const takeover = try self.ensureSendTakeoverDeflater();
                     return takeover.deflateMessage(payload) catch |err| switch (err) {
@@ -890,21 +900,24 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         fn compressionAllocator(self: *const Self) std.mem.Allocator {
+            if (comptime !supports_permessage_deflate) unreachable;
             return self.config.permessage_deflate.?.allocator;
         }
 
         fn shouldUseOutgoingContextTakeover(self: *const Self) bool {
+            if (comptime !supports_permessage_deflate) return false;
             const pmd = self.config.permessage_deflate orelse return false;
             return !outgoingNoContextTakeover(static.role, pmd.negotiated);
         }
 
         fn shouldUseIncomingContextTakeover(self: *const Self) bool {
+            if (comptime !supports_permessage_deflate) return false;
             const pmd = self.config.permessage_deflate orelse return false;
             return !incomingNoContextTakeover(static.role, pmd.negotiated);
         }
 
         fn ensureSendTakeoverDeflater(self: *Self) ProtocolError!*flate_backend.TakeoverDeflater {
-            if (comptime !permessage_deflate_context_takeover) unreachable;
+            if (comptime !supports_permessage_deflate or !permessage_deflate_context_takeover) unreachable;
             if (self.send_takeover == null) {
                 self.send_takeover = undefined;
                 errdefer self.send_takeover = null;
@@ -919,7 +932,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         fn ensureRecvTakeoverInflater(self: *Self) *flate_backend.TakeoverInflater {
-            if (comptime !permessage_deflate_context_takeover) unreachable;
+            if (comptime !supports_permessage_deflate or !permessage_deflate_context_takeover) unreachable;
             if (self.recv_takeover == null) {
                 self.recv_takeover = .{};
                 self.recv_takeover.?.init();
@@ -928,7 +941,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         fn inflateMessageTakeover(self: *Self, compressed_payload: []const u8, dest: []u8) flate_backend.InflateError![]u8 {
-            if (comptime !permessage_deflate_context_takeover) unreachable;
+            if (comptime !supports_permessage_deflate or !permessage_deflate_context_takeover) unreachable;
             const inflater = self.ensureRecvTakeoverInflater();
             return inflater.inflateMessage(compressionAllocator(self), compressed_payload, dest);
         }

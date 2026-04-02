@@ -15,6 +15,7 @@ const BenchConnSync = zws.Conn.Type(.{
     .auto_reply_close = true,
     .validate_utf8 = false,
     .runtime_hooks = false,
+    .supports_permessage_deflate = false,
 });
 
 const BenchConnSyncDeadline = zws.Conn.Type(.{
@@ -23,6 +24,7 @@ const BenchConnSyncDeadline = zws.Conn.Type(.{
     .auto_reply_close = true,
     .validate_utf8 = false,
     .runtime_hooks = true,
+    .supports_permessage_deflate = false,
 });
 
 const BenchConnAsync = BenchConnSync;

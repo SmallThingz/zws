@@ -264,6 +264,7 @@ fn runAsync(
         .auto_reply_close = true,
         .validate_utf8 = ConnType.static_config.validate_utf8,
         .runtime_hooks = ConnType.static_config.runtime_hooks,
+        .supports_permessage_deflate = ConnType.static_config.supports_permessage_deflate,
         .permessage_deflate_context_takeover = ConnType.static_config.permessage_deflate_context_takeover,
         .permessage_deflate_min_payload_len = ConnType.static_config.permessage_deflate_min_payload_len,
         .permessage_deflate_require_compression_gain = ConnType.static_config.permessage_deflate_require_compression_gain,
