@@ -192,6 +192,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             };
         }
 
+        // Accept sparse/anonymous config literals at the public API boundary, then
+        // collapse them into the smaller stored shape so disabled features compile out.
         fn normalizeConfig(config: anytype) StoredConfig {
             const T = @TypeOf(config);
             return .{
@@ -199,15 +201,15 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                 .max_message_payload_len = if (@hasField(T, "max_message_payload_len")) config.max_message_payload_len else std.math.maxInt(usize),
                 .permessage_deflate = if (supports_permessage_deflate)
                     if (@hasField(T, "permessage_deflate")) normalizePerMessageDeflateConfig(config.permessage_deflate) else null
-                else
-                    {},
+                else {},
                 .timeouts = if (runtime_hooks)
                     if (@hasField(T, "timeouts")) normalizeTimeoutConfig(config.timeouts) else .{}
-                else
-                    {},
+                else {},
             };
         }
 
+        // Per-message-deflate configs often arrive as anonymous struct literals from
+        // examples/tests; normalize those into the canonical runtime shape once here.
         fn normalizePerMessageDeflateConfig(value: anytype) ?PerMessageDeflateConfig {
             const T = @TypeOf(value);
             if (T == ?PerMessageDeflateConfig) return value;
@@ -226,6 +228,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             };
         }
 
+        // Only the negotiated takeover bits affect the wire format today, so the
+        // stored negotiated extension state is reduced to those booleans.
         fn normalizeNegotiatedPerMessageDeflate(value: anytype) extensions.PerMessageDeflate {
             const T = @TypeOf(value);
             if (T == extensions.PerMessageDeflate) return value;
@@ -744,6 +748,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             self.close_sent = true;
         }
 
+        // Parse and validate the already-buffered frame header in one place so both
+        // borrowed and owned read paths share the exact same protocol checks.
         fn parseHeaderBytes(self: *Self, bytes: []const u8) ProtocolError!?ParsedHeader {
             if (bytes.len < 2) return null;
             const HeaderByte0 = packed struct(u8) {
@@ -1123,6 +1129,8 @@ fn neededHeaderLen(second: u8) usize {
         (if ((second & 0x80) != 0) @as(usize, 4) else @as(usize, 0));
 }
 
+// Apply the websocket XOR mask in-place, starting at the caller-provided frame
+// offset so chunked reads and writes stay aligned with the 4-byte mask cycle.
 fn applyMask(bytes: []u8, mask: [mask_len]u8, start_offset: usize) void {
     if (bytes.len == 0) return;
 
@@ -2586,6 +2594,49 @@ test "internal role and compression helpers follow negotiated takeover policy" {
     plain_conn.deinit();
     try std.testing.expect(plain_conn.send_takeover == null);
     try std.testing.expect(plain_conn.recv_takeover == null);
+}
+
+test "init normalizes sparse anonymous config literals and compiles out disabled fields" {
+    const TrimmedConn = Conn(.{
+        .runtime_hooks = false,
+        .supports_permessage_deflate = false,
+    });
+    var empty_reader = Io.Reader.fixed(""[0..]);
+    var sink: [0]u8 = .{};
+    var writer = Io.Writer.fixed(sink[0..]);
+    const trimmed = TrimmedConn.init(&empty_reader, &writer, .{
+        .max_message_payload_len = 123,
+    });
+
+    try std.testing.expectEqual(@as(u64, std.math.maxInt(u64)), trimmed.config.max_frame_payload_len);
+    try std.testing.expectEqual(@as(usize, 123), trimmed.config.max_message_payload_len);
+    try std.testing.expectEqual(void, @TypeOf(trimmed.config.permessage_deflate));
+    try std.testing.expectEqual(void, @TypeOf(trimmed.config.timeouts));
+
+    const FullConn = Conn(.{});
+    const full = FullConn.init(&empty_reader, &writer, .{
+        .max_frame_payload_len = 456,
+        .timeouts = .{ .read_ns = 10, .flush_ns = 20 },
+        .permessage_deflate = .{
+            .allocator = std.testing.allocator,
+            .negotiated = .{
+                .server_no_context_takeover = true,
+                .client_no_context_takeover = false,
+            },
+            .compress_outgoing = true,
+        },
+    });
+
+    try std.testing.expectEqual(@as(u64, 456), full.config.max_frame_payload_len);
+    try std.testing.expectEqual(@as(usize, std.math.maxInt(usize)), full.config.max_message_payload_len);
+    try std.testing.expectEqual(@as(?u64, 10), full.config.timeouts.read_ns);
+    try std.testing.expectEqual(@as(?u64, null), full.config.timeouts.write_ns);
+    try std.testing.expectEqual(@as(?u64, 20), full.config.timeouts.flush_ns);
+    try std.testing.expect(full.config.permessage_deflate != null);
+    try std.testing.expectEqual(std.testing.allocator.ptr, full.config.permessage_deflate.?.allocator.ptr);
+    try std.testing.expect(full.config.permessage_deflate.?.compress_outgoing);
+    try std.testing.expect(full.config.permessage_deflate.?.negotiated.server_no_context_takeover);
+    try std.testing.expect(!full.config.permessage_deflate.?.negotiated.client_no_context_takeover);
 }
 
 test "internal header parsing and fragment bookkeeping helpers behave directly" {

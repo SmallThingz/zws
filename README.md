@@ -17,9 +17,8 @@ Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame ho
 - 🧠 **Optional context takeover**: compile-time `Conn.Type` toggle (`permessage_deflate_context_takeover`) enables cross-message compression state when negotiated.
 - 🎛 **Per-message compression policy**: compile-time `Conn.Type` knobs decide when messages are compressed (`permessage_deflate_min_payload_len`, `permessage_deflate_require_compression_gain`).
 - ⏱ **Timeout hooks**: optional read, write, and flush time budgets with typed runtime hooks for framework-owned transports.
-- ⏱ **Timeout-only runtime hooks**: optional typed deadline hooks for read, write, and flush budgets.
-- 🔁 **Convenience helpers**: `readMessage`, `echoFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, and `writeClose`.
-- 🧩 **Typed message handlers**: `Handler.run(...)` with `Ctx.T()` state access, sync/async handler signatures, and response coercion from `[]const u8`, `[][]const u8`, or structs with `body`.
+- 🔁 **Convenience helpers**: `readMessage`, `writeText`, `writeBinary`, `writePing`, `writePong`, and `writeClose`.
+- 🧩 **Typed message handlers**: `Handler.run(...)` with typed user state, sync/async execution modes, and response coercion from `[]const u8`, `[][]const u8`, or structs with `body`.
 - 🧪 **Validation stack**: unit tests, fuzz/property tests, a cross-library interop matrix, soak runners, and benchmarks live alongside the library.
 
 ## 🚀 Quick Start
@@ -32,13 +31,17 @@ const zws = @import("zwebsocket");
 
 fn runEcho(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     var conn = zws.Conn.Server.init(reader, writer, .{});
-    var scratch: [4096]u8 = undefined;
+    var message_buf: [4096]u8 = undefined;
 
     while (true) {
-        _ = conn.echoFrame(scratch[0..]) catch |err| switch (err) {
+        const message = conn.readMessage(message_buf[0..]) catch |err| switch (err) {
             error.ConnectionClosed => break,
             else => |e| return e,
         };
+        switch (message.opcode) {
+            .text => try conn.writeText(message.payload),
+            .binary => try conn.writeBinary(message.payload),
+        }
         try conn.flush();
     }
 }
@@ -47,8 +50,9 @@ fn runEcho(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
 For explicit handshake validation on a raw stream:
 
 ```zig
-const accepted = try zws.Handshake.acceptServerHandshake(req, .{});
-try zws.Handshake.writeServerHandshakeResponse(writer, accepted);
+const negotiated = try zws.Handshake.upgrade(reader, writer);
+_ = negotiated;
+try writer.flush();
 ```
 
 For a full standalone echo server example:
@@ -57,7 +61,7 @@ For a full standalone echo server example:
 zig build examples -Dexample=echo-server -- --port=9001 --compression
 ```
 
-For a frame-oriented echo server that stays on `echoFrame(...)`:
+For a frame-oriented echo server that stays on the low-level frame APIs:
 
 ```bash
 zig build examples -Dexample=frame-echo-server -- --port=9002
@@ -74,17 +78,20 @@ For a typed per-message handler loop with user-owned state:
 ```zig
 const io = std.Io.Threaded.global_single_threaded.io();
 var app_state = AppState{};
-var msg_buf: [64 * 1024]u8 = undefined;
+var scratch = zws.Handler.Scratch(.{
+    .receive_mode = .solid_slice,
+}).init();
 
-fn onMessage(ctx: *zws.Handler.SliceContext(zws.Conn.Server)) ![]const u8 {
-    const state = ctx.T(AppState);
-    state.seen += 1;
+fn onMessage(ctx: *zws.Handler.SliceContext(.{
+    .receive_mode = .solid_slice,
+}, zws.Conn.Server, AppState)) ![]const u8 {
+    ctx.state.seen += 1;
     return ctx.message.payload;
 }
 
 try zws.Handler.run(.{
     .receive_mode = .solid_slice,
-}, io, &conn, &app_state, msg_buf[0..], onMessage);
+}, io, &conn, &app_state, &scratch, onMessage);
 ```
 
 ## 📦 Installation
@@ -112,13 +119,13 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
 - Low-level read path:
   `beginFrame`, `readFrameChunk`, `readFrameAll`, `discardFrame`, `readFrameBorrowed`.
 - Convenience read path:
-  `readFrame`, `readMessage`, `echoFrame`.
+  `readFrame`, `readMessage`, `readMessageBorrowed`.
 - Write path:
   `writeFrame`, `writeText`, `writeBinary`, `writePing`, `writePong`, `writeClose`, `flush`.
 - Handshake path:
-  `Handshake.computeAcceptKey`, `Handshake.acceptServerHandshake`, `Handshake.writeServerHandshakeResponse`, `Handshake.serverHandshake`.
+  `Handshake.computeAcceptKey`, `Handshake.upgrade`.
 - Compression path:
-  `Extensions.PerMessageDeflate`, `Conn.PerMessageDeflateConfig`, `Handshake.Response.permessage_deflate`, `Conn.Config.permessage_deflate`.
+  `Extensions.PerMessageDeflate`, `Conn.PerMessageDeflateConfig`, `Conn.Config.permessage_deflate`.
 - Runtime hooks:
   `Observe.TimeoutConfig`, `Observe.DefaultRuntimeHooks`, `Conn.TypeWithHooks(...)`.
 - Message handler loop:
@@ -132,12 +139,12 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
 
 - `src/root.zig`: public package surface
 - `src/conn.zig`: connection state machine and frame I/O
-- `src/handshake.zig`: server handshake validation and response generation
+- `src/handshake.zig`: server upgrade parsing, validation, and `101` response writing
 - `src/extensions.zig`: extension negotiation helpers
 - `benchmark/bench.zig`: benchmark client
 - `benchmark/zwebsocket_server.zig`: standalone benchmark server
 - `examples/echo_server.zig`: standalone echo server example
-- `examples/frame_echo_server.zig`: frame-level echo server example using `echoFrame`
+- `examples/frame_echo_server.zig`: frame-level echo server example using `readFrameBorrowed`
 - `examples/ws_client.zig`: standalone client example with manual HTTP upgrade
 - `validation/`: Zig interop and soak runners, plus peer dependency metadata
 

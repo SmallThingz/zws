@@ -45,6 +45,8 @@ pub fn Scratch(comptime opts: Options) type {
     };
 }
 
+// The context carries only the output surface needed for the chosen execution
+// mode so sequential handlers do not pay for async bookkeeping fields.
 fn OutputType(comptime opts: Options, comptime ConnType: type) type {
     return switch (opts.execution) {
         .sequential => *ConnType,
@@ -71,10 +73,7 @@ pub fn SliceContext(comptime opts: Options, comptime ConnType: type, comptime St
         }
 
         pub fn flush(self: *Self) anyerror!void {
-            switch (comptime opts.execution) {
-                .sequential => try self._output.flush(),
-                .async => try self._output.flush(),
-            }
+            try self._output.flush();
         }
     };
 }
@@ -110,10 +109,7 @@ pub fn StreamContext(comptime opts: Options, comptime ConnType: type, comptime S
         }
 
         pub fn flush(self: *Self) anyerror!void {
-            switch (comptime opts.execution) {
-                .sequential => try self._output.flush(),
-                .async => try self._output.flush(),
-            }
+            try self._output.flush();
         }
     };
 }
@@ -229,6 +225,7 @@ fn runSequential(
                 .state = state_ptr,
                 .message = message,
                 ._output = conn_ptr,
+                ._stage_buf = scratch.stage_buf[0..],
             };
             try processHandlerResult(opts, io, &ctx, handler);
         }
@@ -245,6 +242,7 @@ fn runSequential(
             .state = state_ptr,
             .stream = &stream,
             ._output = conn_ptr,
+            ._stage_buf = scratch.stage_buf[0..],
         };
         try processHandlerResult(opts, io, &ctx, handler);
         stream.discard() catch |err| switch (err) {
@@ -518,6 +516,8 @@ fn writeChunkedBody(target: anytype, opcode: conn.MessageOpcode, chunks: []const
     }
 }
 
+// If all response chunks fit in the slot-local stage buffer, collapse them into a
+// single message write to avoid fragmented-frame overhead on the hot reply path.
 fn stageChunks(stage_buf: []u8, chunks: []const []const u8) ?[]const u8 {
     if (chunks.len == 0) return "";
     var total: usize = 0;
@@ -623,8 +623,10 @@ fn validateOptions(comptime opts: Options) void {
 }
 
 fn SequentialScratch(comptime opts: Options) type {
+    const stage_len = effectiveStageBufferLen(opts);
     return struct {
         message_buf: [if (opts.receive_mode == .solid_slice) opts.message_buffer_len else 0]u8 = undefined,
+        stage_buf: [stage_len]u8 = undefined,
 
         const Self = @This();
 
@@ -763,6 +765,8 @@ fn AsyncOutput(comptime ConnType: type) type {
 
         const Self = @This();
 
+        // Hold the write gate for the whole logical response so chunked replies do
+        // not interleave frames when multiple workers finish concurrently.
         pub fn writeResponse(self: *Self, request_opcode: conn.MessageOpcode, response: Response, stage_buf: []u8) anyerror!void {
             try self.shared.write_mutex.lock(self.shared.io);
             defer self.shared.write_mutex.unlock(self.shared.io);
@@ -808,6 +812,9 @@ const LockedWriterProxy = struct {
         };
     }
 
+    // The async read-side helper uses a second Conn over the same stream; funnel its
+    // auto-generated pong/close writes through the shared write mutex to preserve
+    // stream ordering with worker responses.
     fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
         const self: *LockedWriterProxy = @fieldParentPtr("interface", io_w);
         self.mutex.lockUncancelable(self.io);
@@ -842,6 +849,57 @@ const LockedWriterProxy = struct {
         io_w.end = preserve;
     }
 };
+
+test "helper utilities normalize responses and compute staging decisions directly" {
+    var stage_buf: [6]u8 = undefined;
+    const chunks = [_][]const u8{ "a", "bc", "def" };
+    const staged = stageChunks(stage_buf[0..], chunks[0..]).?;
+    try std.testing.expectEqualStrings("abcdef", staged);
+    try std.testing.expect(stageChunks(stage_buf[0..2], chunks[0..]) == null);
+
+    const bytes = normalizeResponse(@as([]const u8, "ok"));
+    try std.testing.expect(bytes.body == .bytes);
+    try std.testing.expectEqualStrings("ok", bytes.body.bytes);
+
+    const chunk_slice: []const []const u8 = chunks[0..];
+    const chunked = normalizeResponse(chunk_slice);
+    try std.testing.expect(chunked.body == .chunks);
+    try std.testing.expectEqual(@as(usize, 3), chunked.body.chunks.len);
+
+    const explicit = Response{
+        .opcode = .binary,
+        .body = .{ .bytes = "payload" },
+    };
+    try std.testing.expectEqualDeep(explicit, normalizeResponse(explicit));
+
+    const BodyStruct = struct {
+        opcode: conn.MessageOpcode,
+        body: []const u8,
+    };
+    try std.testing.expectEqualDeep(
+        Response{
+            .opcode = .binary,
+            .body = .{ .bytes = "payload" },
+        },
+        normalizeResponse(BodyStruct{
+            .opcode = .binary,
+            .body = "payload",
+        }),
+    );
+
+    try std.testing.expectEqualDeep(Body.none, normalizeBody({}));
+    try std.testing.expectEqualDeep(Body{ .bytes = "x" }, normalizeBody(@as([]const u8, "x")));
+    try std.testing.expectEqual(@as(?conn.MessageOpcode, .text), normalizeOpcode(conn.MessageOpcode.text));
+    try std.testing.expectEqual(@as(?conn.MessageOpcode, null), normalizeOpcode(@as(?conn.MessageOpcode, null)));
+
+    try std.testing.expect(isBytesSlice([]const u8));
+    try std.testing.expect(isChunkSlice([]const []const u8));
+    try std.testing.expectEqualStrings(@typeName(u8), @typeName(pointerChildType(*u8, "ptr")));
+    try std.testing.expectEqual(@as(usize, 64), effectiveStageBufferLen(.{ .message_buffer_len = 64 }));
+    try std.testing.expectEqual(@as(usize, 7), effectiveStageBufferLen(.{ .message_buffer_len = 64, .stage_buffer_len = 7 }));
+    try std.testing.expectEqual(@as(usize, 4), asyncWorkerCount(.{ .execution = .async, .async_max_inflight = 9 }));
+    try std.testing.expectEqual(@as(usize, 2), asyncWorkerCount(.{ .execution = .async, .async_max_inflight = 2 }));
+}
 
 test "run solid-slice mode invokes handler and writes byte-slice response" {
     var input: std.ArrayList(u8) = .empty;
@@ -956,7 +1014,7 @@ test "run solid-slice mode can use borrowed messages when scratch is smaller tha
     try std.testing.expectEqualStrings("pong", msg.payload);
 }
 
-test "run solid-slice mode writes chunked response bodies as fragmented frames" {
+test "run solid-slice mode coalesces chunked response bodies when stage buffer can hold them" {
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(std.testing.allocator);
     try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "y", .{ 1, 2, 3, 4 });
@@ -982,10 +1040,59 @@ test "run solid-slice mode writes chunked response bodies as fragmented frames" 
     var sink: [0]u8 = .{};
     var out_writer = Io.Writer.fixed(sink[0..]);
     var client = conn.Client.init(&out_reader, &out_writer, .{});
-    var message_buf: [64]u8 = undefined;
-    const msg = try client.readMessage(message_buf[0..]);
-    try std.testing.expectEqual(conn.MessageOpcode.text, msg.opcode);
-    try std.testing.expectEqualStrings("abcdef", msg.payload);
+    var frame_buf: [64]u8 = undefined;
+    const frame = try client.readFrame(frame_buf[0..]);
+    try std.testing.expectEqual(conn.Opcode.text, frame.header.opcode);
+    try std.testing.expect(frame.header.fin);
+    try std.testing.expectEqualStrings("abcdef", frame.payload);
+}
+
+test "run solid-slice mode fragments chunked response bodies when stage buffer is too small" {
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "y", .{ 1, 2, 3, 4 });
+    try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .close, true, true, &.{ 0x03, 0xE8 }, .{ 13, 14, 15, 16 });
+
+    var reader = Io.Reader.fixed(input.items);
+    var output: [512]u8 = undefined;
+    var writer = Io.Writer.fixed(output[0..]);
+    var server_conn = conn.Server.init(&reader, &writer, .{});
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const chunks = [_][]const u8{ "a", "bc", "def" };
+    const opts: Options = .{
+        .message_buffer_len = 64,
+        .stage_buffer_len = 2,
+    };
+    const H = struct {
+        fn handle(_: *SliceContext(opts, conn.Server, u8)) []const []const u8 {
+            return chunks[0..];
+        }
+    };
+    var state: u8 = 0;
+    var scratch = Scratch(opts).init();
+    try run(opts, io, &server_conn, &state, &scratch, H.handle);
+
+    var out_reader = Io.Reader.fixed(output[0..writer.end]);
+    var sink: [0]u8 = .{};
+    var out_writer = Io.Writer.fixed(sink[0..]);
+    var client = conn.Client.init(&out_reader, &out_writer, .{});
+    var frame_buf: [64]u8 = undefined;
+
+    const first = try client.readFrame(frame_buf[0..]);
+    try std.testing.expectEqual(conn.Opcode.text, first.header.opcode);
+    try std.testing.expect(!first.header.fin);
+    try std.testing.expectEqualStrings("a", first.payload);
+
+    const second = try client.readFrame(frame_buf[0..]);
+    try std.testing.expectEqual(conn.Opcode.continuation, second.header.opcode);
+    try std.testing.expect(!second.header.fin);
+    try std.testing.expectEqualStrings("bc", second.payload);
+
+    const third = try client.readFrame(frame_buf[0..]);
+    try std.testing.expectEqual(conn.Opcode.continuation, third.header.opcode);
+    try std.testing.expect(third.header.fin);
+    try std.testing.expectEqualStrings("def", third.payload);
 }
 
 test "run stream mode reads fragmented messages without internal message assembly" {

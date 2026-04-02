@@ -53,19 +53,22 @@ That makes it fit two common models:
 - raw `std.Io.net.Stream`
 - custom runtimes that can hand over borrowed reader/writer pairs
 
-For message-oriented application code, you can also run a typed handler loop with `Handler.run(...)` and keep state in user-owned structs via `Ctx.T()`.
+For message-oriented application code, you can also run a typed handler loop with `Handler.run(...)` and keep state in user-owned structs via `ctx.state`.
 
 ### Message Handlers
 
 `Handler.run(...)` is the built-in typed message loop adapter. It does not introduce runtime interfaces/vtables; handler dispatch is comptime-specialized.
 
 - Handler signatures:
-  - sync: `fn(ctx: *Handler.SliceContext(...)) ResponseType`
-  - async-style: `fn(io: std.Io, ctx: *Handler.SliceContext(...)) !ResponseType`
-- `Ctx.T()` gives typed access to user-owned per-loop/per-connection state.
+  - sequential: `fn(ctx: *Handler.SliceContext(opts, ConnType, State)) ResponseType`
+  - async-compatible: `fn(io: std.Io, ctx: *Handler.SliceContext(opts, ConnType, State)) !ResponseType`
+- `ctx.state` gives typed access to user-owned per-loop/per-connection state.
 - Receive mode is configured through `Handler.Options.receive_mode`:
   - `.solid_slice`: handlers receive a fully assembled message slice from caller-provided message buffer.
   - `.stream`: handlers pull chunks with `ctx.readChunk(...)` and can avoid full-message assembly in the library. Compressed (`RSV1`) messages are rejected in this mode.
+- Execution mode is configured through `Handler.Options.execution`:
+  - `.sequential`: one message at a time on the connection.
+  - `.async`: bounded concurrent handler execution for solid-slice mode; writes are serialized through the shared connection writer.
 - Supported sync return shapes:
   - `[]const u8`
   - `[][]const u8` / `[]const []const u8`
@@ -104,8 +107,8 @@ Runtime hooks are now timeout-only.
 
 `permessage-deflate` is optional.
 
-- enable it during the handshake with `Handshake.Options.enable_permessage_deflate`
-- propagate the negotiated `Handshake.Response.permessage_deflate` into `Conn.Config.permessage_deflate`
+- if the client offers `permessage-deflate`, `Handshake.upgrade(...)` returns the negotiated settings
+- propagate the negotiated `Handshake.upgrade(...)` result into `Conn.Config.permessage_deflate`
 - compressed message I/O uses `std.compress.flate` for RFC7692 framing and optional context-takeover support
 - compression remains disabled by default (`Conn.Config.permessage_deflate = null`)
 - outgoing compressed writes are opt-in (`Conn.PerMessageDeflateConfig.compress_outgoing = false` by default)
