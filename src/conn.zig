@@ -366,14 +366,18 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             try self.finishTimedOp(timed);
         }
 
-        pub fn beginFrame(self: *Self) (ProtocolError || Io.Reader.Error)!FrameHeader {
-            if (self.recv_active) return error.FrameActive;
-
+        fn peekParsedHeader(self: *Self) (ProtocolError || Io.Reader.Error)!ParsedHeader {
             const available = try self.peekGreedyTimed(2);
             const prefix = if (available.len >= 2) available else try self.peekTimed(2);
             const header_need = neededHeaderLen(prefix[1]);
-            const header_bytes = if (prefix.len >= header_need) prefix else try self.peekTimed(header_need);
-            const parsed = (try self.parseHeaderBytes(header_bytes)).?;
+            const bytes = if (prefix.len >= header_need) prefix[0..header_need] else try self.peekGreedyTimed(header_need);
+            return (try self.parseHeaderBytes(bytes)).?;
+        }
+
+        pub fn beginFrame(self: *Self) (ProtocolError || Io.Reader.Error)!FrameHeader {
+            if (self.recv_active) return error.FrameActive;
+
+            const parsed = try self.peekParsedHeader();
 
             self.reader.toss(parsed.header_len);
             self.recv_active = true;
@@ -389,18 +393,14 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         pub fn beginFrameBorrowed(self: *Self) (ProtocolError || Io.Reader.Error)!?BorrowedFrame {
             if (self.recv_active) return error.FrameActive;
 
-            const available = try self.peekGreedyTimed(2);
-            const prefix = if (available.len >= 2) available else try self.peekTimed(2);
-            const header_need = neededHeaderLen(prefix[1]);
-            if (header_need > self.reader.buffer.len) return null;
-
-            const header_bytes = if (prefix.len >= header_need) prefix else try self.peekTimed(header_need);
-            const parsed = (try self.parseHeaderBytes(header_bytes)).?;
+            const parsed = try self.peekParsedHeader();
+            if (parsed.header_len > self.reader.buffer.len) return null;
             const payload_len: usize = std.math.cast(usize, parsed.header.payload_len) orelse return null;
             const total_len = std.math.add(usize, parsed.header_len, payload_len) catch return null;
             if (total_len > self.reader.buffer.len) return null;
 
-            const frame_bytes = if (header_bytes.len >= total_len) header_bytes[0..total_len] else try self.peekTimed(total_len);
+            const available = try self.peekGreedyTimed(total_len);
+            const frame_bytes = if (available.len >= total_len) available[0..total_len] else try self.peekTimed(total_len);
             const payload: []u8 = @constCast(frame_bytes[parsed.header_len..][0..payload_len]);
             if (parsed.header.masked) applyMask(payload, parsed.mask, 0);
             self.reader.toss(total_len);
@@ -473,11 +473,7 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
 
             var control_buf: [control_payload_max_len]u8 = undefined;
             while (true) {
-                const available = try self.peekGreedyTimed(2);
-                const prefix = if (available.len >= 2) available else try self.peekTimed(2);
-                const header_need = neededHeaderLen(prefix[1]);
-                const header_bytes = if (prefix.len >= header_need) prefix else try self.peekTimed(header_need);
-                const parsed = (try self.parseHeaderBytes(header_bytes)).?;
+                const parsed = try self.peekParsedHeader();
 
                 if (proto.isControl(parsed.header.opcode)) {
                     self.reader.toss(parsed.header_len);
@@ -506,7 +502,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                 const total_len = std.math.add(usize, parsed.header_len, payload_len) catch return null;
                 if (total_len > self.reader.buffer.len) return null;
 
-                const frame_bytes = if (header_bytes.len >= total_len) header_bytes[0..total_len] else try self.peekTimed(total_len);
+                const available = try self.peekGreedyTimed(total_len);
+                const frame_bytes = if (available.len >= total_len) available[0..total_len] else try self.peekTimed(total_len);
                 const payload: []u8 = @constCast(frame_bytes[parsed.header_len..][0..payload_len]);
                 if (parsed.header.masked) applyMask(payload, parsed.mask, 0);
                 if (comptime validate_utf8) {
