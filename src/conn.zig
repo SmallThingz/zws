@@ -401,6 +401,57 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             };
         }
 
+        pub fn readMessageBorrowed(self: *Self) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!?Message {
+            if (self.recv_active) return error.FrameActive;
+
+            var control_buf: [control_payload_max_len]u8 = undefined;
+            while (true) {
+                const available = try self.peekGreedyTimed(2);
+                const prefix = if (available.len >= 2) available else try self.peekTimed(2);
+                const header_need = neededHeaderLen(prefix[1]);
+                const header_bytes = if (prefix.len >= header_need) prefix else try self.peekTimed(header_need);
+                const parsed = (try self.parseHeaderBytes(header_bytes)).?;
+
+                if (proto.isControl(parsed.header.opcode)) {
+                    self.reader.toss(parsed.header_len);
+                    self.recv_active = true;
+                    self.recv_header = parsed.header;
+                    self.recv_remaining = parsed.header.payload_len;
+                    if (comptime expects_masked) {
+                        self.recv_mask = parsed.mask;
+                        self.recv_mask_offset = 0;
+                    }
+
+                    const payload = try self.readFrameAll(control_buf[0..]);
+                    if (try self.handleControlFrame(parsed.header.opcode, payload, auto_reply_close, true)) {
+                        return error.ConnectionClosed;
+                    }
+                    continue;
+                }
+
+                if (!parsed.header.fin or parsed.header.compressed or parsed.header.opcode == .continuation) return null;
+
+                const message_opcode = proto.messageOpcode(parsed.header.opcode) orelse return null;
+                const payload_len: usize = std.math.cast(usize, parsed.header.payload_len) orelse return null;
+                const total_len = std.math.add(usize, parsed.header_len, payload_len) catch return null;
+                if (total_len > self.reader.buffer.len) return null;
+
+                const frame_bytes = if (header_bytes.len >= total_len) header_bytes[0..total_len] else try self.peekTimed(total_len);
+                const payload: []u8 = @constCast(frame_bytes[parsed.header_len..][0..payload_len]);
+                if (parsed.header.masked) applyMask(payload, parsed.mask, 0);
+                if (comptime validate_utf8) {
+                    if (message_opcode == .text and !std.unicode.utf8ValidateSlice(payload)) return error.InvalidUtf8;
+                }
+
+                self.reader.toss(total_len);
+                self.noteConsumedFrame(parsed.header);
+                return .{
+                    .opcode = message_opcode,
+                    .payload = payload,
+                };
+            }
+        }
+
         pub fn readMessage(self: *Self, buf: []u8) (ProtocolError || Io.Reader.Error || Io.Writer.Error)!Message {
             var total_len: usize = 0;
             var message_opcode: ?MessageOpcode = self.recv_fragment_opcode;
@@ -1971,6 +2022,40 @@ test "readFrameBorrowed unmasks payload without a copy" {
     try std.testing.expectEqual(Opcode.text, frame.header.opcode);
     try std.testing.expect(frame.header.fin);
     try std.testing.expectEqualStrings("borrowed", frame.payload);
+}
+
+test "readMessageBorrowed returns unfragmented borrowed message and preserves fallback for fragmented data" {
+    {
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(std.testing.allocator);
+        try appendTestFrame(&wire, std.testing.allocator, .text, true, true, "hello", .{ 1, 2, 3, 4 });
+
+        var reader = Io.Reader.fixed(wire.items);
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
+
+        const message = (try conn.readMessageBorrowed()).?;
+        try std.testing.expectEqual(MessageOpcode.text, message.opcode);
+        try std.testing.expectEqualStrings("hello", message.payload);
+    }
+    {
+        var wire: std.ArrayList(u8) = .empty;
+        defer wire.deinit(std.testing.allocator);
+        try appendTestFrame(&wire, std.testing.allocator, .text, false, true, "hel", .{ 1, 2, 3, 4 });
+        try appendTestFrame(&wire, std.testing.allocator, .continuation, true, true, "lo", .{ 5, 6, 7, 8 });
+
+        var reader = Io.Reader.fixed(wire.items);
+        var sink: [0]u8 = .{};
+        var writer = Io.Writer.fixed(sink[0..]);
+        var conn = Conn(.{}).init(&reader, &writer, .{});
+        try std.testing.expect((try conn.readMessageBorrowed()) == null);
+
+        var buf: [16]u8 = undefined;
+        const message = try conn.readMessage(buf[0..]);
+        try std.testing.expectEqual(MessageOpcode.text, message.opcode);
+        try std.testing.expectEqualStrings("hello", message.payload);
+    }
 }
 
 test "readFrameBorrowed handles empty payload control frames" {

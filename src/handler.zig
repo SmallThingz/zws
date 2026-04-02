@@ -209,10 +209,13 @@ fn runSequential(
 
     if (comptime opts.receive_mode == .solid_slice) {
         while (true) {
-            const message = conn_ptr.readMessage(scratch.message_buf[0..]) catch |err| switch (err) {
+            const message = (conn_ptr.readMessageBorrowed() catch |err| switch (err) {
                 error.EndOfStream, error.ConnectionClosed => return,
                 else => return err,
-            };
+            }) orelse (conn_ptr.readMessage(scratch.message_buf[0..]) catch |err| switch (err) {
+                error.EndOfStream, error.ConnectionClosed => return,
+                else => return err,
+            });
 
             var ctx: SliceContext(ConnType, StateType) = .{
                 .io = io,
@@ -919,6 +922,40 @@ test "run solid-slice mode accepts struct responses with body and opcode" {
     const msg = try client.readMessage(message_buf[0..]);
     try std.testing.expectEqual(conn.MessageOpcode.binary, msg.opcode);
     try std.testing.expectEqualStrings("abc", msg.payload);
+}
+
+test "run solid-slice mode can use borrowed messages when scratch is smaller than payload" {
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+
+    try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "ping", .{ 1, 2, 3, 4 });
+    try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .close, true, true, &.{ 0x03, 0xE8 }, .{ 5, 6, 7, 8 });
+
+    var reader = Io.Reader.fixed(input.items);
+    var output: [512]u8 = undefined;
+    var writer = Io.Writer.fixed(output[0..]);
+    var server_conn = conn.Server.init(&reader, &writer, .{});
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const H = struct {
+        fn handle(ctx: *SliceContext(conn.Server, u8)) []const u8 {
+            std.testing.expectEqualStrings("ping", ctx.message.payload) catch unreachable;
+            return "pong";
+        }
+    };
+
+    var state: u8 = 0;
+    var scratch = Scratch(.{ .message_buffer_len = 1 }).init();
+    try run(.{ .message_buffer_len = 1 }, io, &server_conn, &state, &scratch, H.handle);
+
+    var out_reader = Io.Reader.fixed(output[0..writer.end]);
+    var sink: [0]u8 = .{};
+    var out_writer = Io.Writer.fixed(sink[0..]);
+    var client = conn.Client.init(&out_reader, &out_writer, .{});
+    var message_buf: [64]u8 = undefined;
+    const msg = try client.readMessage(message_buf[0..]);
+    try std.testing.expectEqual(conn.MessageOpcode.text, msg.opcode);
+    try std.testing.expectEqualStrings("pong", msg.payload);
 }
 
 test "run solid-slice mode writes chunked response bodies as fragmented frames" {
