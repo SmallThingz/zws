@@ -3,16 +3,25 @@
 #include <charconv>
 #include <cstdlib>
 #include <iostream>
+#include <string>
 #include <string_view>
+#include <unordered_map>
+
+enum class Mode {
+    Sync,
+    Async,
+};
 
 int main(int argc, char **argv) {
     int port = 9002;
     int idleTimeoutSeconds = 120;
     bool deadlineEnabled = false;
+    Mode mode = Mode::Sync;
     for (int i = 1; i < argc; i++) {
         std::string_view arg = argv[i];
         constexpr std::string_view prefix = "--port=";
         constexpr std::string_view deadlinePrefix = "--deadline-ms=";
+        constexpr std::string_view modePrefix = "--mode=";
         if (arg.starts_with(prefix)) {
             std::from_chars(arg.data() + prefix.size(), arg.data() + arg.size(), port);
         } else if (arg.starts_with(deadlinePrefix)) {
@@ -25,10 +34,27 @@ int main(int argc, char **argv) {
                     idleTimeoutSeconds = 8;
                 }
             }
+        } else if (arg.starts_with(modePrefix)) {
+            std::string_view modeArg = arg.substr(modePrefix.size());
+            if (modeArg == "sync") {
+                mode = Mode::Sync;
+            } else if (modeArg == "async") {
+                mode = Mode::Async;
+            } else {
+                std::cerr << "unknown mode: " << modeArg << std::endl;
+                return 1;
+            }
         }
     }
 
-    struct PerSocketData {};
+    struct PerSocketData {
+        std::uint64_t id = 0;
+    };
+
+    using Socket = uWS::WebSocket<false, true, PerSocketData>;
+
+    std::unordered_map<std::uint64_t, Socket *> sockets;
+    std::uint64_t nextSocketId = 1;
 
     auto app = uWS::App();
     app.ws<PerSocketData>("/*", {
@@ -40,15 +66,34 @@ int main(int argc, char **argv) {
         .resetIdleTimeoutOnSend = deadlineEnabled,
         .sendPingsAutomatically = false,
         .upgrade = nullptr,
-        .open = [](auto * /*ws*/) {},
-        .message = [](auto *ws, std::string_view message, uWS::OpCode opCode) {
-            ws->send(message, opCode, false);
+        .open = [&sockets, &nextSocketId](auto *ws) {
+            auto *psd = ws->getUserData();
+            psd->id = nextSocketId++;
+            sockets.emplace(psd->id, ws);
+        },
+        .message = [&sockets, mode](auto *ws, std::string_view message, uWS::OpCode opCode) {
+            if (mode == Mode::Sync) {
+                ws->send(message, opCode, false);
+                return;
+            }
+
+            const std::uint64_t id = ws->getUserData()->id;
+            std::string payload(message);
+            uWS::Loop::get()->defer([&sockets, id, opCode, payload = std::move(payload)]() mutable {
+                auto it = sockets.find(id);
+                if (it == sockets.end()) {
+                    return;
+                }
+                it->second->send(std::string_view(payload), opCode, false);
+            });
         },
         .dropped = [](auto * /*ws*/, std::string_view /*message*/, uWS::OpCode /*opCode*/) {},
         .drain = [](auto * /*ws*/) {},
         .ping = [](auto * /*ws*/, std::string_view /*message*/) {},
         .pong = [](auto * /*ws*/, std::string_view /*message*/) {},
-        .close = [](auto * /*ws*/, int /*code*/, std::string_view /*message*/) {},
+        .close = [&sockets](auto *ws, int /*code*/, std::string_view /*message*/) {
+            sockets.erase(ws->getUserData()->id);
+        },
     });
 
     app.listen(port, [port](auto *listen_socket) {

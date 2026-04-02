@@ -2,9 +2,14 @@
 
 This benchmark compares standalone websocket echo servers on the same local machine:
 
-- `zwebsocket-bench-server`
-- `uWebSockets` via `benchmark/uws_server.cpp`
-- `uWebSockets` with a deadline-enabled websocket idle timeout via `benchmark/uws_server.cpp --deadline-ms=...`
+- `zwebsocket` sync
+- `zwebsocket` sync + deadline
+- `zwebsocket` async
+- `zwebsocket` async + deadline
+- `uWebSockets` sync
+- `uWebSockets` sync + deadline
+- `uWebSockets` async
+- `uWebSockets` async + deadline
 
 The client in `benchmark/bench.zig` is shared across every peer:
 
@@ -31,6 +36,7 @@ Environment overrides:
 ```sh
 SINGLE_CONNS=1 MULTI_CONNS=16 ITERS=200000 WARMUP=10000 MSG_SIZE=16 zig build bench-compare -Doptimize=ReleaseFast
 SINGLE_CONNS=1 MULTI_CONNS=16 ITERS=200000 WARMUP=10000 PIPELINE_DEPTH=8 MSG_SIZE=16 zig build bench-compare -Doptimize=ReleaseFast
+ROUNDS=2 BENCH_TIMEOUT_MS=120000 ZWS_DEADLINE_MS=30000 UWS_DEADLINE_MS=30000 zig build bench-compare -Doptimize=ReleaseFast
 ```
 
 Notes:
@@ -38,6 +44,24 @@ Notes:
 - `uWebSockets` and `uSockets` are cloned on demand under `.zig-cache/`.
 - The `uWebSockets` benchmark build uses no TLS and no websocket compression.
 - The default workload is a small binary echo frame, which is a transport-focused benchmark rather than an application benchmark.
+
+## Latest Comparison
+
+<!-- BENCH_COMPARE:START -->
+
+Source: `benchmark/results/latest.json`
+
+Config: host=`127.0.0.1` path=`/` rounds=2 single_conns=1 multi_conns=16 iters=200000 warmup=10000 pipeline_depth=8 msg_size=16 bench_timeout_ms=120000 zws_deadline_ms=30000 uws_deadline_ms=30000
+
+| Suite | zws-sync | zws-sync+dl | zws-async | zws-async+dl | uWS-sync | uWS-sync+dl | uWS-async | uWS-async+dl |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| single / non-pipelined | 158028.21 | 162607.50 | 85592.14 | 94520.45 | 148719.29 | 161160.58 | 133463.68 | 140262.99 |
+| single / pipelined | 436208.05 | 385857.99 | 167178.73 | 164686.41 | 893497.65 | 1327791.61 | 404093.60 | 441111.57 |
+| multi / non-pipelined | 837004.55 | 885113.28 | 405747.09 | 392415.41 | 424344.27 | 418441.23 | 368187.79 | 363019.57 |
+| multi / pipelined | 1598433.93 | 1261822.34 | 669832.49 | 643594.57 | 3115943.87 | 3011907.81 | 542525.31 | 551853.19 |
+
+Fairness notes: all peers use the same benchmark client, identical per-suite client settings, and the matrix runs strict interleaved rounds for every peer inside each suite.
+<!-- BENCH_COMPARE:END -->
 
 ## Harness
 
@@ -50,13 +74,22 @@ Notes:
 - `single / pipelined`
 - `multi / non-pipelined`
 - `multi / pipelined`
-- runs strict interleaved rounds inside each suite (`zwebsocket`, `uWebSockets`, `uWebSockets+deadline`)
+- runs strict interleaved rounds inside each suite across eight peers:
+- `zws-sync`
+- `zws-sync+dl`
+- `zws-async`
+- `zws-async+dl`
+- `uWS-sync`
+- `uWS-sync+dl`
+- `uWS-async`
+- `uWS-async+dl`
 - prints a per-suite summary and a final matrix table
+- defaults to `2` rounds per suite because the expanded matrix is much larger
 
 Environment overrides:
 
 ```sh
-ROUNDS=6 SINGLE_CONNS=1 MULTI_CONNS=16 ITERS=200000 WARMUP=10000 PIPELINE_DEPTH=8 MSG_SIZE=16 zig build bench-compare -Doptimize=ReleaseFast
-ROUNDS=6 SINGLE_CONNS=1 MULTI_CONNS=32 ITERS=150000 WARMUP=10000 PIPELINE_DEPTH=16 MSG_SIZE=16 zig build bench-compare -Doptimize=ReleaseFast
-UWS_DEADLINE_MS=30000 zig build bench-compare -Doptimize=ReleaseFast
+ROUNDS=2 SINGLE_CONNS=1 MULTI_CONNS=16 ITERS=200000 WARMUP=10000 PIPELINE_DEPTH=8 MSG_SIZE=16 zig build bench-compare -Doptimize=ReleaseFast
+ROUNDS=2 SINGLE_CONNS=1 MULTI_CONNS=32 ITERS=150000 WARMUP=10000 PIPELINE_DEPTH=16 MSG_SIZE=16 zig build bench-compare -Doptimize=ReleaseFast
+BENCH_TIMEOUT_MS=120000 ZWS_DEADLINE_MS=30000 UWS_DEADLINE_MS=30000 zig build bench-compare -Doptimize=ReleaseFast
 ```

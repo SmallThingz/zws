@@ -2,10 +2,10 @@ const std = @import("std");
 const builtin = @import("builtin");
 const scripts = @import("scripts.zig");
 
-const PeerCount = 3;
+const PeerCount = 8;
 
 const Config = struct {
-    rounds: usize = 6,
+    rounds: usize = 2,
     host: []const u8 = "127.0.0.1",
     path: []const u8 = "/",
     single_conns: usize = 1,
@@ -15,9 +15,16 @@ const Config = struct {
     pipelined_depth: usize = 8,
     msg_size: usize = 16,
     optimize: []const u8 = "ReleaseFast",
-    zws_port: u16 = 9101,
-    uws_port: u16 = 9102,
-    uws_deadline_port: u16 = 9103,
+    bench_timeout_ms: usize = 120_000,
+    zws_sync_port: u16 = 9101,
+    zws_sync_deadline_port: u16 = 9102,
+    zws_async_port: u16 = 9103,
+    zws_async_deadline_port: u16 = 9104,
+    uws_sync_port: u16 = 9105,
+    uws_sync_deadline_port: u16 = 9106,
+    uws_async_port: u16 = 9107,
+    uws_async_deadline_port: u16 = 9108,
+    zws_deadline_ms: usize = 30_000,
     uws_deadline_ms: usize = 30_000,
 };
 
@@ -38,6 +45,36 @@ const SuiteResult = struct {
     averages: [PeerCount]f64,
 };
 
+const ReadmeSnapshot = struct {
+    generated_awake_ns: u64,
+    fairness: []const u8,
+    config: ConfigSnapshot,
+    peers: [PeerCount][]const u8,
+    suites: [4]SuiteSnapshot,
+};
+
+const ConfigSnapshot = struct {
+    rounds: usize,
+    host: []const u8,
+    path: []const u8,
+    single_conns: usize,
+    multi_conns: usize,
+    iters: usize,
+    warmup: usize,
+    pipelined_depth: usize,
+    msg_size: usize,
+    bench_timeout_ms: usize,
+    zws_deadline_ms: usize,
+    uws_deadline_ms: usize,
+};
+
+const SuiteSnapshot = struct {
+    label: []const u8,
+    conns: usize,
+    pipeline: usize,
+    averages: [PeerCount]f64,
+};
+
 const BenchPaths = struct {
     zws_server: []const u8,
     uws_server: []const u8,
@@ -45,9 +82,14 @@ const BenchPaths = struct {
 };
 
 const Servers = struct {
-    zws: std.process.Child,
-    uws: std.process.Child,
-    uws_deadline: std.process.Child,
+    zws_sync: std.process.Child,
+    zws_sync_deadline: std.process.Child,
+    zws_async: std.process.Child,
+    zws_async_deadline: std.process.Child,
+    uws_sync: std.process.Child,
+    uws_sync_deadline: std.process.Child,
+    uws_async: std.process.Child,
+    uws_async_deadline: std.process.Child,
 };
 
 fn terminateChild(io: std.Io, child: *std.process.Child) void {
@@ -61,6 +103,36 @@ fn terminateChild(io: std.Io, child: *std.process.Child) void {
     if (child.id) |pid| std.posix.kill(pid, .TERM) catch {};
     _ = child.wait(io) catch {};
     child.id = null;
+}
+
+fn runBenchClient(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    argv: []const []const u8,
+    cwd: []const u8,
+    env_map: *const std.process.Environ.Map,
+    timeout_ms: usize,
+) !void {
+    const result = try std.process.run(allocator, io, .{
+        .argv = argv,
+        .cwd = .{ .path = cwd },
+        .environ_map = env_map,
+        .stdout_limit = .limited(4096),
+        .stderr_limit = .limited(16 * 1024),
+        .timeout = .{
+            .duration = .{
+                .raw = std.Io.Duration.fromMilliseconds(@intCast(timeout_ms)),
+                .clock = .awake,
+            },
+        },
+    });
+    defer allocator.free(result.stdout);
+    defer allocator.free(result.stderr);
+
+    switch (result.term) {
+        .exited => |code| if (code != 0) return error.ProcessFailed,
+        else => return error.ProcessFailed,
+    }
 }
 
 fn waitForPort(io: std.Io, port: u16, timeout_ms: u64) !void {
@@ -161,115 +233,228 @@ fn runBenchRate(
     defer env.deinit();
     try env.put("BENCH_LABEL", peer.label);
 
-    try runChecked(
+    try runBenchClient(
+        allocator,
         io,
         &.{ bench_path, host_arg, port_arg, path_arg, conns_arg, iters_arg, warmup_arg, pipeline_arg, size_arg, "--quiet", rate_arg },
         root,
         &env,
-        false,
+        cfg.bench_timeout_ms,
     );
     return parseRateFile(io, peer.rate_path);
 }
 
-fn startServers(
-    io: std.Io,
-    root: []const u8,
-    cfg: Config,
-    suite: Suite,
-    paths: BenchPaths,
-) !Servers {
-    var zws_port_buf: [16]u8 = undefined;
+fn startServers(io: std.Io, root: []const u8, cfg: Config, suite: Suite, paths: BenchPaths) !Servers {
+    var zws_sync_port_buf: [16]u8 = undefined;
+    var zws_sync_dl_port_buf: [16]u8 = undefined;
+    var zws_async_port_buf: [16]u8 = undefined;
+    var zws_async_dl_port_buf: [16]u8 = undefined;
     var zws_pipeline_buf: [32]u8 = undefined;
     var zws_size_buf: [32]u8 = undefined;
-    const zws_port_arg = try std.fmt.bufPrint(&zws_port_buf, "--port={d}", .{cfg.zws_port});
+    var zws_deadline_buf: [32]u8 = undefined;
+
+    const zws_sync_port_arg = try std.fmt.bufPrint(&zws_sync_port_buf, "--port={d}", .{cfg.zws_sync_port});
+    const zws_sync_dl_port_arg = try std.fmt.bufPrint(&zws_sync_dl_port_buf, "--port={d}", .{cfg.zws_sync_deadline_port});
+    const zws_async_port_arg = try std.fmt.bufPrint(&zws_async_port_buf, "--port={d}", .{cfg.zws_async_port});
+    const zws_async_dl_port_arg = try std.fmt.bufPrint(&zws_async_dl_port_buf, "--port={d}", .{cfg.zws_async_deadline_port});
     const zws_pipeline_arg = try std.fmt.bufPrint(&zws_pipeline_buf, "--pipeline={d}", .{suite.pipeline});
     const zws_size_arg = try std.fmt.bufPrint(&zws_size_buf, "--msg-size={d}", .{cfg.msg_size});
+    const zws_deadline_arg = try std.fmt.bufPrint(&zws_deadline_buf, "--deadline-ms={d}", .{cfg.zws_deadline_ms});
 
-    var uws_port_buf: [16]u8 = undefined;
-    const uws_port_arg = try std.fmt.bufPrint(&uws_port_buf, "--port={d}", .{cfg.uws_port});
-    var uws_deadline_port_buf: [16]u8 = undefined;
+    var uws_sync_port_buf: [16]u8 = undefined;
+    var uws_sync_dl_port_buf: [16]u8 = undefined;
+    var uws_async_port_buf: [16]u8 = undefined;
+    var uws_async_dl_port_buf: [16]u8 = undefined;
     var uws_deadline_ms_buf: [32]u8 = undefined;
-    const uws_deadline_port_arg = try std.fmt.bufPrint(&uws_deadline_port_buf, "--port={d}", .{cfg.uws_deadline_port});
+    const uws_sync_port_arg = try std.fmt.bufPrint(&uws_sync_port_buf, "--port={d}", .{cfg.uws_sync_port});
+    const uws_sync_dl_port_arg = try std.fmt.bufPrint(&uws_sync_dl_port_buf, "--port={d}", .{cfg.uws_sync_deadline_port});
+    const uws_async_port_arg = try std.fmt.bufPrint(&uws_async_port_buf, "--port={d}", .{cfg.uws_async_port});
+    const uws_async_dl_port_arg = try std.fmt.bufPrint(&uws_async_dl_port_buf, "--port={d}", .{cfg.uws_async_deadline_port});
     const uws_deadline_ms_arg = try std.fmt.bufPrint(&uws_deadline_ms_buf, "--deadline-ms={d}", .{cfg.uws_deadline_ms});
 
     const children: Servers = .{
-        .zws = try spawnBackground(io, &.{ paths.zws_server, zws_port_arg, zws_pipeline_arg, zws_size_arg }, root),
-        .uws = try spawnBackground(io, &.{ paths.uws_server, uws_port_arg }, root),
-        .uws_deadline = try spawnBackground(io, &.{ paths.uws_server, uws_deadline_port_arg, uws_deadline_ms_arg }, root),
+        .zws_sync = try spawnBackground(io, &.{ paths.zws_server, zws_sync_port_arg, zws_pipeline_arg, zws_size_arg, "--mode=sync" }, root),
+        .zws_sync_deadline = try spawnBackground(io, &.{ paths.zws_server, zws_sync_dl_port_arg, zws_pipeline_arg, zws_size_arg, "--mode=sync", zws_deadline_arg }, root),
+        .zws_async = try spawnBackground(io, &.{ paths.zws_server, zws_async_port_arg, zws_pipeline_arg, zws_size_arg, "--mode=async" }, root),
+        .zws_async_deadline = try spawnBackground(io, &.{ paths.zws_server, zws_async_dl_port_arg, zws_pipeline_arg, zws_size_arg, "--mode=async", zws_deadline_arg }, root),
+        .uws_sync = try spawnBackground(io, &.{ paths.uws_server, uws_sync_port_arg, "--mode=sync" }, root),
+        .uws_sync_deadline = try spawnBackground(io, &.{ paths.uws_server, uws_sync_dl_port_arg, "--mode=sync", uws_deadline_ms_arg }, root),
+        .uws_async = try spawnBackground(io, &.{ paths.uws_server, uws_async_port_arg, "--mode=async" }, root),
+        .uws_async_deadline = try spawnBackground(io, &.{ paths.uws_server, uws_async_dl_port_arg, "--mode=async", uws_deadline_ms_arg }, root),
     };
-    try waitForPort(io, cfg.zws_port, 10_000);
-    try waitForPort(io, cfg.uws_port, 10_000);
-    try waitForPort(io, cfg.uws_deadline_port, 10_000);
+    try waitForPort(io, cfg.zws_sync_port, 10_000);
+    try waitForPort(io, cfg.zws_sync_deadline_port, 10_000);
+    try waitForPort(io, cfg.zws_async_port, 10_000);
+    try waitForPort(io, cfg.zws_async_deadline_port, 10_000);
+    try waitForPort(io, cfg.uws_sync_port, 10_000);
+    try waitForPort(io, cfg.uws_sync_deadline_port, 10_000);
+    try waitForPort(io, cfg.uws_async_port, 10_000);
+    try waitForPort(io, cfg.uws_async_deadline_port, 10_000);
     return children;
 }
 
 fn stopServers(io: std.Io, children: *const Servers) void {
-    var zws = children.zws;
-    var uws = children.uws;
-    var uws_deadline = children.uws_deadline;
-    terminateChild(io, &zws);
-    terminateChild(io, &uws);
-    terminateChild(io, &uws_deadline);
+    var zws_sync = children.zws_sync;
+    var zws_sync_deadline = children.zws_sync_deadline;
+    var zws_async = children.zws_async;
+    var zws_async_deadline = children.zws_async_deadline;
+    var uws_sync = children.uws_sync;
+    var uws_sync_deadline = children.uws_sync_deadline;
+    var uws_async = children.uws_async;
+    var uws_async_deadline = children.uws_async_deadline;
+    terminateChild(io, &zws_sync);
+    terminateChild(io, &zws_sync_deadline);
+    terminateChild(io, &zws_async);
+    terminateChild(io, &zws_async_deadline);
+    terminateChild(io, &uws_sync);
+    terminateChild(io, &uws_sync_deadline);
+    terminateChild(io, &uws_async);
+    terminateChild(io, &uws_async_deadline);
 }
 
-fn printSuiteTable(
-    writer: *std.Io.Writer,
-    result: SuiteResult,
-) !void {
-    const zws_avg = result.averages[0];
-    const uws_avg = result.averages[1];
-    const uws_deadline_avg = result.averages[2];
-    const delta_plain = zws_avg - uws_avg;
-    const pct_plain = if (uws_avg == 0) 0 else (delta_plain / uws_avg) * 100.0;
-    const delta_deadline = zws_avg - uws_deadline_avg;
-    const pct_deadline = if (uws_deadline_avg == 0) 0 else (delta_deadline / uws_deadline_avg) * 100.0;
+fn printSuiteTable(writer: *std.Io.Writer, peers: []const Peer, result: SuiteResult) !void {
+    try writer.print("Suite: {s}  ({d} conn, pipeline={d})\n", .{ result.suite.label, result.suite.conns, result.suite.pipeline });
+    for (peers, 0..) |peer, idx| {
+        try writer.print("  {s:<22} {d:>12.2} msg/s\n", .{ peer.label, result.averages[idx] });
+    }
+    try writer.writeAll("\n");
+}
 
-    try writer.print(
-        \\Suite: {s}  ({d} conn, pipeline={d})
-        \\  zwebsocket           {d:>12.2} msg/s
-        \\  uWebSockets          {d:>12.2} msg/s
-        \\  uWebSockets+deadline {d:>12.2} msg/s
-        \\  delta vs uWS         {d:>12.2} msg/s ({d:>7.2}%)
-        \\  delta vs uWS+dl      {d:>12.2} msg/s ({d:>7.2}%)
-        \\
-    ,
+fn printFinalTable(writer: *std.Io.Writer, peers: []const Peer, results: []const SuiteResult) !void {
+    try writer.writeAll("== final summary ==\n");
+    try writer.writeAll("suite                         ");
+    for (peers) |peer| {
+        try writer.print("{s:<18}", .{peer.label});
+    }
+    try writer.writeAll("\n");
+    try writer.writeAll("----------------------------  ");
+    for (peers) |_| {
+        try writer.writeAll("------------------");
+    }
+    try writer.writeAll("\n");
+    for (results) |result| {
+        try writer.print("{s:<28}  ", .{result.suite.label});
+        for (result.averages) |avg| {
+            try writer.print("{d:>18.2}", .{avg});
+        }
+        try writer.writeAll("\n");
+    }
+}
+
+fn nowAwakeNs(io: std.Io) u64 {
+    const ts = std.Io.Timestamp.now(io, .awake);
+    if (ts.nanoseconds <= 0) return 0;
+    return std.math.cast(u64, ts.nanoseconds) orelse 0;
+}
+
+fn renderResultsMarkdown(
+    allocator: std.mem.Allocator,
+    cfg: Config,
+    peers: []const Peer,
+    results: []const SuiteResult,
+    source_json_rel_path: []const u8,
+    include_heading: bool,
+) ![]u8 {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    errdefer out.deinit();
+    const w = &out.writer;
+
+    if (include_heading) try w.writeAll("# WebSocket Benchmark Snapshot\n\n");
+    try w.print("Source: `{s}`\n\n", .{source_json_rel_path});
+    try w.print(
+        "Config: host=`{s}` path=`{s}` rounds={d} single_conns={d} multi_conns={d} iters={d} warmup={d} pipeline_depth={d} msg_size={d} bench_timeout_ms={d} zws_deadline_ms={d} uws_deadline_ms={d}\n\n",
         .{
-            result.suite.label,
-            result.suite.conns,
-            result.suite.pipeline,
-            zws_avg,
-            uws_avg,
-            uws_deadline_avg,
-            delta_plain,
-            pct_plain,
-            delta_deadline,
-            pct_deadline,
+            cfg.host,
+            cfg.path,
+            cfg.rounds,
+            cfg.single_conns,
+            cfg.multi_conns,
+            cfg.iters,
+            cfg.warmup,
+            cfg.pipelined_depth,
+            cfg.msg_size,
+            cfg.bench_timeout_ms,
+            cfg.zws_deadline_ms,
+            cfg.uws_deadline_ms,
         },
     );
+    try w.writeAll("| Suite | ");
+    for (peers, 0..) |peer, idx| {
+        try w.writeAll(peer.label);
+        if (idx + 1 != peers.len) try w.writeAll(" | ");
+    }
+    try w.writeAll(" |\n|---");
+    for (peers) |_| try w.writeAll("|---:");
+    try w.writeAll("|\n");
+    for (results) |result| {
+        try w.print("| {s} | ", .{result.suite.label});
+        for (result.averages, 0..) |avg, idx| {
+            try w.print("{d:.2}", .{avg});
+            if (idx + 1 != result.averages.len) try w.writeAll(" | ");
+        }
+        try w.writeAll(" |\n");
+    }
+    try w.writeAll("\nFairness notes: all peers use the same benchmark client, identical per-suite client settings, and the matrix runs strict interleaved rounds for every peer inside each suite.\n");
+    return out.toOwnedSlice();
 }
 
-fn printFinalTable(writer: *std.Io.Writer, results: []const SuiteResult) !void {
-    try writer.writeAll("== final summary ==\n");
-    try writer.writeAll("suite                         zwebsocket        uWebSockets     uWS+deadline       vs uWS        vs uWS+dl\n");
-    try writer.writeAll("----------------------------  ----------------  ----------------  ----------------  ------------  ------------\n");
-    for (results) |result| {
-        const zws_avg = result.averages[0];
-        const uws_avg = result.averages[1];
-        const uws_deadline_avg = result.averages[2];
-        const pct_plain = if (uws_avg == 0) 0 else ((zws_avg - uws_avg) / uws_avg) * 100.0;
-        const pct_deadline = if (uws_deadline_avg == 0) 0 else ((zws_avg - uws_deadline_avg) / uws_deadline_avg) * 100.0;
-        try writer.print(
-            "{s:<28}  {d:>16.2}  {d:>16.2}  {d:>16.2}  {d:>11.2}%  {d:>11.2}%\n",
-            .{
-                result.suite.label,
-                zws_avg,
-                uws_avg,
-                uws_deadline_avg,
-                pct_plain,
-                pct_deadline,
-            },
-        );
-    }
+fn writeArtifacts(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    cfg: Config,
+    peers: []const Peer,
+    results: []const SuiteResult,
+) !void {
+    const full_md = try renderResultsMarkdown(allocator, cfg, peers, results, "benchmark/results/latest.json", true);
+    defer allocator.free(full_md);
+    const summary_md = try renderResultsMarkdown(allocator, cfg, peers, results, "benchmark/results/latest.json", false);
+    defer allocator.free(summary_md);
+
+    const snapshot: ReadmeSnapshot = .{
+        .generated_awake_ns = nowAwakeNs(io),
+        .fairness = "all peers use the same benchmark client, identical per-suite client settings, and the matrix runs strict interleaved rounds for every peer inside each suite.",
+        .config = .{
+            .rounds = cfg.rounds,
+            .host = cfg.host,
+            .path = cfg.path,
+            .single_conns = cfg.single_conns,
+            .multi_conns = cfg.multi_conns,
+            .iters = cfg.iters,
+            .warmup = cfg.warmup,
+            .pipelined_depth = cfg.pipelined_depth,
+            .msg_size = cfg.msg_size,
+            .bench_timeout_ms = cfg.bench_timeout_ms,
+            .zws_deadline_ms = cfg.zws_deadline_ms,
+            .uws_deadline_ms = cfg.uws_deadline_ms,
+        },
+        .peers = .{
+            peers[0].label,
+            peers[1].label,
+            peers[2].label,
+            peers[3].label,
+            peers[4].label,
+            peers[5].label,
+            peers[6].label,
+            peers[7].label,
+        },
+        .suites = .{
+            .{ .label = results[0].suite.label, .conns = results[0].suite.conns, .pipeline = results[0].suite.pipeline, .averages = results[0].averages },
+            .{ .label = results[1].suite.label, .conns = results[1].suite.conns, .pipeline = results[1].suite.pipeline, .averages = results[1].averages },
+            .{ .label = results[2].suite.label, .conns = results[2].suite.conns, .pipeline = results[2].suite.pipeline, .averages = results[2].averages },
+            .{ .label = results[3].suite.label, .conns = results[3].suite.conns, .pipeline = results[3].suite.pipeline, .averages = results[3].averages },
+        },
+    };
+
+    var json_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer json_writer.deinit();
+    var json_stream: std.json.Stringify = .{
+        .writer = &json_writer.writer,
+        .options = .{ .whitespace = .indent_2 },
+    };
+    try json_stream.write(snapshot);
+
+    try scripts.writeCompareArtifactsAndSyncReadme(io, allocator, root, summary_md, full_md, json_writer.written());
 }
 
 fn runSuite(
@@ -297,16 +482,15 @@ fn runSuite(
     }
 
     const rounds_f = @as(f64, @floatFromInt(cfg.rounds));
+    var averages: [PeerCount]f64 = undefined;
+    for (&averages, sums) |*dst, sum| dst.* = sum / rounds_f;
+
     const result: SuiteResult = .{
         .suite = suite,
-        .averages = .{
-            sums[0] / rounds_f,
-            sums[1] / rounds_f,
-            sums[2] / rounds_f,
-        },
+        .averages = averages,
     };
     try writer.writeAll("\n");
-    try printSuiteTable(writer, result);
+    try printSuiteTable(writer, peers, result);
     return result;
 }
 
@@ -318,13 +502,10 @@ pub fn main(init: std.process.Init) !void {
     const root = try std.process.currentPathAlloc(init.io, allocator);
     const env = init.environ_map;
     const env_pipeline = scripts.envInt(env, "PIPELINE", 8);
-    const pipelined_depth = if (env_pipeline <= 1)
-        8
-    else
-        env_pipeline;
+    const pipelined_depth = if (env_pipeline <= 1) 8 else env_pipeline;
 
     const cfg: Config = .{
-        .rounds = scripts.envInt(env, "ROUNDS", 6),
+        .rounds = scripts.envInt(env, "ROUNDS", 2),
         .host = env.get("HOST") orelse "127.0.0.1",
         .path = env.get("WS_PATH") orelse "/",
         .single_conns = scripts.envInt(env, "SINGLE_CONNS", 1),
@@ -334,15 +515,22 @@ pub fn main(init: std.process.Init) !void {
         .pipelined_depth = scripts.envInt(env, "PIPELINE_DEPTH", pipelined_depth),
         .msg_size = scripts.envInt(env, "MSG_SIZE", 16),
         .optimize = env.get("OPTIMIZE") orelse "ReleaseFast",
-        .zws_port = @intCast(scripts.envInt(env, "ZWS_PORT", 9101)),
-        .uws_port = @intCast(scripts.envInt(env, "UWS_PORT", 9102)),
-        .uws_deadline_port = @intCast(scripts.envInt(env, "UWS_DEADLINE_PORT", 9103)),
+        .bench_timeout_ms = scripts.envInt(env, "BENCH_TIMEOUT_MS", 120_000),
+        .zws_sync_port = @intCast(scripts.envInt(env, "ZWS_SYNC_PORT", 9101)),
+        .zws_sync_deadline_port = @intCast(scripts.envInt(env, "ZWS_SYNC_DEADLINE_PORT", 9102)),
+        .zws_async_port = @intCast(scripts.envInt(env, "ZWS_ASYNC_PORT", 9103)),
+        .zws_async_deadline_port = @intCast(scripts.envInt(env, "ZWS_ASYNC_DEADLINE_PORT", 9104)),
+        .uws_sync_port = @intCast(scripts.envInt(env, "UWS_SYNC_PORT", 9105)),
+        .uws_sync_deadline_port = @intCast(scripts.envInt(env, "UWS_SYNC_DEADLINE_PORT", 9106)),
+        .uws_async_port = @intCast(scripts.envInt(env, "UWS_ASYNC_PORT", 9107)),
+        .uws_async_deadline_port = @intCast(scripts.envInt(env, "UWS_ASYNC_DEADLINE_PORT", 9108)),
+        .zws_deadline_ms = scripts.envInt(env, "ZWS_DEADLINE_MS", 30_000),
         .uws_deadline_ms = scripts.envInt(env, "UWS_DEADLINE_MS", 30_000),
     };
     if (cfg.single_conns == 0 or cfg.multi_conns == 0) return error.InvalidConns;
     if (cfg.pipelined_depth <= 1) return error.InvalidPipelineDepth;
 
-    var stdout_buf: [1024]u8 = undefined;
+    var stdout_buf: [2048]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);
 
     try stdout.interface.writeAll("== build ==\n");
@@ -355,13 +543,15 @@ pub fn main(init: std.process.Init) !void {
         .bench_bin = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zwebsocket-bench" }),
     };
 
-    const zws_rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-zws.txt" });
-    const uws_rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-uws.txt" });
-    const uws_deadline_rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-uws-deadline.txt" });
     const peers = [_]Peer{
-        .{ .label = "zwebsocket", .port = cfg.zws_port, .rate_path = zws_rate_path },
-        .{ .label = "uWebSockets", .port = cfg.uws_port, .rate_path = uws_rate_path },
-        .{ .label = "uWebSockets+deadline", .port = cfg.uws_deadline_port, .rate_path = uws_deadline_rate_path },
+        .{ .label = "zws-sync", .port = cfg.zws_sync_port, .rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-zws-sync.txt" }) },
+        .{ .label = "zws-sync+dl", .port = cfg.zws_sync_deadline_port, .rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-zws-sync-dl.txt" }) },
+        .{ .label = "zws-async", .port = cfg.zws_async_port, .rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-zws-async.txt" }) },
+        .{ .label = "zws-async+dl", .port = cfg.zws_async_deadline_port, .rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-zws-async-dl.txt" }) },
+        .{ .label = "uWS-sync", .port = cfg.uws_sync_port, .rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-uws-sync.txt" }) },
+        .{ .label = "uWS-sync+dl", .port = cfg.uws_sync_deadline_port, .rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-uws-sync-dl.txt" }) },
+        .{ .label = "uWS-async", .port = cfg.uws_async_port, .rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-uws-async.txt" }) },
+        .{ .label = "uWS-async+dl", .port = cfg.uws_async_deadline_port, .rate_path = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "bench-rate-uws-async-dl.txt" }) },
     };
     const suites = [_]Suite{
         .{ .label = "single / non-pipelined", .conns = cfg.single_conns, .pipeline = 1 },
@@ -385,6 +575,7 @@ pub fn main(init: std.process.Init) !void {
         );
     }
 
-    try printFinalTable(&stdout.interface, results[0..]);
+    try printFinalTable(&stdout.interface, peers[0..], results[0..]);
+    try writeArtifacts(init.io, allocator, root, cfg, peers[0..], results[0..]);
     try stdout.interface.flush();
 }

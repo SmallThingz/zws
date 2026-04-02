@@ -1,0 +1,90 @@
+{
+  "generated_awake_ns": 127781801613122,
+  "fairness": "all peers use the same benchmark client, identical per-suite client settings, and the matrix runs strict interleaved rounds for every peer inside each suite.",
+  "config": {
+    "rounds": 2,
+    "host": "127.0.0.1",
+    "path": "/",
+    "single_conns": 1,
+    "multi_conns": 16,
+    "iters": 200000,
+    "warmup": 10000,
+    "pipelined_depth": 8,
+    "msg_size": 16,
+    "bench_timeout_ms": 120000,
+    "zws_deadline_ms": 30000,
+    "uws_deadline_ms": 30000
+  },
+  "peers": [
+    "zws-sync",
+    "zws-sync+dl",
+    "zws-async",
+    "zws-async+dl",
+    "uWS-sync",
+    "uWS-sync+dl",
+    "uWS-async",
+    "uWS-async+dl"
+  ],
+  "suites": [
+    {
+      "label": "single / non-pipelined",
+      "conns": 1,
+      "pipeline": 1,
+      "averages": [
+        158028.21,
+        162607.5,
+        85592.14,
+        94520.445,
+        148719.29499999998,
+        161160.575,
+        133463.675,
+        140262.99
+      ]
+    },
+    {
+      "label": "single / pipelined",
+      "conns": 1,
+      "pipeline": 8,
+      "averages": [
+        436208.04500000004,
+        385857.985,
+        167178.725,
+        164686.40500000003,
+        893497.6499999999,
+        1327791.6099999999,
+        404093.595,
+        441111.57
+      ]
+    },
+    {
+      "label": "multi / non-pipelined",
+      "conns": 16,
+      "pipeline": 1,
+      "averages": [
+        837004.5549999999,
+        885113.2849999999,
+        405747.085,
+        392415.405,
+        424344.27,
+        418441.225,
+        368187.78500000003,
+        363019.57499999995
+      ]
+    },
+    {
+      "label": "multi / pipelined",
+      "conns": 16,
+      "pipeline": 8,
+      "averages": [
+        1598433.93,
+        1261822.3399999999,
+        669832.485,
+        643594.565,
+        3115943.865,
+        3011907.81,
+        542525.31,
+        551853.19
+      ]
+    }
+  ]
+}

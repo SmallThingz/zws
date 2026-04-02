@@ -39,7 +39,7 @@ pub fn setTcpNoDelay(stream: *const std.Io.net.Stream) void {
     ) catch {};
 }
 
-pub fn closeForProtocolError(conn: *zws.Conn.Server, writer: *Io.Writer, err: anyerror) void {
+pub fn closeForProtocolError(conn: anytype, writer: *Io.Writer, err: anyerror) void {
     const close_code: ?u16 = switch (err) {
         error.MessageTooLarge, error.FrameTooLarge => 1009,
         error.InvalidUtf8 => 1007,

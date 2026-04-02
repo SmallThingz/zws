@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const Io = std.Io;
 
 const conn = @import("conn.zig");
@@ -10,10 +11,19 @@ pub const ReceiveMode = enum {
     stream,
 };
 
+pub const ExecutionMode = enum {
+    sequential,
+    async,
+};
+
 pub const Options = struct {
     receive_mode: ReceiveMode = .solid_slice,
+    execution: ExecutionMode = .sequential,
     auto_flush: bool = true,
     close_on_handler_error: bool = true,
+    async_max_inflight: usize = 4,
+    message_buffer_len: usize = 64 * 1024,
+    stage_buffer_len: usize = 0,
 };
 
 pub const Body = union(enum) {
@@ -27,22 +37,37 @@ pub const Response = struct {
     body: Body = .none,
 };
 
+pub fn Scratch(comptime opts: Options) type {
+    comptime validateOptions(opts);
+    return switch (opts.execution) {
+        .sequential => SequentialScratch(opts),
+        .async => AsyncScratch(opts),
+    };
+}
+
 pub fn SliceContext(comptime ConnType: type, comptime StateType: type) type {
     return struct {
         io: Io,
-        conn: *ConnType,
         state: *StateType,
         message: conn.Message,
+        _output: ContextOutput(ConnType),
+        _stage_buf: []u8 = &.{},
 
         const Self = @This();
 
         pub fn respond(self: *Self, value: anytype) anyerror!void {
             const normalized = normalizeResponse(value);
-            try writeNormalizedResponse(self.conn, self.message.opcode, normalized);
+            switch (self._output) {
+                .conn => |c| try writeNormalizedResponse(c, self.message.opcode, normalized, self._stage_buf),
+                .async => |a| try a.writeResponse(self.message.opcode, normalized, self._stage_buf),
+            }
         }
 
         pub fn flush(self: *Self) anyerror!void {
-            try self.conn.flush();
+            switch (self._output) {
+                .conn => |c| try c.flush(),
+                .async => |a| try a.flush(),
+            }
         }
     };
 }
@@ -50,9 +75,10 @@ pub fn SliceContext(comptime ConnType: type, comptime StateType: type) type {
 pub fn StreamContext(comptime ConnType: type, comptime StateType: type) type {
     return struct {
         io: Io,
-        conn: *ConnType,
         state: *StateType,
         stream: *StreamReader(ConnType),
+        _output: ContextOutput(ConnType),
+        _stage_buf: []u8 = &.{},
 
         const Self = @This();
 
@@ -70,11 +96,17 @@ pub fn StreamContext(comptime ConnType: type, comptime StateType: type) type {
 
         pub fn respond(self: *Self, value: anytype) anyerror!void {
             const normalized = normalizeResponse(value);
-            try writeNormalizedResponse(self.conn, self.stream.opcode, normalized);
+            switch (self._output) {
+                .conn => |c| try writeNormalizedResponse(c, self.stream.opcode, normalized, self._stage_buf),
+                .async => |a| try a.writeResponse(self.stream.opcode, normalized, self._stage_buf),
+            }
         }
 
         pub fn flush(self: *Self) anyerror!void {
-            try self.conn.flush();
+            switch (self._output) {
+                .conn => |c| try c.flush(),
+                .async => |a| try a.flush(),
+            }
         }
     };
 }
@@ -152,7 +184,24 @@ pub fn run(
     io: Io,
     conn_ptr: anytype,
     state_ptr: anytype,
-    message_buf: []u8,
+    scratch: *Scratch(opts),
+    comptime handler: anytype,
+) anyerror!void {
+    comptime validateOptions(opts);
+    _ = handlerFnInfo(@TypeOf(handler));
+
+    if (comptime opts.execution == .sequential) {
+        return runSequential(opts, io, conn_ptr, state_ptr, scratch, handler);
+    }
+    return runAsync(opts, io, conn_ptr, state_ptr, scratch, handler);
+}
+
+fn runSequential(
+    comptime opts: Options,
+    io: Io,
+    conn_ptr: anytype,
+    state_ptr: anytype,
+    scratch: *SequentialScratch(opts),
     comptime handler: anytype,
 ) anyerror!void {
     const ConnType = pointerChildType(@TypeOf(conn_ptr), "conn_ptr");
@@ -160,18 +209,18 @@ pub fn run(
 
     if (comptime opts.receive_mode == .solid_slice) {
         while (true) {
-            const message = conn_ptr.readMessage(message_buf) catch |err| switch (err) {
+            const message = conn_ptr.readMessage(scratch.message_buf[0..]) catch |err| switch (err) {
                 error.EndOfStream, error.ConnectionClosed => return,
                 else => return err,
             };
 
             var ctx: SliceContext(ConnType, StateType) = .{
                 .io = io,
-                .conn = conn_ptr,
                 .state = state_ptr,
                 .message = message,
+                ._output = .{ .conn = conn_ptr },
             };
-            try processHandlerResult(opts, io, conn_ptr, message.opcode, handler, &ctx);
+            try processHandlerResult(opts, io, &ctx, handler);
         }
     }
 
@@ -183,16 +232,152 @@ pub fn run(
         var stream = StreamReader(ConnType).init(conn_ptr, start);
         var ctx: StreamContext(ConnType, StateType) = .{
             .io = io,
-            .conn = conn_ptr,
             .state = state_ptr,
             .stream = &stream,
+            ._output = .{ .conn = conn_ptr },
         };
-        try processHandlerResult(opts, io, conn_ptr, start.opcode, handler, &ctx);
+        try processHandlerResult(opts, io, &ctx, handler);
         stream.discard() catch |err| switch (err) {
             error.EndOfStream, error.ConnectionClosed => return,
             else => return err,
         };
     }
+}
+
+fn runAsync(
+    comptime opts: Options,
+    io: Io,
+    conn_ptr: anytype,
+    state_ptr: anytype,
+    scratch: *AsyncScratch(opts),
+    comptime handler: anytype,
+) anyerror!void {
+    const ConnType = pointerChildType(@TypeOf(conn_ptr), "conn_ptr");
+    const StateType = pointerChildType(@TypeOf(state_ptr), "state_ptr");
+    const HooksType = @TypeOf(conn_ptr.hooks);
+    const ReadConnType = conn.ConnWithHooks(.{
+        .role = ConnType.static_config.role,
+        .auto_pong = true,
+        .auto_reply_close = true,
+        .validate_utf8 = ConnType.static_config.validate_utf8,
+        .runtime_hooks = ConnType.static_config.runtime_hooks,
+        .permessage_deflate_context_takeover = ConnType.static_config.permessage_deflate_context_takeover,
+        .permessage_deflate_min_payload_len = ConnType.static_config.permessage_deflate_min_payload_len,
+        .permessage_deflate_require_compression_gain = ConnType.static_config.permessage_deflate_require_compression_gain,
+    }, HooksType);
+    const Shared = AsyncShared(ConnType);
+    const Slot = AsyncSlot(opts);
+
+    var shared: Shared = .{
+        .io = io,
+        .conn = conn_ptr,
+    };
+    var output: AsyncOutput(ConnType) = .{
+        .shared = &shared,
+    };
+
+    var read_writer_buf: [256]u8 = undefined;
+    var read_writer = LockedWriterProxy.init(io, conn_ptr.writer, &shared.write_mutex, read_writer_buf[0..]);
+    var read_conn = ReadConnType.initWithHooks(conn_ptr.reader, &read_writer.interface, conn_ptr.config, conn_ptr.hooks);
+
+    const Worker = struct {
+        fn main(slot: *Slot, shared_ptr: *Shared, output_ptr: *AsyncOutput(ConnType), state: *StateType) void {
+            while (true) {
+                slot.mutex.lockUncancelable(shared_ptr.io);
+                while (!slot.has_work and !slot.stop) {
+                    slot.cond.waitUncancelable(shared_ptr.io, &slot.mutex);
+                }
+                if (slot.stop and !slot.has_work) {
+                    slot.mutex.unlock(shared_ptr.io);
+                    return;
+                }
+                const opcode = slot.opcode;
+                const message_len = slot.message_len;
+                slot.has_work = false;
+                slot.mutex.unlock(shared_ptr.io);
+
+                var ctx: SliceContext(ConnType, StateType) = .{
+                    .io = shared_ptr.io,
+                    .state = state,
+                    .message = .{
+                        .opcode = opcode,
+                        .payload = slot.message_buf[0..message_len],
+                    },
+                    ._output = .{ .async = output_ptr },
+                    ._stage_buf = slot.stage_buf[0..],
+                };
+
+                processHandlerResult(opts, shared_ptr.io, &ctx, handler) catch |err| {
+                    _ = shared_ptr.recordError(err);
+                };
+                shared_ptr.finishSlot(slot);
+            }
+        }
+    };
+
+    var started_threads: usize = 0;
+    errdefer {
+        for (scratch.slots[0..started_threads]) |*slot| {
+            slot.mutex.lockUncancelable(io);
+            slot.stop = true;
+            slot.cond.signal(io);
+            slot.mutex.unlock(io);
+        }
+        for (scratch.slots[0..started_threads]) |*slot| {
+            if (slot.thread) |thread| thread.join();
+            slot.thread = null;
+        }
+    }
+
+    for (&scratch.slots) |*slot| {
+        slot.* = .{};
+        slot.thread = try std.Thread.spawn(.{}, Worker.main, .{ slot, &shared, &output, state_ptr });
+        started_threads += 1;
+    }
+    while (try shared.reserveSlot(scratch.slots[0..])) |slot_index| {
+        const slot = &scratch.slots[slot_index];
+        read_conn.close_sent = conn_ptr.close_sent;
+
+        const message = read_conn.readMessage(slot.message_buf[0..]) catch |err| switch (err) {
+            error.EndOfStream => {
+                shared.releaseReservedSlot(slot);
+                shared.stopAccepting(false);
+                break;
+            },
+            error.ConnectionClosed => {
+                shared.releaseReservedSlot(slot);
+                conn_ptr.close_received = conn_ptr.close_received or read_conn.close_received;
+                conn_ptr.close_sent = conn_ptr.close_sent or read_conn.close_sent;
+                shared.stopAccepting(true);
+                break;
+            },
+            else => {
+                shared.releaseReservedSlot(slot);
+                _ = shared.recordError(err);
+                break;
+            },
+        };
+
+        slot.mutex.lockUncancelable(io);
+        slot.opcode = message.opcode;
+        slot.message_len = message.payload.len;
+        slot.has_work = true;
+        slot.cond.signal(io);
+        slot.mutex.unlock(io);
+    }
+
+    for (&scratch.slots) |*slot| {
+        slot.mutex.lockUncancelable(io);
+        slot.stop = true;
+        slot.cond.signal(io);
+        slot.mutex.unlock(io);
+    }
+    for (&scratch.slots) |*slot| {
+        if (slot.thread) |thread| thread.join();
+        slot.thread = null;
+    }
+
+    if (shared.firstError()) |err| return err;
 }
 
 fn beginMessageStream(c: anytype) anyerror!MessageStart {
@@ -237,14 +422,7 @@ fn handleControlFrame(c: anytype, payload: []const u8, opcode: conn.Opcode) anye
     }
 }
 
-fn processHandlerResult(
-    comptime opts: Options,
-    io: Io,
-    conn_ptr: anytype,
-    request_opcode: conn.MessageOpcode,
-    comptime handler: anytype,
-    ctx: anytype,
-) anyerror!void {
+fn processHandlerResult(comptime opts: Options, io: Io, ctx: anytype, comptime handler: anytype) anyerror!void {
     const fn_info = handlerFnInfo(@TypeOf(handler));
     const ReturnType = fn_info.return_type orelse @compileError("handler must have a return type");
     const raw: ReturnType = callHandler(ReturnType, handler, io, ctx);
@@ -252,31 +430,40 @@ fn processHandlerResult(
     switch (raw_info) {
         .error_union => {
             const value = raw catch |err| {
-                try handleHandlerError(opts, conn_ptr);
+                handleHandlerError(opts, ctx, err);
                 return err;
             };
-            try writeResult(conn_ptr, request_opcode, value);
+            try writeResult(ctx, value);
         },
         else => {
-            try writeResult(conn_ptr, request_opcode, raw);
+            try writeResult(ctx, raw);
         },
     }
     if (comptime opts.auto_flush) {
-        try conn_ptr.flush();
+        try ctx.flush();
     }
 }
 
-fn writeResult(conn_ptr: anytype, request_opcode: conn.MessageOpcode, value: anytype) anyerror!void {
+fn writeResult(ctx: anytype, value: anytype) anyerror!void {
     const T = @TypeOf(value);
     if (T == void) return;
-    const normalized = normalizeResponse(value);
-    try writeNormalizedResponse(conn_ptr, request_opcode, normalized);
+    try ctx.respond(value);
 }
 
-fn handleHandlerError(comptime opts: Options, conn_ptr: anytype) anyerror!void {
-    if (comptime !opts.close_on_handler_error) return;
-    conn_ptr.writeClose(1011, "") catch {};
-    conn_ptr.flush() catch {};
+fn handleHandlerError(comptime opts: Options, ctx: anytype, err: anyerror) void {
+    switch (ctx._output) {
+        .conn => |c| {
+            if (comptime !opts.close_on_handler_error) return;
+            c.writeClose(1011, "") catch {};
+            c.flush() catch {};
+        },
+        .async => |a| {
+            const first = a.shared.recordError(err);
+            if (comptime !opts.close_on_handler_error) return;
+            if (!first) return;
+            a.sendInternalClose(1011, "");
+        },
+    }
 }
 
 fn callHandler(comptime ReturnType: type, comptime handler: anytype, io: Io, ctx: anytype) ReturnType {
@@ -295,45 +482,62 @@ fn handlerFnInfo(comptime HandlerType: type) std.builtin.Type.Fn {
     };
 }
 
-fn writeNormalizedResponse(conn_ptr: anytype, request_opcode: conn.MessageOpcode, response: Response) anyerror!void {
+fn writeNormalizedResponse(target: anytype, request_opcode: conn.MessageOpcode, response: Response, stage_buf: []u8) anyerror!void {
     const response_opcode = response.opcode orelse request_opcode;
     switch (response.body) {
         .none => return,
-        .bytes => |body| {
-            try writeSingleBody(conn_ptr, response_opcode, body);
-        },
+        .bytes => |body| try writeSingleBody(target, response_opcode, body),
         .chunks => |chunks| {
-            try writeChunkedBody(conn_ptr, response_opcode, chunks);
+            if (stageChunks(stage_buf, chunks)) |staged| {
+                try writeSingleBody(target, response_opcode, staged);
+            } else {
+                try writeChunkedBody(target, response_opcode, chunks);
+            }
         },
     }
 }
 
-fn writeSingleBody(conn_ptr: anytype, opcode: conn.MessageOpcode, body: []const u8) anyerror!void {
+fn writeSingleBody(target: anytype, opcode: conn.MessageOpcode, body: []const u8) anyerror!void {
     switch (opcode) {
-        .text => try conn_ptr.writeText(body),
-        .binary => try conn_ptr.writeBinary(body),
+        .text => try target.writeText(body),
+        .binary => try target.writeBinary(body),
     }
 }
 
-fn writeChunkedBody(conn_ptr: anytype, opcode: conn.MessageOpcode, chunks: []const []const u8) anyerror!void {
+fn writeChunkedBody(target: anytype, opcode: conn.MessageOpcode, chunks: []const []const u8) anyerror!void {
     const first_opcode = switch (opcode) {
         .text => conn.Opcode.text,
         .binary => conn.Opcode.binary,
     };
 
     if (chunks.len == 0) {
-            try conn_ptr.writeFrame(first_opcode, "", true, false);
-            return;
-        }
+        try target.writeFrame(first_opcode, "", true, false);
+        return;
+    }
 
     for (chunks, 0..) |chunk, idx| {
         const fin = idx + 1 == chunks.len;
         if (idx == 0) {
-            try conn_ptr.writeFrame(first_opcode, chunk, fin, false);
+            try target.writeFrame(first_opcode, chunk, fin, false);
         } else {
-            try conn_ptr.writeFrame(.continuation, chunk, fin, false);
+            try target.writeFrame(.continuation, chunk, fin, false);
         }
     }
+}
+
+fn stageChunks(stage_buf: []u8, chunks: []const []const u8) ?[]const u8 {
+    if (chunks.len == 0) return "";
+    var total: usize = 0;
+    for (chunks) |chunk| {
+        total = std.math.add(usize, total, chunk.len) catch return null;
+        if (total > stage_buf.len) return null;
+    }
+    var end: usize = 0;
+    for (chunks) |chunk| {
+        @memcpy(stage_buf[end..][0..chunk.len], chunk);
+        end += chunk.len;
+    }
+    return stage_buf[0..end];
 }
 
 fn normalizeResponse(value: anytype) Response {
@@ -408,6 +612,236 @@ fn pointerChildType(comptime PointerType: type, comptime label: []const u8) type
     return info.pointer.child;
 }
 
+fn validateOptions(comptime opts: Options) void {
+    if (opts.receive_mode == .solid_slice and opts.message_buffer_len == 0) {
+        @compileError("handler solid-slice mode requires message_buffer_len > 0");
+    }
+    if (opts.execution == .async) {
+        if (builtin.single_threaded) {
+            @compileError("handler async mode requires a threaded build");
+        }
+        if (opts.receive_mode != .solid_slice) {
+            @compileError("handler async mode only supports .receive_mode = .solid_slice");
+        }
+        if (opts.async_max_inflight == 0) {
+            @compileError("handler async mode requires async_max_inflight > 0");
+        }
+    }
+}
+
+fn SequentialScratch(comptime opts: Options) type {
+    return struct {
+        message_buf: [if (opts.receive_mode == .solid_slice) opts.message_buffer_len else 0]u8 = undefined,
+
+        const Self = @This();
+
+        pub fn init() Self {
+            return .{};
+        }
+    };
+}
+
+fn AsyncScratch(comptime opts: Options) type {
+    return struct {
+        slots: [opts.async_max_inflight]AsyncSlot(opts) = undefined,
+
+        const Self = @This();
+
+        pub fn init() Self {
+            var out: Self = undefined;
+            inline for (&out.slots) |*slot| slot.* = .{};
+            return out;
+        }
+    };
+}
+
+fn AsyncSlot(comptime opts: Options) type {
+    const stage_len = effectiveStageBufferLen(opts);
+    return struct {
+        busy: bool = false,
+        mutex: Io.Mutex = .init,
+        cond: Io.Condition = .init,
+        has_work: bool = false,
+        stop: bool = false,
+        opcode: conn.MessageOpcode = .text,
+        message_len: usize = 0,
+        message_buf: [opts.message_buffer_len]u8 = undefined,
+        stage_buf: [stage_len]u8 = undefined,
+        thread: ?std.Thread = null,
+    };
+}
+
+fn effectiveStageBufferLen(comptime opts: Options) usize {
+    return if (opts.stage_buffer_len == 0) opts.message_buffer_len else opts.stage_buffer_len;
+}
+
+fn ContextOutput(comptime ConnType: type) type {
+    return union(enum) {
+        conn: *ConnType,
+        async: *AsyncOutput(ConnType),
+    };
+}
+
+fn AsyncShared(comptime ConnType: type) type {
+    return struct {
+        io: Io,
+        conn: *ConnType,
+        write_mutex: Io.Mutex = .init,
+        mutex: Io.Mutex = .init,
+        cond: Io.Condition = .init,
+        stopping: bool = false,
+        shutdown: std.atomic.Value(bool) = .init(false),
+        inflight: usize = 0,
+        first_error: ?anyerror = null,
+
+        const Self = @This();
+
+        fn reserveSlot(self: *Self, slots: anytype) Io.Cancelable!?usize {
+            try self.mutex.lock(self.io);
+            defer self.mutex.unlock(self.io);
+
+            while (true) {
+                if (self.stopping) return null;
+                for (slots, 0..) |*slot, idx| {
+                    if (!slot.busy) {
+                        slot.busy = true;
+                        self.inflight += 1;
+                        return idx;
+                    }
+                }
+                try self.cond.wait(self.io, &self.mutex);
+            }
+        }
+
+        fn releaseReservedSlot(self: *Self, slot: anytype) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            slot.busy = false;
+            self.inflight -= 1;
+            self.cond.signal(self.io);
+        }
+
+        fn finishSlot(self: *Self, slot: anytype) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            slot.busy = false;
+            self.inflight -= 1;
+            self.cond.signal(self.io);
+        }
+
+        fn stopAccepting(self: *Self, shutdown_writes: bool) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            self.stopping = true;
+            if (shutdown_writes) self.shutdown.store(true, .release);
+            self.cond.broadcast(self.io);
+        }
+
+        fn recordError(self: *Self, err: anyerror) bool {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            const first = self.first_error == null;
+            if (first) self.first_error = err;
+            self.stopping = true;
+            self.shutdown.store(true, .release);
+            self.cond.broadcast(self.io);
+            return first;
+        }
+
+        fn firstError(self: *Self) ?anyerror {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            return self.first_error;
+        }
+    };
+}
+
+fn AsyncOutput(comptime ConnType: type) type {
+    return struct {
+        shared: *AsyncShared(ConnType),
+
+        const Self = @This();
+
+        pub fn writeResponse(self: *Self, request_opcode: conn.MessageOpcode, response: Response, stage_buf: []u8) anyerror!void {
+            try self.shared.write_mutex.lock(self.shared.io);
+            defer self.shared.write_mutex.unlock(self.shared.io);
+            if (self.shared.shutdown.load(.acquire)) return error.ConnectionClosed;
+            try writeNormalizedResponse(self.shared.conn, request_opcode, response, stage_buf);
+        }
+
+        pub fn flush(self: *Self) anyerror!void {
+            try self.shared.write_mutex.lock(self.shared.io);
+            defer self.shared.write_mutex.unlock(self.shared.io);
+            if (self.shared.shutdown.load(.acquire)) return error.ConnectionClosed;
+            try self.shared.conn.flush();
+        }
+
+        fn sendInternalClose(self: *Self, code: ?u16, reason: []const u8) void {
+            self.shared.write_mutex.lockUncancelable(self.shared.io);
+            defer self.shared.write_mutex.unlock(self.shared.io);
+            self.shared.conn.writeClose(code, reason) catch {};
+            self.shared.conn.flush() catch {};
+        }
+    };
+}
+
+const LockedWriterProxy = struct {
+    interface: Io.Writer,
+    io: Io,
+    target: *Io.Writer,
+    mutex: *Io.Mutex,
+
+    fn init(io: Io, target: *Io.Writer, mutex: *Io.Mutex, buffer: []u8) LockedWriterProxy {
+        return .{
+            .interface = .{
+                .vtable = &.{
+                    .drain = drain,
+                    .flush = flush,
+                    .rebase = rebase,
+                },
+                .buffer = buffer,
+            },
+            .io = io,
+            .target = target,
+            .mutex = mutex,
+        };
+    }
+
+    fn drain(io_w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+        const self: *LockedWriterProxy = @fieldParentPtr("interface", io_w);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const buffered = io_w.buffered();
+        if (buffered.len != 0) {
+            try self.target.writeAll(buffered);
+            _ = io_w.consumeAll();
+        }
+        return self.target.writeSplat(data, splat);
+    }
+
+    fn flush(io_w: *Io.Writer) Io.Writer.Error!void {
+        const self: *LockedWriterProxy = @fieldParentPtr("interface", io_w);
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const buffered = io_w.buffered();
+        if (buffered.len != 0) {
+            try self.target.writeAll(buffered);
+            _ = io_w.consumeAll();
+        }
+        try self.target.flush();
+    }
+
+    fn rebase(io_w: *Io.Writer, preserve: usize, capacity: usize) Io.Writer.Error!void {
+        _ = capacity;
+        if (preserve > io_w.end or preserve > io_w.buffer.len) return error.WriteFailed;
+        const start = io_w.end - preserve;
+        std.mem.copyForwards(u8, io_w.buffer[0..preserve], io_w.buffer[start..][0..preserve]);
+        io_w.end = preserve;
+    }
+};
+
 test "run solid-slice mode invokes handler and writes byte-slice response" {
     var input: std.ArrayList(u8) = .empty;
     defer input.deinit(std.testing.allocator);
@@ -435,7 +869,8 @@ test "run solid-slice mode invokes handler and writes byte-slice response" {
         }
     };
 
-    try run(.{}, io, &server_conn, &state, output[0..], H.handle);
+    var scratch = Scratch(.{}).init();
+    try run(.{}, io, &server_conn, &state, &scratch, H.handle);
     try std.testing.expectEqual(@as(usize, 1), state.calls);
 
     var out_reader = Io.Reader.fixed(output[0..writer.end]);
@@ -473,7 +908,8 @@ test "run solid-slice mode accepts struct responses with body and opcode" {
         }
     };
     var state: u8 = 0;
-    try run(.{}, io, &server_conn, &state, output[0..], H.handle);
+    var scratch = Scratch(.{}).init();
+    try run(.{}, io, &server_conn, &state, &scratch, H.handle);
 
     var out_reader = Io.Reader.fixed(output[0..writer.end]);
     var sink: [0]u8 = .{};
@@ -504,7 +940,8 @@ test "run solid-slice mode writes chunked response bodies as fragmented frames" 
         }
     };
     var state: u8 = 0;
-    try run(.{}, io, &server_conn, &state, output[0..], H.handle);
+    var scratch = Scratch(.{}).init();
+    try run(.{}, io, &server_conn, &state, &scratch, H.handle);
 
     var out_reader = Io.Reader.fixed(output[0..writer.end]);
     var sink: [0]u8 = .{};
@@ -551,7 +988,8 @@ test "run stream mode reads fragmented messages without internal message assembl
         }
     };
 
-    try run(.{ .receive_mode = .stream }, io, &server_conn, &state, &.{}, H.handle);
+    var scratch = Scratch(.{ .receive_mode = .stream }).init();
+    try run(.{ .receive_mode = .stream }, io, &server_conn, &state, &scratch, H.handle);
 
     var out_reader = Io.Reader.fixed(output[0..writer.end]);
     var sink: [0]u8 = .{};
@@ -592,7 +1030,8 @@ test "run accepts handlers that take io and return error unions" {
         }
     };
     var state: u8 = 0;
-    try run(.{}, io, &server_conn, &state, output[0..], H.handle);
+    var scratch = Scratch(.{}).init();
+    try run(.{}, io, &server_conn, &state, &scratch, H.handle);
 }
 
 test "run closes with 1011 on handler error by default" {
@@ -612,7 +1051,8 @@ test "run closes with 1011 on handler error by default" {
         }
     };
     var state: u8 = 0;
-    try std.testing.expectError(error.HandlerFailed, run(.{}, io, &server_conn, &state, output[0..], H.handle));
+    var scratch = Scratch(.{}).init();
+    try std.testing.expectError(error.HandlerFailed, run(.{}, io, &server_conn, &state, &scratch, H.handle));
 
     var out_reader = Io.Reader.fixed(output[0..writer.end]);
     var sink: [0]u8 = .{};
@@ -642,7 +1082,8 @@ test "run can skip 1011 close on handler error when configured" {
         }
     };
     var state: u8 = 0;
-    try std.testing.expectError(error.HandlerFailed, run(.{ .close_on_handler_error = false }, io, &server_conn, &state, output[0..], H.handle));
+    var scratch = Scratch(.{ .close_on_handler_error = false }).init();
+    try std.testing.expectError(error.HandlerFailed, run(.{ .close_on_handler_error = false }, io, &server_conn, &state, &scratch, H.handle));
     try std.testing.expectEqual(@as(usize, 0), writer.end);
 }
 
@@ -663,7 +1104,8 @@ test "run supports struct responses with empty body" {
         }
     };
     var state: u8 = 0;
-    try run(.{}, io, &server_conn, &state, output[0..], H.handle);
+    var scratch = Scratch(.{}).init();
+    try run(.{}, io, &server_conn, &state, &scratch, H.handle);
     try std.testing.expectEqual(@as(usize, 0), writer.end);
 }
 
@@ -686,12 +1128,12 @@ test "run stream mode discards unread message tail before continuing" {
             var tmp: [2]u8 = undefined;
             const first = try ctx.readChunk(tmp[0..]);
             try std.testing.expectEqualStrings("he", first);
-            // Return early without consuming the full message; run() must discard tail.
             return "ok";
         }
     };
     var state: u8 = 0;
-    try run(.{ .receive_mode = .stream }, io, &server_conn, &state, &.{}, H.handle);
+    var scratch = Scratch(.{ .receive_mode = .stream }).init();
+    try run(.{ .receive_mode = .stream }, io, &server_conn, &state, &scratch, H.handle);
 
     var out_reader = Io.Reader.fixed(output[0..writer.end]);
     var sink: [0]u8 = .{};
@@ -709,9 +1151,12 @@ test "run stream mode discards unread message tail before continuing" {
 
 test "run stream mode rejects compressed messages" {
     const wire = [_]u8{
-        0xC1, // FIN + RSV1 + text opcode
-        0x81, // masked + payload len 1
-        0x01, 0x02, 0x03, 0x04,
+        0xC1,
+        0x81,
+        0x01,
+        0x02,
+        0x03,
+        0x04,
         'x' ^ 0x01,
     };
     var reader = Io.Reader.fixed(wire[0..]);
@@ -730,8 +1175,117 @@ test "run stream mode rejects compressed messages" {
         fn handle(_: *StreamContext(conn.Server, u8)) !void {}
     };
     var state: u8 = 0;
+    var scratch = Scratch(.{ .receive_mode = .stream }).init();
     try std.testing.expectError(
         error.InvalidCompressedMessage,
-        run(.{ .receive_mode = .stream }, io, &server_conn, &state, &.{}, H.handle),
+        run(.{ .receive_mode = .stream }, io, &server_conn, &state, &scratch, H.handle),
     );
+}
+
+test "async mode processes multiple messages concurrently and writes completion-order replies" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "slow", .{ 1, 2, 3, 4 });
+    try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "fast", .{ 5, 6, 7, 8 });
+
+    var reader = Io.Reader.fixed(input.items);
+    var output: [512]u8 = undefined;
+    var writer = Io.Writer.fixed(output[0..]);
+    var server_conn = conn.Server.init(&reader, &writer, .{});
+    const io = std.testing.io;
+
+    const State = struct {
+        mutex: Io.Mutex = .init,
+        cond: Io.Condition = .init,
+        calls: usize = 0,
+        fast_done: bool = false,
+    };
+    var state: State = .{};
+
+    const H = struct {
+        fn handle(ctx: *SliceContext(conn.Server, State)) ![]const u8 {
+            ctx.state.mutex.lockUncancelable(ctx.io);
+            ctx.state.calls += 1;
+            if (std.mem.eql(u8, ctx.message.payload, "slow")) {
+                while (!ctx.state.fast_done) {
+                    ctx.state.cond.waitUncancelable(ctx.io, &ctx.state.mutex);
+                }
+                ctx.state.mutex.unlock(ctx.io);
+                return "slow-reply";
+            }
+            ctx.state.fast_done = true;
+            ctx.state.cond.signal(ctx.io);
+            ctx.state.mutex.unlock(ctx.io);
+            return "fast-reply";
+        }
+    };
+
+    var scratch = Scratch(.{
+        .execution = .async,
+        .async_max_inflight = 2,
+        .message_buffer_len = 64,
+        .stage_buffer_len = 64,
+    }).init();
+    try run(.{
+        .execution = .async,
+        .async_max_inflight = 2,
+        .message_buffer_len = 64,
+        .stage_buffer_len = 64,
+    }, io, &server_conn, &state, &scratch, H.handle);
+
+    try std.testing.expectEqual(@as(usize, 2), state.calls);
+
+    var out_reader = Io.Reader.fixed(output[0..writer.end]);
+    var sink: [0]u8 = .{};
+    var out_writer = Io.Writer.fixed(sink[0..]);
+    var client = conn.Client.init(&out_reader, &out_writer, .{});
+    var message_buf: [64]u8 = undefined;
+
+    const first = try client.readMessage(message_buf[0..]);
+    try std.testing.expectEqualStrings("fast-reply", first.payload);
+    const second = try client.readMessage(message_buf[0..]);
+    try std.testing.expectEqualStrings("slow-reply", second.payload);
+}
+
+test "async mode sends one 1011 and returns handler error" {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    var input: std.ArrayList(u8) = .empty;
+    defer input.deinit(std.testing.allocator);
+    try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "boom", .{ 1, 2, 3, 4 });
+
+    var reader = Io.Reader.fixed(input.items);
+    var output: [256]u8 = undefined;
+    var writer = Io.Writer.fixed(output[0..]);
+    var server_conn = conn.Server.init(&reader, &writer, .{});
+    const io = std.testing.io;
+
+    const H = struct {
+        fn handle(_: *SliceContext(conn.Server, u8)) error{HandlerFailed}!void {
+            return error.HandlerFailed;
+        }
+    };
+    var state: u8 = 0;
+    var scratch = Scratch(.{
+        .execution = .async,
+        .async_max_inflight = 1,
+        .message_buffer_len = 64,
+    }).init();
+    try std.testing.expectError(error.HandlerFailed, run(.{
+        .execution = .async,
+        .async_max_inflight = 1,
+        .message_buffer_len = 64,
+    }, io, &server_conn, &state, &scratch, H.handle));
+
+    var out_reader = Io.Reader.fixed(output[0..writer.end]);
+    var sink: [0]u8 = .{};
+    var out_writer = Io.Writer.fixed(sink[0..]);
+    var client = conn.Client.init(&out_reader, &out_writer, .{});
+    var payload: [16]u8 = undefined;
+    const frame = try client.readFrame(payload[0..]);
+    try std.testing.expectEqual(conn.Opcode.close, frame.header.opcode);
+    const close_frame = try conn.parseClosePayload(frame.payload, true);
+    try std.testing.expectEqual(@as(?u16, 1011), close_frame.code);
 }

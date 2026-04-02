@@ -134,6 +134,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
     if (comptime runtime_hooks) observe.validateHooks(Hooks);
 
     return struct {
+        pub const static_config = static;
+
         reader: *Io.Reader,
         writer: *Io.Writer,
         config: Config,

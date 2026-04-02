@@ -1,6 +1,14 @@
 const std = @import("std");
 const builtin = @import("builtin");
 
+const RootReadmeBenchCompareStartMarker = "<!-- BENCH_COMPARE:START -->";
+const RootReadmeBenchCompareEndMarker = "<!-- BENCH_COMPARE:END -->";
+const BenchmarkReadmeBenchCompareStartMarker = "<!-- BENCH_COMPARE:START -->";
+const BenchmarkReadmeBenchCompareEndMarker = "<!-- BENCH_COMPARE:END -->";
+const BenchmarkResultsRelDir = "benchmark/results";
+const BenchmarkLatestJsonRelPath = "benchmark/results/latest.json";
+const BenchmarkLatestMdRelPath = "benchmark/results/latest.md";
+
 pub fn envInt(env: *const std.process.Environ.Map, name: []const u8, default: usize) usize {
     const v = env.get(name) orelse return default;
     return std.fmt.parseInt(usize, v, 10) catch default;
@@ -91,4 +99,113 @@ pub fn buildUwsServer(
     }, root, &env);
 
     return out_path;
+}
+
+fn readFileMaybe(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !?[]u8 {
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch |err| switch (err) {
+        error.FileNotFound => return null,
+        else => return err,
+    };
+    defer file.close(io);
+
+    const stat = try file.stat(io);
+    if (stat.size > std.math.maxInt(usize)) return error.FileTooLarge;
+    const len: usize = @intCast(stat.size);
+
+    const out = try allocator.alloc(u8, len);
+    errdefer allocator.free(out);
+
+    var buffer: [4096]u8 = undefined;
+    var reader = file.reader(io, &buffer);
+    try reader.interface.readSliceAll(out);
+    return out;
+}
+
+fn writeFileIfChanged(io: std.Io, allocator: std.mem.Allocator, path: []const u8, bytes: []const u8) !bool {
+    const existing = try readFileMaybe(io, allocator, path);
+    if (existing) |buf| {
+        defer allocator.free(buf);
+        if (std.mem.eql(u8, buf, bytes)) return false;
+    }
+    const file = try std.Io.Dir.createFileAbsolute(io, path, .{ .truncate = true });
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var writer = file.writer(io, &buf);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
+    return true;
+}
+
+fn updateReadmeSectionAtPath(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    start_marker: []const u8,
+    end_marker: []const u8,
+    replacement: []const u8,
+) !void {
+    const readme = try readFileMaybe(io, allocator, path) orelse return error.FileNotFound;
+    defer allocator.free(readme);
+
+    const start = std.mem.indexOf(u8, readme, start_marker) orelse return error.ReadmeBenchMarkersMissing;
+    const after_start = start + start_marker.len;
+    const end = std.mem.indexOfPos(u8, readme, after_start, end_marker) orelse return error.ReadmeBenchMarkersMissing;
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, readme[0..after_start]);
+    try out.appendSlice(allocator, "\n\n");
+    try out.appendSlice(allocator, replacement);
+    if (replacement.len == 0 or replacement[replacement.len - 1] != '\n') try out.append(allocator, '\n');
+    if (readme[end - 1] != '\n') try out.append(allocator, '\n');
+    try out.appendSlice(allocator, readme[end..]);
+
+    _ = try writeFileIfChanged(io, allocator, path, out.items);
+}
+
+fn syncReadmes(io: std.Io, allocator: std.mem.Allocator, root: []const u8, replacement: []const u8) !void {
+    const root_readme_path = try std.fs.path.join(allocator, &.{ root, "README.md" });
+    defer allocator.free(root_readme_path);
+    try updateReadmeSectionAtPath(
+        io,
+        allocator,
+        root_readme_path,
+        RootReadmeBenchCompareStartMarker,
+        RootReadmeBenchCompareEndMarker,
+        replacement,
+    );
+
+    const benchmark_readme_path = try std.fs.path.join(allocator, &.{ root, "benchmark", "README.md" });
+    defer allocator.free(benchmark_readme_path);
+    try updateReadmeSectionAtPath(
+        io,
+        allocator,
+        benchmark_readme_path,
+        BenchmarkReadmeBenchCompareStartMarker,
+        BenchmarkReadmeBenchCompareEndMarker,
+        replacement,
+    );
+}
+
+pub fn writeCompareArtifactsAndSyncReadme(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    root: []const u8,
+    summary_md: []const u8,
+    full_md: []const u8,
+    json: []const u8,
+) !void {
+    const results_dir = try std.fs.path.join(allocator, &.{ root, BenchmarkResultsRelDir });
+    defer allocator.free(results_dir);
+    try std.Io.Dir.createDirPath(.cwd(), io, results_dir);
+
+    const json_path = try std.fs.path.join(allocator, &.{ root, BenchmarkLatestJsonRelPath });
+    defer allocator.free(json_path);
+    _ = try writeFileIfChanged(io, allocator, json_path, json);
+
+    const md_path = try std.fs.path.join(allocator, &.{ root, BenchmarkLatestMdRelPath });
+    defer allocator.free(md_path);
+    _ = try writeFileIfChanged(io, allocator, md_path, full_md);
+
+    try syncReadmes(io, allocator, root, summary_md);
 }

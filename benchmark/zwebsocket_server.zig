@@ -3,29 +3,77 @@ const zws = @import("zwebsocket");
 const common = @import("zws_support_common");
 
 const Io = std.Io;
-const BenchConn = zws.Conn.Type(.{
+
+const Mode = enum {
+    sync,
+    async,
+};
+
+const BenchConnSync = zws.Conn.Type(.{
     .role = .server,
-    .auto_pong = false,
-    .auto_reply_close = false,
+    .auto_pong = true,
+    .auto_reply_close = true,
     .validate_utf8 = false,
     .runtime_hooks = false,
 });
 
+const BenchConnSyncDeadline = zws.Conn.Type(.{
+    .role = .server,
+    .auto_pong = true,
+    .auto_reply_close = true,
+    .validate_utf8 = false,
+    .runtime_hooks = true,
+});
+
+const BenchConnAsync = BenchConnSync;
+const BenchConnAsyncDeadline = BenchConnSyncDeadline;
+
+const handler_sync_opts: zws.Handler.Options = .{
+    .execution = .sequential,
+    .auto_flush = true,
+    .close_on_handler_error = true,
+    .message_buffer_len = 64 * 1024,
+    .stage_buffer_len = 64 * 1024,
+};
+
+const handler_async_opts: zws.Handler.Options = .{
+    .execution = .async,
+    .auto_flush = true,
+    .close_on_handler_error = true,
+    .async_max_inflight = 16,
+    .message_buffer_len = 64 * 1024,
+    .stage_buffer_len = 64 * 1024,
+};
+
+const Config = struct {
+    port: u16 = 9001,
+    pipeline: usize = 1,
+    msg_size: usize = 16,
+    deadline_ms: usize = 0,
+    mode: Mode = .sync,
+};
+
 fn usage(io: Io) !void {
-    var buf: [256]u8 = undefined;
+    var buf: [384]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
     try stdout.interface.writeAll(
         \\zwebsocket-bench-server
         \\
         \\Usage:
-        \\  zwebsocket-bench-server [--port=9001] [--pipeline=1] [--msg-size=16]
+        \\  zwebsocket-bench-server [--port=9001] [--pipeline=1] [--msg-size=16] [--mode=sync|async] [--deadline-ms=0]
         \\
     );
     try stdout.interface.flush();
 }
 
-fn flushIfBuffered(w: *Io.Writer) Io.Writer.Error!void {
-    if (w.buffered().len != 0) try w.flush();
+fn timeoutsFromDeadlineMs(deadline_ms: usize) zws.Observe.TimeoutConfig {
+    if (deadline_ms == 0) return .{};
+    const budget_ns = std.math.mul(u64, @as(u64, @intCast(deadline_ms)), std.time.ns_per_ms) catch std.math.maxInt(u64);
+    return .{
+        .read_ns = budget_ns,
+        .write_ns = budget_ns,
+        .flush_ns = budget_ns,
+    };
 }
 
 fn responseFrameLen(payload_len: usize) usize {
@@ -38,52 +86,44 @@ fn responseFrameLen(payload_len: usize) usize {
     return header_len + payload_len;
 }
 
-fn echoOne(conn: *BenchConn, scratch: []u8) !bool {
-    if (try conn.readFrameBorrowed()) |frame| {
-        switch (frame.header.opcode) {
-            .ping => try conn.writePong(frame.payload),
-            .pong => {},
-            .close => {
-                const parsed = try zws.Conn.parseClosePayload(frame.payload, false);
-                conn.writeClose(parsed.code, parsed.reason) catch |err| switch (err) {
-                    error.ConnectionClosed => {},
-                    else => return err,
-                };
-                return true;
-            },
-            else => try conn.writeFrame(frame.header.opcode, frame.payload, frame.header.fin, frame.header.compressed),
-        }
-        return false;
-    }
-
-    const frame = try conn.readFrame(scratch);
-    switch (frame.header.opcode) {
-        .ping => try conn.writePong(frame.payload),
-        .pong => {},
-        .close => {
-            const parsed = try zws.Conn.parseClosePayload(frame.payload, false);
-            conn.writeClose(parsed.code, parsed.reason) catch |err| switch (err) {
-                error.ConnectionClosed => {},
-                else => return err,
-            };
-            return true;
-        },
-        else => try conn.writeFrame(frame.header.opcode, frame.payload, frame.header.fin, frame.header.compressed),
-    }
-    return false;
+fn connConfig(cfg: Config) zws.Conn.Config {
+    return .{
+        .timeouts = timeoutsFromDeadlineMs(cfg.deadline_ms),
+    };
 }
 
-fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize, msg_size: usize) Io.Cancelable!void {
+fn EchoHandler(comptime ConnType: type) type {
+    return struct {
+        fn handle(ctx: *zws.Handler.SliceContext(ConnType, u8)) struct {
+            opcode: zws.Protocol.MessageOpcode,
+            body: []const u8,
+        } {
+            return .{
+                .opcode = ctx.message.opcode,
+                .body = ctx.message.payload,
+            };
+        }
+    };
+}
+
+fn handleConnWithHandler(
+    comptime ConnType: type,
+    comptime handler_opts: zws.Handler.Options,
+    io: Io,
+    stream: std.Io.net.Stream,
+    cfg: Config,
+) Io.Cancelable!void {
     defer stream.close(io);
     common.setTcpNoDelay(&stream);
 
-    const write_buf_len: usize = if (pipeline > 1)
-        @min(@max(responseFrameLen(msg_size) * pipeline, @as(usize, 64)), @as(usize, 16 * 1024))
+    const read_buf_len: usize = if (cfg.pipeline > 1) 4 * 1024 else 256;
+    const write_buf_len: usize = if (handler_opts.execution == .async)
+        0
+    else if (cfg.pipeline > 1)
+        @min(@max(responseFrameLen(cfg.msg_size) * cfg.pipeline, @as(usize, 64)), @as(usize, 16 * 1024))
     else
         64;
-    const flush_every: usize = if (pipeline > 1) pipeline else 1;
 
-    const read_buf_len: usize = if (pipeline > 1) 4 * 1024 else 256;
     var read_storage: [4 * 1024]u8 = undefined;
     var write_storage: [16 * 1024]u8 = undefined;
 
@@ -93,31 +133,37 @@ fn handleConn(io: Io, stream: std.Io.net.Stream, pipeline: usize, msg_size: usiz
     _ = zws.Handshake.upgrade(&sr.interface, &sw.interface) catch return;
     sw.interface.flush() catch return;
 
-    var conn = BenchConn.init(&sr.interface, &sw.interface, .{});
+    var conn = ConnType.init(&sr.interface, &sw.interface, connConfig(cfg));
+    var scratch = zws.Handler.Scratch(handler_opts).init();
+    var state: u8 = 0;
 
-    var payload_buf: [64 * 1024]u8 = undefined;
-    var buffered_frames: usize = 0;
-    while (true) {
-        const closed = echoOne(&conn, payload_buf[0..]) catch |err| switch (err) {
-            error.EndOfStream => return,
-            else => return,
-        };
-        if (closed) {
-            sw.interface.flush() catch {};
+    zws.Handler.run(handler_opts, io, &conn, &state, &scratch, EchoHandler(ConnType).handle) catch |err| switch (err) {
+        error.EndOfStream, error.ConnectionClosed => return,
+        else => {
+            common.closeForProtocolError(&conn, &sw.interface, err);
             return;
-        }
-        buffered_frames += 1;
-        if (buffered_frames >= flush_every or sr.interface.buffered().len == 0) {
-            flushIfBuffered(&sw.interface) catch return;
-            buffered_frames = 0;
-        }
-    }
+        },
+    };
+}
+
+fn handleConnSync(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
+    return handleConnWithHandler(BenchConnSync, handler_sync_opts, io, stream, cfg);
+}
+
+fn handleConnSyncDeadline(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
+    return handleConnWithHandler(BenchConnSyncDeadline, handler_sync_opts, io, stream, cfg);
+}
+
+fn handleConnAsync(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
+    return handleConnWithHandler(BenchConnAsync, handler_async_opts, io, stream, cfg);
+}
+
+fn handleConnAsyncDeadline(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
+    return handleConnWithHandler(BenchConnAsyncDeadline, handler_async_opts, io, stream, cfg);
 }
 
 pub fn main(init: std.process.Init) !void {
-    var port: u16 = 9001;
-    var pipeline: usize = 1;
-    var msg_size: usize = 16;
+    var cfg: Config = .{};
 
     var it = try std.process.Args.Iterator.initAllocator(init.minimal.args, init.gpa);
     defer it.deinit();
@@ -131,11 +177,15 @@ pub fn main(init: std.process.Init) !void {
         }
         if (common.parseKeyVal(arg)) |kv| {
             if (std.mem.eql(u8, kv.key, "port")) {
-                port = try std.fmt.parseInt(u16, kv.val, 10);
+                cfg.port = try std.fmt.parseInt(u16, kv.val, 10);
             } else if (std.mem.eql(u8, kv.key, "pipeline")) {
-                pipeline = try std.fmt.parseInt(usize, kv.val, 10);
+                cfg.pipeline = try std.fmt.parseInt(usize, kv.val, 10);
             } else if (std.mem.eql(u8, kv.key, "msg-size")) {
-                msg_size = try std.fmt.parseInt(usize, kv.val, 10);
+                cfg.msg_size = try std.fmt.parseInt(usize, kv.val, 10);
+            } else if (std.mem.eql(u8, kv.key, "deadline-ms")) {
+                cfg.deadline_ms = try std.fmt.parseInt(usize, kv.val, 10);
+            } else if (std.mem.eql(u8, kv.key, "mode")) {
+                cfg.mode = std.meta.stringToEnum(Mode, kv.val) orelse return error.UnknownArg;
             } else {
                 return error.UnknownArg;
             }
@@ -143,9 +193,9 @@ pub fn main(init: std.process.Init) !void {
         }
         return error.UnknownArg;
     }
-    if (pipeline == 0) return error.InvalidPipeline;
+    if (cfg.pipeline == 0) return error.InvalidPipeline;
 
-    const addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(port) };
+    const addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(cfg.port) };
     var listener = try std.Io.net.IpAddress.listen(&addr, init.io, .{ .reuse_address = true });
     defer listener.deinit(init.io);
 
@@ -154,12 +204,32 @@ pub fn main(init: std.process.Init) !void {
 
     while (true) {
         const stream = listener.accept(init.io) catch |err| switch (err) {
-            error.SocketNotListening => return,
-            error.Canceled => return,
+            error.SocketNotListening, error.Canceled => return,
             else => return,
         };
-        group.concurrent(init.io, handleConn, .{ init.io, stream, pipeline, msg_size }) catch {
-            stream.close(init.io);
-        };
+        switch (cfg.mode) {
+            .sync => {
+                if (cfg.deadline_ms == 0) {
+                    group.concurrent(init.io, handleConnSync, .{ init.io, stream, cfg }) catch {
+                        stream.close(init.io);
+                    };
+                } else {
+                    group.concurrent(init.io, handleConnSyncDeadline, .{ init.io, stream, cfg }) catch {
+                        stream.close(init.io);
+                    };
+                }
+            },
+            .async => {
+                if (cfg.deadline_ms == 0) {
+                    group.concurrent(init.io, handleConnAsync, .{ init.io, stream, cfg }) catch {
+                        stream.close(init.io);
+                    };
+                } else {
+                    group.concurrent(init.io, handleConnAsyncDeadline, .{ init.io, stream, cfg }) catch {
+                        stream.close(init.io);
+                    };
+                }
+            },
+        }
     }
 }
