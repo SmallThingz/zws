@@ -1,5 +1,5 @@
 const std = @import("std");
-const zws = @import("zwebsocket");
+const zws = @import("zws");
 const common = @import("zws_support_common");
 
 const Config = struct {

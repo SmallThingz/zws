@@ -2271,7 +2271,7 @@ test "permessage-deflate client/server roundtrip preserves message payloads" {
         .permessage_deflate = pmd_cfg,
     });
 
-    const payload = "zwebsocket interop text payload with enough repetition to exercise permessage-deflate";
+    const payload = "zws interop text payload with enough repetition to exercise permessage-deflate";
     try client.writeText(payload);
 
     var server_reader = Io.Reader.fixed(out[0..client_writer.end]);

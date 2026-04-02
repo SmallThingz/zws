@@ -76,8 +76,8 @@ pub fn main(init: std.process.Init) !void {
     const allocator = arena.allocator();
 
     const root = try std.process.currentPathAlloc(init.io, allocator);
-    const bench_path = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zwebsocket-bench" });
-    const server_path = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zwebsocket-bench-server" });
+    const bench_path = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zws-bench" });
+    const server_path = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zws-bench-server" });
 
     var cfg: Config = .{};
     var bench_args: std.ArrayList([]const u8) = .empty;

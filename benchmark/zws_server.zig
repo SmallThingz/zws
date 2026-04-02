@@ -1,5 +1,5 @@
 const std = @import("std");
-const zws = @import("zwebsocket");
+const zws = @import("zws");
 const common = @import("zws_support_common");
 
 const Io = std.Io;
@@ -61,10 +61,10 @@ fn usage(io: Io) !void {
     var buf: [384]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
     try stdout.interface.writeAll(
-        \\zwebsocket-bench-server
+        \\zws-bench-server
         \\
         \\Usage:
-        \\  zwebsocket-bench-server [--port=9001] [--pipeline=1] [--msg-size=16] [--expected-conns=1] [--mode=sync|async] [--deadline-ms=0]
+        \\  zws-bench-server [--port=9001] [--pipeline=1] [--msg-size=16] [--expected-conns=1] [--mode=sync|async] [--deadline-ms=0]
         \\
     );
     try stdout.interface.flush();

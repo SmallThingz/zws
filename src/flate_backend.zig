@@ -193,7 +193,7 @@ pub fn inflateMessage(
 }
 
 test "permessage-deflate helpers roundtrip sync and full flush payloads" {
-    const payload = "zwebsocket interop text payload with enough repetition to exercise permessage-deflate";
+    const payload = "zws interop text payload with enough repetition to exercise permessage-deflate";
 
     inline for (.{ sync_flush, full_flush }) |flush_mode| {
         const compressed = try deflateMessage(std.testing.allocator, payload, 1, flush_mode);

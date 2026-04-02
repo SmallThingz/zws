@@ -1,5 +1,5 @@
 {
-  "name": "zwebsocket-validation",
+  "name": "zws-validation",
   "private": true,
   "type": "module",
   "dependencies": {

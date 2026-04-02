@@ -1,5 +1,5 @@
 const std = @import("std");
-const zws = @import("zwebsocket");
+const zws = @import("zws");
 const common = @import("zws_support_common");
 
 const Io = common.Io;
@@ -9,14 +9,14 @@ const Config = struct {
     port: u16 = 9001,
     path: []const u8 = "/",
     compression: bool = false,
-    message: []const u8 = "hello from zwebsocket",
+    message: []const u8 = "hello from zws",
 };
 
 fn usage(io: Io) !void {
     var buf: [640]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
     try stdout.interface.writeAll(
-        \\zwebsocket-client
+        \\zws-client
         \\
         \\Usage:
         \\  zig build examples -Dexample=client -- [options]

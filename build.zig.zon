@@ -1,7 +1,7 @@
 .{
-    .name = .zwebsocket,
+    .name = .zws,
     .version = "0.0.0",
-    .fingerprint = 0xa626e93070fc150f,
+    .fingerprint = 0xf55fb23b66d4d64,
     .minimum_zig_version = "0.16.0-dev.2905+5d71e3051",
     .dependencies = .{},
     .paths = .{

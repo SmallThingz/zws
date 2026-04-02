@@ -33,7 +33,7 @@ fn usage(io: Io) !void {
     var buf: [768]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
     try stdout.interface.writeAll(
-        \\zwebsocket-bench
+        \\zws-bench
         \\
         \\Usage:
         \\  zig build bench -Doptimize=ReleaseFast -- [options]
@@ -318,7 +318,7 @@ pub fn main(init: std.process.Init) !void {
     const elapsed_ns: u128 = @intCast(start.durationTo(end).raw.nanoseconds);
     const msgs_per_sec = (@as(f64, @floatFromInt(total_ok)) * @as(f64, 1_000_000_000.0)) / @as(f64, @floatFromInt(elapsed_ns));
     const payload_mib_per_sec = (msgs_per_sec * @as(f64, @floatFromInt(cfg.msg_size))) / (1024.0 * 1024.0);
-    const label = init.environ_map.get("BENCH_LABEL") orelse "zwebsocket";
+    const label = init.environ_map.get("BENCH_LABEL") orelse "zws";
 
     var stdout_buf: [256]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(init.io, &stdout_buf);

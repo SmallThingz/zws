@@ -610,8 +610,8 @@ pub fn main(init: std.process.Init) !void {
     const uws_dir = try std.fs.path.join(allocator, &.{ root, ".zig-cache", "uWebSockets-bench" });
     const paths: BenchPaths = .{
         .uws_server = try scripts.buildUwsServer(init.io, allocator, root, uws_dir, init.minimal.environ),
-        .zws_server = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zwebsocket-bench-server" }),
-        .bench_bin = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zwebsocket-bench" }),
+        .zws_server = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zws-bench-server" }),
+        .bench_bin = try std.fs.path.join(allocator, &.{ root, "zig-out", "bin", "zws-bench" }),
     };
 
     const peers = [_]Peer{

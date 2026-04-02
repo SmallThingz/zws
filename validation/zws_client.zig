@@ -1,5 +1,5 @@
 const std = @import("std");
-const zws = @import("zwebsocket");
+const zws = @import("zws");
 const common = @import("zws_support_common");
 
 const Io = common.Io;
@@ -15,7 +15,7 @@ fn usage(io: Io) !void {
     var buf: [512]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
     try stdout.interface.writeAll(
-        \\zwebsocket-interop-client
+        \\zws-interop-client
         \\
         \\Usage:
         \\  zig build interop -Dinterop=client -- [options]
@@ -94,7 +94,7 @@ pub fn main(init: std.process.Init) !void {
     var conn = zws.Conn.Client.init(&sr.interface, &sw.interface, conn_cfg);
 
     const text_payload =
-        "zwebsocket interop text payload with enough repetition to exercise permessage-deflate";
+        "zws interop text payload with enough repetition to exercise permessage-deflate";
     try conn.writeText(text_payload);
     try sw.interface.flush();
 

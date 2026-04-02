@@ -1,6 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const zws = @import("zwebsocket");
+const zws = @import("zws");
 const common = @import("zws_support_common");
 
 const Config = struct {
@@ -143,7 +143,7 @@ fn runWorker(args: WorkerArgs) !void {
 
     while (!args.shared.failed.load(.acquire) and std.Io.Timestamp.now(args.io, .awake).nanoseconds < args.deadline.nanoseconds) {
         var text_storage: [384]u8 = undefined;
-        const prefix = try std.fmt.bufPrint(&text_storage, "zwebsocket soak payload {d} ", .{args.index});
+        const prefix = try std.fmt.bufPrint(&text_storage, "zws soak payload {d} ", .{args.index});
         @memset(text_storage[prefix.len .. prefix.len + 256], 'x');
         const text_payload = text_storage[0 .. prefix.len + 256];
 

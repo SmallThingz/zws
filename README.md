@@ -1,4 +1,4 @@
-# 🚀 zwebsocket
+# 🚀 zws
 
 Low-allocation RFC 6455 websocket primitives for Zig with a specialized frame hot path, strict handshake validation, and `permessage-deflate`.
 
@@ -27,7 +27,7 @@ After you have already accepted the websocket upgrade and have a reader/writer p
 
 ```zig
 const std = @import("std");
-const zws = @import("zwebsocket");
+const zws = @import("zws");
 
 fn runEcho(reader: *std.Io.Reader, writer: *std.Io.Writer) !void {
     var conn = zws.Conn.Server.init(reader, writer, .{});
@@ -105,11 +105,11 @@ zig fetch --save <git-or-tarball-url>
 `build.zig`:
 
 ```zig
-const zws_dep = b.dependency("zwebsocket", .{
+const zws_dep = b.dependency("zws", .{
     .target = target,
     .optimize = optimize,
 });
-exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
+exe.root_module.addImport("zws", zws_dep.module("zws"));
 ```
 
 ## 🧩 Library API (At a Glance)
@@ -142,7 +142,7 @@ exe.root_module.addImport("zwebsocket", zws_dep.module("zwebsocket"));
 - `src/handshake.zig`: server upgrade parsing, validation, and `101` response writing
 - `src/extensions.zig`: extension negotiation helpers
 - `benchmark/bench.zig`: benchmark client
-- `benchmark/zwebsocket_server.zig`: standalone benchmark server
+- `benchmark/zws_server.zig`: standalone benchmark server
 - `examples/echo_server.zig`: standalone echo server example
 - `examples/frame_echo_server.zig`: frame-level echo server example using `readFrameBorrowed`
 - `examples/ws_client.zig`: standalone client example with manual HTTP upgrade
@@ -199,7 +199,7 @@ zig build bench-compare -Doptimize=ReleaseFast
 
 ## ⚠️ Current Scope
 
-`zwebsocket` is intentionally focused on a small websocket core.
+`zws` is intentionally focused on a small websocket core.
 
 - Server-side RFC 6455 handshake validation is included.
 - Connection state is synchronous and stream-oriented.

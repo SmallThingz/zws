@@ -54,7 +54,7 @@ const node_peer_code =
     \\  const ws = new WebSocket(args.url, { perMessageDeflate: args.compression });
     \\  await waitForEvent(ws, 'open');
     \\
-    \\  const textPayload = 'zwebsocket interop text payload with enough repetition to exercise permessage-deflate';
+    \\  const textPayload = 'zws interop text payload with enough repetition to exercise permessage-deflate';
     \\  ws.send(textPayload);
     \\  {
     \\    const [data, isBinary] = await waitForEvent(ws, 'message');
@@ -103,7 +103,7 @@ const aiohttp_peer_code =
     \\import aiohttp
     \\from aiohttp import web, WSMsgType
     \\
-    \\TEXT_PAYLOAD = "zwebsocket interop text payload with enough repetition to exercise permessage-deflate"
+    \\TEXT_PAYLOAD = "zws interop text payload with enough repetition to exercise permessage-deflate"
     \\BINARY_PAYLOAD = bytes(((i * 13 + 7) & 0xFF) for i in range(256))
     \\
     \\async def run_client(url: str, compression: bool) -> None:
@@ -449,7 +449,7 @@ pub fn main(init: std.process.Init) !void {
 
     const scenarios = [_]Scenario{
         .{
-            .name = "node-ws client -> zwebsocket server",
+            .name = "node-ws client -> zws server",
             .port = args.port_base,
             .server_cmd = &.{ args.server_bin, port_0 },
             .server_cwd = root,
@@ -457,7 +457,7 @@ pub fn main(init: std.process.Init) !void {
             .client_cwd = validation_dir,
         },
         .{
-            .name = "node-ws client -> zwebsocket server (permessage-deflate)",
+            .name = "node-ws client -> zws server (permessage-deflate)",
             .port = args.port_base + 1,
             .server_cmd = &.{ args.server_bin, port_1, "--compression" },
             .server_cwd = root,
@@ -465,7 +465,7 @@ pub fn main(init: std.process.Init) !void {
             .client_cwd = validation_dir,
         },
         .{
-            .name = "aiohttp client -> zwebsocket server",
+            .name = "aiohttp client -> zws server",
             .port = args.port_base + 2,
             .server_cmd = &.{ args.server_bin, port_2 },
             .server_cwd = root,
@@ -473,7 +473,7 @@ pub fn main(init: std.process.Init) !void {
             .client_cwd = validation_dir,
         },
         .{
-            .name = "aiohttp client -> zwebsocket server (permessage-deflate)",
+            .name = "aiohttp client -> zws server (permessage-deflate)",
             .port = args.port_base + 3,
             .server_cmd = &.{ args.server_bin, port_3, "--compression" },
             .server_cwd = root,
@@ -481,7 +481,7 @@ pub fn main(init: std.process.Init) !void {
             .client_cwd = validation_dir,
         },
         .{
-            .name = "raw client with repeated permessage-deflate offers -> zwebsocket server",
+            .name = "raw client with repeated permessage-deflate offers -> zws server",
             .port = args.port_base + 4,
             .server_cmd = &.{ args.server_bin, port_4, "--compression" },
             .server_cwd = root,
@@ -489,7 +489,7 @@ pub fn main(init: std.process.Init) !void {
             .client_cwd = root,
         },
         .{
-            .name = "zwebsocket client -> node-ws server",
+            .name = "zws client -> node-ws server",
             .port = args.port_base + 5,
             .server_cmd = &.{ node, "-e", node_peer_code, "server", port_5 },
             .server_cwd = validation_dir,
@@ -497,7 +497,7 @@ pub fn main(init: std.process.Init) !void {
             .client_cwd = root,
         },
         .{
-            .name = "zwebsocket client -> node-ws server (permessage-deflate)",
+            .name = "zws client -> node-ws server (permessage-deflate)",
             .port = args.port_base + 6,
             .server_cmd = &.{ node, "-e", node_peer_code, "server", port_6, "--compression" },
             .server_cwd = validation_dir,
@@ -505,7 +505,7 @@ pub fn main(init: std.process.Init) !void {
             .client_cwd = root,
         },
         .{
-            .name = "zwebsocket client -> aiohttp server",
+            .name = "zws client -> aiohttp server",
             .port = args.port_base + 7,
             .server_cmd = &.{ python, "-c", aiohttp_peer_code, "server", port_7 },
             .server_cwd = validation_dir,
@@ -513,7 +513,7 @@ pub fn main(init: std.process.Init) !void {
             .client_cwd = root,
         },
         .{
-            .name = "zwebsocket client -> aiohttp server (permessage-deflate)",
+            .name = "zws client -> aiohttp server (permessage-deflate)",
             .port = args.port_base + 8,
             .server_cmd = &.{ python, "-c", aiohttp_peer_code, "server", port_8, "--compression" },
             .server_cwd = validation_dir,

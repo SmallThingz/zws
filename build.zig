@@ -15,7 +15,7 @@ pub fn build(b: *std.Build) void {
     const example_choice = b.option([]const u8, "example", "Select one example: echo-server, frame-echo-server, client");
     const interop_choice = b.option([]const u8, "interop", "Select one interop target: run, client, repeated-offer-client");
 
-    const mod = b.addModule("zwebsocket", .{
+    const mod = b.addModule("zws", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
@@ -26,26 +26,44 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
         .imports = &.{
-            .{ .name = "zwebsocket", .module = mod },
+            .{ .name = "zws", .module = mod },
         },
     });
     const mod_tests = b.addTest(.{
         .root_module = mod,
+        .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
     });
+    mod_tests.root_module.link_libc = true;
     const run_mod_tests = b.addRunArtifact(mod_tests);
+    if (b.args) |args| run_mod_tests.addArgs(args);
     const support_tests = b.addTest(.{
         .root_module = support_common,
+        .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
     });
+    support_tests.root_module.link_libc = true;
     const run_support_tests = b.addRunArtifact(support_tests);
+    if (b.args) |args| run_support_tests.addArgs(args);
+
+    const test_flake_exe = b.addExecutable(.{
+        .name = "zws-test-flake",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("benchmark/run_test_flake.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    const test_flake_run = b.addRunArtifact(test_flake_exe);
+    test_flake_run.addPrefixedArtifactArg("--test-bin=", mod_tests);
+    if (b.args) |args| test_flake_run.addArgs(args);
 
     const bench_exe = b.addExecutable(.{
-        .name = "zwebsocket-bench",
+        .name = "zws-bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("benchmark/bench.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws", .module = mod },
                 .{ .name = "zws_support_common", .module = support_common },
             },
         }),
@@ -53,7 +71,7 @@ pub fn build(b: *std.Build) void {
     const install_bench = b.addInstallArtifact(bench_exe, .{});
 
     const bench_runner_exe = b.addExecutable(.{
-        .name = "zwebsocket-bench-runner",
+        .name = "zws-bench-runner",
         .root_module = b.createModule(.{
             .root_source_file = b.path("benchmark/run_bench.zig"),
             .target = target,
@@ -62,13 +80,13 @@ pub fn build(b: *std.Build) void {
     });
 
     const bench_server_exe = b.addExecutable(.{
-        .name = "zwebsocket-bench-server",
+        .name = "zws-bench-server",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("benchmark/zwebsocket_server.zig"),
+            .root_source_file = b.path("benchmark/zws_server.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws", .module = mod },
                 .{ .name = "zws_support_common", .module = support_common },
             },
         }),
@@ -76,7 +94,7 @@ pub fn build(b: *std.Build) void {
     const install_bench_server = b.addInstallArtifact(bench_server_exe, .{});
 
     const compare_exe = b.addExecutable(.{
-        .name = "zwebsocket-bench-compare",
+        .name = "zws-bench-compare",
         .root_module = b.createModule(.{
             .root_source_file = b.path("benchmark/run_ab.zig"),
             .target = target,
@@ -86,13 +104,13 @@ pub fn build(b: *std.Build) void {
     const install_compare = b.addInstallArtifact(compare_exe, .{});
 
     const echo_server_exe = b.addExecutable(.{
-        .name = "zwebsocket-echo-server",
+        .name = "zws-echo-server",
         .root_module = b.createModule(.{
             .root_source_file = b.path("examples/echo_server.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws", .module = mod },
                 .{ .name = "zws_support_common", .module = support_common },
             },
         }),
@@ -100,13 +118,13 @@ pub fn build(b: *std.Build) void {
     const install_echo_server = b.addInstallArtifact(echo_server_exe, .{});
 
     const frame_echo_server_exe = b.addExecutable(.{
-        .name = "zwebsocket-frame-echo-server",
+        .name = "zws-frame-echo-server",
         .root_module = b.createModule(.{
             .root_source_file = b.path("examples/frame_echo_server.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws", .module = mod },
                 .{ .name = "zws_support_common", .module = support_common },
             },
         }),
@@ -114,13 +132,13 @@ pub fn build(b: *std.Build) void {
     const install_frame_echo_server = b.addInstallArtifact(frame_echo_server_exe, .{});
 
     const client_exe = b.addExecutable(.{
-        .name = "zwebsocket-client",
+        .name = "zws-client",
         .root_module = b.createModule(.{
             .root_source_file = b.path("examples/ws_client.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws", .module = mod },
                 .{ .name = "zws_support_common", .module = support_common },
             },
         }),
@@ -128,13 +146,13 @@ pub fn build(b: *std.Build) void {
     const install_client = b.addInstallArtifact(client_exe, .{});
 
     const interop_client_exe = b.addExecutable(.{
-        .name = "zwebsocket-interop-client",
+        .name = "zws-interop-client",
         .root_module = b.createModule(.{
             .root_source_file = b.path("validation/zws_client.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws", .module = mod },
                 .{ .name = "zws_support_common", .module = support_common },
             },
         }),
@@ -142,13 +160,13 @@ pub fn build(b: *std.Build) void {
     const install_interop_client = b.addInstallArtifact(interop_client_exe, .{});
 
     const repeated_offer_client_exe = b.addExecutable(.{
-        .name = "zwebsocket-repeated-pmd-offer-client",
+        .name = "zws-repeated-pmd-offer-client",
         .root_module = b.createModule(.{
             .root_source_file = b.path("validation/repeated_pmd_offer_client.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws", .module = mod },
                 .{ .name = "zws_support_common", .module = support_common },
             },
         }),
@@ -156,7 +174,7 @@ pub fn build(b: *std.Build) void {
     const install_repeated_offer_client = b.addInstallArtifact(repeated_offer_client_exe, .{});
 
     const interop_runner_exe = b.addExecutable(.{
-        .name = "zwebsocket-interop-runner",
+        .name = "zws-interop-runner",
         .root_module = b.createModule(.{
             .root_source_file = b.path("validation/run_interop.zig"),
             .target = target,
@@ -165,13 +183,13 @@ pub fn build(b: *std.Build) void {
     });
 
     const soak_runner_exe = b.addExecutable(.{
-        .name = "zwebsocket-soak-runner",
+        .name = "zws-soak-runner",
         .root_module = b.createModule(.{
             .root_source_file = b.path("validation/soak.zig"),
             .target = target,
             .optimize = optimize,
             .imports = &.{
-                .{ .name = "zwebsocket", .module = mod },
+                .{ .name = "zws", .module = mod },
                 .{ .name = "zws_support_common", .module = support_common },
             },
         }),
@@ -189,9 +207,11 @@ pub fn build(b: *std.Build) void {
 
     b.getUninstallStep().makeFn = makeNoOp;
 
-    const test_step = b.step("test", "Run zwebsocket tests");
+    const test_step = b.step("test", "Run zws tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_support_tests.step);
+    const test_flake_step = b.step("test-flake", "Hunt flaky tests deterministically with seeded runs");
+    test_flake_step.dependOn(&test_flake_run.step);
 
     const bench_run = b.addRunArtifact(bench_runner_exe);
     bench_run.step.dependOn(&install_bench.step);
@@ -205,10 +225,20 @@ pub fn build(b: *std.Build) void {
     compare_run.step.dependOn(&install_bench_server.step);
     compare_run.step.dependOn(&install_compare.step);
     if (b.args) |args| compare_run.addArgs(args);
-    const compare_step = b.step("bench-compare", "Run interleaved zwebsocket vs uWebSockets benchmark rounds");
+    const compare_step = b.step("bench-compare", "Run interleaved zws vs uWebSockets benchmark rounds");
     compare_step.dependOn(&compare_run.step);
 
-    const examples_step = b.step("examples", "Build zwebsocket examples; use -Dexample=echo-server|frame-echo-server|client to select one");
+    const examples_step = b.step("examples", "Build zws examples; use -Dexample=echo-server|frame-echo-server|client to select one");
+    const examples_check_step = b.step("examples-check", "Run all zws examples with --help");
+    const echo_server_help = b.addRunArtifact(echo_server_exe);
+    echo_server_help.addArg("--help");
+    const frame_echo_server_help = b.addRunArtifact(frame_echo_server_exe);
+    frame_echo_server_help.addArg("--help");
+    const client_help = b.addRunArtifact(client_exe);
+    client_help.addArg("--help");
+    examples_check_step.dependOn(&echo_server_help.step);
+    examples_check_step.dependOn(&frame_echo_server_help.step);
+    examples_check_step.dependOn(&client_help.step);
     if (example_choice) |choice| {
         if (eql(choice, "echo-server")) {
             examples_step.dependOn(&install_echo_server.step);
@@ -229,9 +259,9 @@ pub fn build(b: *std.Build) void {
     interop_run.step.dependOn(&install_echo_server.step);
     interop_run.step.dependOn(&install_interop_client.step);
     interop_run.step.dependOn(&install_repeated_offer_client.step);
-    interop_run.addArg(b.fmt("--server-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-echo-server")}));
-    interop_run.addArg(b.fmt("--client-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-interop-client")}));
-    interop_run.addArg(b.fmt("--repeated-client-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-repeated-pmd-offer-client")}));
+    interop_run.addArg(b.fmt("--server-bin={s}", .{b.getInstallPath(.bin, "zws-echo-server")}));
+    interop_run.addArg(b.fmt("--client-bin={s}", .{b.getInstallPath(.bin, "zws-interop-client")}));
+    interop_run.addArg(b.fmt("--repeated-client-bin={s}", .{b.getInstallPath(.bin, "zws-repeated-pmd-offer-client")}));
     const interop_step = b.step("interop", "Run interop or build an interop helper with -Dinterop=run|client|repeated-offer-client");
     if (interop_choice) |choice| {
         if (eql(choice, "run")) {
@@ -249,10 +279,10 @@ pub fn build(b: *std.Build) void {
 
     const soak_run = b.addRunArtifact(soak_runner_exe);
     soak_run.step.dependOn(&install_echo_server.step);
-    soak_run.addArg(b.fmt("--server-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-echo-server")}));
+    soak_run.addArg(b.fmt("--server-bin={s}", .{b.getInstallPath(.bin, "zws-echo-server")}));
     const soak_compressed = b.addRunArtifact(soak_runner_exe);
     soak_compressed.step.dependOn(&install_echo_server.step);
-    soak_compressed.addArg(b.fmt("--server-bin={s}", .{b.getInstallPath(.bin, "zwebsocket-echo-server")}));
+    soak_compressed.addArg(b.fmt("--server-bin={s}", .{b.getInstallPath(.bin, "zws-echo-server")}));
     soak_compressed.addArg("--compression");
     const soak_step = b.step("soak", "Run websocket soak tests against the example server");
     soak_step.dependOn(&soak_run.step);
@@ -261,6 +291,7 @@ pub fn build(b: *std.Build) void {
     const validate_step = b.step("validate", "Run tests, interop, and soak validation");
     validate_step.dependOn(&run_mod_tests.step);
     validate_step.dependOn(&run_support_tests.step);
+    validate_step.dependOn(examples_step);
     validate_step.dependOn(&interop_run.step);
     validate_step.dependOn(&soak_run.step);
     validate_step.dependOn(&soak_compressed.step);

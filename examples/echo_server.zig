@@ -1,5 +1,5 @@
 const std = @import("std");
-const zws = @import("zwebsocket");
+const zws = @import("zws");
 const common = @import("zws_support_common");
 
 const Io = common.Io;
@@ -14,7 +14,7 @@ fn usage(io: Io) !void {
     var buf: [512]u8 = undefined;
     var stdout = std.Io.File.stdout().writer(io, &buf);
     try stdout.interface.writeAll(
-        \\zwebsocket-echo-server
+        \\zws-echo-server
         \\
         \\Usage:
         \\  zig build examples -Dexample=echo-server -- [options]

@@ -1,5 +1,5 @@
 const std = @import("std");
-const zws = @import("zwebsocket");
+const zws = @import("zws");
 const builtin = @import("builtin");
 
 pub const Io = std.Io;

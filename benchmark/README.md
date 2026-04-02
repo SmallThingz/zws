@@ -2,10 +2,10 @@
 
 This benchmark compares standalone websocket echo servers on the same local machine:
 
-- `zwebsocket` sync
-- `zwebsocket` sync + deadline
-- `zwebsocket` async
-- `zwebsocket` async + deadline
+- `zws` sync
+- `zws` sync + deadline
+- `zws` async
+- `zws` async + deadline
 - `uWebSockets` sync
 - `uWebSockets` sync + deadline
 - `uWebSockets` async
@@ -67,7 +67,7 @@ Fairness notes: all peers use the same benchmark client, identical per-suite cli
 
 `bench-compare` is the low-noise harness:
 
-- builds `zwebsocket` binaries once
+- builds `zws` binaries once
 - builds `uWebSockets` benchmark server once
 - runs four suites:
 - `single / non-pipelined`

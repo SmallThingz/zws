@@ -2,7 +2,7 @@
 
 ## API Stability
 
-`zwebsocket` is still pre-`1.0`, but it now has an explicit compatibility policy.
+`zws` is still pre-`1.0`, but it now has an explicit compatibility policy.
 
 ### Stable Surface
 
@@ -38,7 +38,7 @@ After `1.0`, the intent is standard semver for the stable surface.
 
 ## Transports
 
-`zwebsocket` is a synchronous, stream-oriented websocket core.
+`zws` is a synchronous, stream-oriented websocket core.
 
 ### Expected Integration Shape
 
@@ -127,7 +127,7 @@ With context takeover support disabled, this keeps the runtime model simple and 
 
 ### Deployment Notes
 
-`benchmark/zwebsocket_server.zig` is a benchmark harness, not a hardened application server.
+`benchmark/zws_server.zig` is a benchmark harness, not a hardened application server.
 
 For a real integration reference, use:
 
@@ -145,7 +145,7 @@ Production callers should still decide their own:
 
 ## Validation
 
-`zwebsocket` now ships with four validation layers.
+`zws` now ships with four validation layers.
 
 ### 1. Core Tests
 
@@ -171,7 +171,7 @@ Those live in `src/validation_tests.zig`.
 zig build interop
 ```
 
-This runs `zwebsocket` against real external peers in both directions:
+This runs `zws` against real external peers in both directions:
 
 - Node `ws` client/server
 - Python `aiohttp` client/server
