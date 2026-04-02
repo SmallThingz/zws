@@ -798,7 +798,6 @@ fn AsyncShared(comptime ConnType: type) type {
             defer self.mutex.unlock(self.io);
             return self.shutdown_writes;
         }
-
     };
 }
 
@@ -1499,74 +1498,124 @@ test "run stream mode rejects compressed messages" {
     );
 }
 
-test "async mode processes multiple messages concurrently and writes completion-order replies" {
+fn expectAsyncBufferedResponseOrder(
+    iterations: usize,
+    comptime first_value: anytype,
+    comptime second_value: anytype,
+    first_expected: []const u8,
+    second_expected: []const u8,
+) !void {
     if (builtin.single_threaded) return error.SkipZigTest;
-
-    var input: std.ArrayList(u8) = .empty;
-    defer input.deinit(std.testing.allocator);
-    try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "slow", .{ 1, 2, 3, 4 });
-    try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "fast", .{ 5, 6, 7, 8 });
-
-    var reader = Io.Reader.fixed(input.items);
-    var output: [512]u8 = undefined;
-    var writer = Io.Writer.fixed(output[0..]);
-    var server_conn = conn.Server.init(&reader, &writer, .{});
-    const io = std.testing.io;
-
-    const State = struct {
-        mutex: Io.Mutex = .init,
-        cond: Io.Condition = .init,
-        calls: usize = 0,
-        fast_done: bool = false,
-    };
-    var state: State = .{};
-
-    const H = struct {
-        fn handle(ctx: *SliceContext(.{
-            .max_inflight = 2,
-            .message_buffer_len = 64,
-            .stage_buffer_len = 64,
-        }, conn.Server, State)) ![]const u8 {
-            ctx.state.mutex.lockUncancelable(ctx.io);
-            ctx.state.calls += 1;
-            if (std.mem.eql(u8, ctx.message.payload, "slow")) {
-                while (!ctx.state.fast_done) {
-                    ctx.state.cond.waitUncancelable(ctx.io, &ctx.state.mutex);
-                }
-                ctx.state.mutex.unlock(ctx.io);
-                return "slow-reply";
-            }
-            ctx.state.fast_done = true;
-            ctx.state.cond.signal(ctx.io);
-            ctx.state.mutex.unlock(ctx.io);
-            return "fast-reply";
-        }
-    };
 
     const async_opts: AsyncOptions = .{
         .max_inflight = 2,
         .message_buffer_len = 64,
         .stage_buffer_len = 64,
     };
+    const State = struct {
+        mutex: Io.Mutex = .init,
+        cond: Io.Condition = .init,
+        calls: usize = 0,
+        first_buffered: bool = false,
+        second_done: bool = false,
+    };
+    const H = struct {
+        fn handle(ctx: *SliceContext(async_opts, conn.Server, State)) !void {
+            ctx.state.mutex.lockUncancelable(ctx.io);
+            ctx.state.calls += 1;
+            const is_first = std.mem.eql(u8, ctx.message.payload, "first");
+            if (!is_first) {
+                while (!ctx.state.first_buffered) {
+                    ctx.state.cond.waitUncancelable(ctx.io, &ctx.state.mutex);
+                }
+                ctx.state.mutex.unlock(ctx.io);
+                try ctx.respond(second_value);
+                ctx.state.mutex.lockUncancelable(ctx.io);
+                ctx.state.second_done = true;
+                ctx.state.cond.broadcast(ctx.io);
+                ctx.state.mutex.unlock(ctx.io);
+                return;
+            }
+            ctx.state.mutex.unlock(ctx.io);
+            // Buffer the first reply, then let the second handler run and flush first.
+            try ctx.respond(first_value);
+            ctx.state.mutex.lockUncancelable(ctx.io);
+            ctx.state.first_buffered = true;
+            ctx.state.cond.broadcast(ctx.io);
+            while (!ctx.state.second_done) {
+                ctx.state.cond.waitUncancelable(ctx.io, &ctx.state.mutex);
+            }
+            ctx.state.mutex.unlock(ctx.io);
+        }
+    };
     const Runtime = AsyncRuntime(async_opts, conn.Server, State, H.handle, .{ .worker_count = 2 });
-    var runtime = Runtime.init(io);
-    try runtime.start();
-    defer runtime.deinit();
-    var scratch = AsyncScratch(async_opts).init();
-    try runAsync(async_opts, io, &runtime, &server_conn, &state, &scratch);
 
-    try std.testing.expectEqual(@as(usize, 2), state.calls);
+    for (0..iterations) |_| {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(std.testing.allocator);
+        try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "first", .{ 1, 2, 3, 4 });
+        try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "second", .{ 5, 6, 7, 8 });
 
-    var out_reader = Io.Reader.fixed(output[0..writer.end]);
-    var sink: [0]u8 = .{};
-    var out_writer = Io.Writer.fixed(sink[0..]);
-    var client = conn.Client.init(&out_reader, &out_writer, .{});
-    var message_buf: [64]u8 = undefined;
+        var reader = Io.Reader.fixed(input.items);
+        var output: [512]u8 = undefined;
+        var writer = Io.Writer.fixed(output[0..]);
+        var server_conn = conn.Server.init(&reader, &writer, .{});
+        var state: State = .{};
+        const io = std.testing.io;
 
-    const first = try client.readMessage(message_buf[0..]);
-    try std.testing.expectEqualStrings("fast-reply", first.payload);
-    const second = try client.readMessage(message_buf[0..]);
-    try std.testing.expectEqualStrings("slow-reply", second.payload);
+        var runtime = Runtime.init(io);
+        try runtime.start();
+        defer runtime.deinit();
+        var scratch = AsyncScratch(async_opts).init();
+        try runAsync(async_opts, io, &runtime, &server_conn, &state, &scratch);
+
+        try std.testing.expectEqual(@as(usize, 2), state.calls);
+
+        var out_reader = Io.Reader.fixed(output[0..writer.end]);
+        var sink: [0]u8 = .{};
+        var out_writer = Io.Writer.fixed(sink[0..]);
+        var client = conn.Client.init(&out_reader, &out_writer, .{});
+        var message_buf: [64]u8 = undefined;
+
+        const first = try client.readMessage(message_buf[0..]);
+        try std.testing.expectEqualStrings(first_expected, first.payload);
+        const second = try client.readMessage(message_buf[0..]);
+        try std.testing.expectEqualStrings(second_expected, second.payload);
+    }
+}
+
+test "async mode preserves buffered reply order across concurrent handlers" {
+    try expectAsyncBufferedResponseOrder(
+        1,
+        @as([]const u8, "first-reply"),
+        @as([]const u8, "second-reply"),
+        "first-reply",
+        "second-reply",
+    );
+}
+
+test "async mode preserves buffered reply order across repeated iterations" {
+    try expectAsyncBufferedResponseOrder(
+        32,
+        @as([]const u8, "first-reply"),
+        @as([]const u8, "second-reply"),
+        "first-reply",
+        "second-reply",
+    );
+}
+
+test "async mode preserves buffered chunked reply order across concurrent handlers" {
+    const first_chunks = [_][]const u8{ "first-", "reply" };
+    const second_chunks = [_][]const u8{ "second-", "reply" };
+    const first_value: []const []const u8 = first_chunks[0..];
+    const second_value: []const []const u8 = second_chunks[0..];
+    try expectAsyncBufferedResponseOrder(
+        1,
+        first_value,
+        second_value,
+        "first-reply",
+        "second-reply",
+    );
 }
 
 test "async mode sends one 1011 and returns handler error" {
@@ -1611,4 +1660,74 @@ test "async mode sends one 1011 and returns handler error" {
     try std.testing.expectEqual(conn.Opcode.close, frame.header.opcode);
     const close_frame = try conn.parseClosePayload(frame.payload, true);
     try std.testing.expectEqual(@as(?u16, 1011), close_frame.code);
+}
+
+fn expectAsyncSingleCloseOnConcurrentErrors(iterations: usize) !void {
+    if (builtin.single_threaded) return error.SkipZigTest;
+
+    const async_opts: AsyncOptions = .{
+        .max_inflight = 2,
+        .message_buffer_len = 64,
+    };
+    const State = struct {
+        mutex: Io.Mutex = .init,
+        cond: Io.Condition = .init,
+        entered: usize = 0,
+    };
+    const H = struct {
+        fn handle(ctx: *SliceContext(async_opts, conn.Server, State)) error{HandlerFailed}!void {
+            ctx.state.mutex.lockUncancelable(ctx.io);
+            ctx.state.entered += 1;
+            if (ctx.state.entered < 2) {
+                while (ctx.state.entered < 2) {
+                    ctx.state.cond.waitUncancelable(ctx.io, &ctx.state.mutex);
+                }
+            } else {
+                ctx.state.cond.broadcast(ctx.io);
+            }
+            ctx.state.mutex.unlock(ctx.io);
+            return error.HandlerFailed;
+        }
+    };
+    const Runtime = AsyncRuntime(async_opts, conn.Server, State, H.handle, .{ .worker_count = 2 });
+
+    for (0..iterations) |_| {
+        var input: std.ArrayList(u8) = .empty;
+        defer input.deinit(std.testing.allocator);
+        try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "boom-1", .{ 1, 2, 3, 4 });
+        try test_support.appendTestFrame(conn.Opcode, &input, std.testing.allocator, .text, true, true, "boom-2", .{ 5, 6, 7, 8 });
+
+        var reader = Io.Reader.fixed(input.items);
+        var output: [256]u8 = undefined;
+        var writer = Io.Writer.fixed(output[0..]);
+        var server_conn = conn.Server.init(&reader, &writer, .{});
+        var state: State = .{};
+        const io = std.testing.io;
+
+        var runtime = Runtime.init(io);
+        try runtime.start();
+        defer runtime.deinit();
+        var scratch = AsyncScratch(async_opts).init();
+        try std.testing.expectError(error.HandlerFailed, runAsync(async_opts, io, &runtime, &server_conn, &state, &scratch));
+
+        var out_reader = Io.Reader.fixed(output[0..writer.end]);
+        var sink: [0]u8 = .{};
+        var out_writer = Io.Writer.fixed(sink[0..]);
+        var client = conn.Client.init(&out_reader, &out_writer, .{});
+        var payload: [16]u8 = undefined;
+
+        const close = try client.readFrame(payload[0..]);
+        try std.testing.expectEqual(conn.Opcode.close, close.header.opcode);
+        const close_frame = try conn.parseClosePayload(close.payload, true);
+        try std.testing.expectEqual(@as(?u16, 1011), close_frame.code);
+        try std.testing.expectError(error.EndOfStream, client.readFrame(payload[0..]));
+    }
+}
+
+test "async mode emits a single 1011 across concurrent handler failures" {
+    try expectAsyncSingleCloseOnConcurrentErrors(1);
+}
+
+test "async mode emits a single 1011 across repeated concurrent handler failures" {
+    try expectAsyncSingleCloseOnConcurrentErrors(32);
 }
