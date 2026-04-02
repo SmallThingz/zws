@@ -32,6 +32,9 @@ fn appendSyncFlushTail(allocator: std.mem.Allocator, compressed_payload: []const
     return input;
 }
 
+// std.flate surfaces RFC7692's stripped trailer as a read failure once the raw
+// stream ends. Convert that edge into a normal completion path and optionally
+// strip the takeover sentinel byte that keeps the inflater state aligned.
 fn inflateFromDecompressor(decompressor: *flate.Decompress, dest: []u8, strip_takeover_sentinel: bool) InflateError![]u8 {
     var writer = std.Io.Writer.fixed(dest);
     while (true) {
@@ -100,6 +103,8 @@ pub const TakeoverDeflater = struct {
     pub fn deflateMessage(self: *@This(), payload: []const u8) DeflateError![]u8 {
         _ = flateCounter(payload.len) catch return error.CounterTooLarge;
 
+        // Takeover mode keeps the compressor alive across messages, so append a
+        // sentinel byte the matching inflater can strip after stream completion.
         self.compressor.writer.writeAll(payload) catch |err| switch (err) {
             error.WriteFailed => return error.OutOfMemory,
         };

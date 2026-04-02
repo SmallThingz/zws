@@ -31,7 +31,42 @@ pub fn fuzz(
     fuzz_opts: std.testing.FuzzInputOptions,
 ) anyerror!void {
     if (comptime builtin.fuzz) {
-        return fuzzBuiltin(context, testOne, fuzz_opts);
+        const fuzz_abi = std.Build.abi.fuzz;
+        const Smith = std.testing.Smith;
+        const Ctx = @TypeOf(context);
+
+        const Wrapper = struct {
+            var ctx: Ctx = undefined;
+            pub fn testOneC() callconv(.c) void {
+                var smith: Smith = .{ .in = null };
+                testOne(ctx, &smith) catch {};
+            }
+        };
+
+        Wrapper.ctx = context;
+
+        var cache_dir: []const u8 = ".";
+        var map_opt: ?std.process.Environ.Map = null;
+        if (std.testing.environ.createMap(std.testing.allocator)) |map| {
+            map_opt = map;
+            if (map.get("ZIG_CACHE_DIR")) |v| {
+                cache_dir = v;
+            } else if (map.get("ZIG_GLOBAL_CACHE_DIR")) |v| {
+                cache_dir = v;
+            }
+        } else |_| {}
+        defer if (map_opt) |*map| map.deinit();
+
+        fuzz_abi.fuzzer_init(.fromSlice(cache_dir));
+
+        const test_name = @typeName(@TypeOf(testOne));
+        fuzz_abi.fuzzer_set_test(Wrapper.testOneC, .fromSlice(test_name));
+
+        for (fuzz_opts.corpus) |input| {
+            fuzz_abi.fuzzer_add_input(.fromSlice(input));
+        }
+        fuzz_abi.fuzzer_run();
+        return;
     }
 
     if (fuzz_opts.corpus.len == 0) {
@@ -43,48 +78,6 @@ pub fn fuzz(
         var smith: std.testing.Smith = .{ .in = input };
         try testOne(context, &smith);
     }
-}
-
-fn fuzzBuiltin(
-    context: anytype,
-    comptime testOne: fn (context: @TypeOf(context), smith: *std.testing.Smith) anyerror!void,
-    fuzz_opts: std.testing.FuzzInputOptions,
-) anyerror!void {
-    const fuzz_abi = std.Build.abi.fuzz;
-    const Smith = std.testing.Smith;
-    const Ctx = @TypeOf(context);
-
-    const Wrapper = struct {
-        var ctx: Ctx = undefined;
-        pub fn testOneC() callconv(.c) void {
-            var smith: Smith = .{ .in = null };
-            testOne(ctx, &smith) catch {};
-        }
-    };
-
-    Wrapper.ctx = context;
-
-    var cache_dir: []const u8 = ".";
-    var map_opt: ?std.process.Environ.Map = null;
-    if (std.testing.environ.createMap(std.testing.allocator)) |map| {
-        map_opt = map;
-        if (map.get("ZIG_CACHE_DIR")) |v| {
-            cache_dir = v;
-        } else if (map.get("ZIG_GLOBAL_CACHE_DIR")) |v| {
-            cache_dir = v;
-        }
-    } else |_| {}
-    defer if (map_opt) |*map| map.deinit();
-
-    fuzz_abi.fuzzer_init(.fromSlice(cache_dir));
-
-    const test_name = @typeName(@TypeOf(testOne));
-    fuzz_abi.fuzzer_set_test(Wrapper.testOneC, .fromSlice(test_name));
-
-    for (fuzz_opts.corpus) |input| {
-        fuzz_abi.fuzzer_add_input(.fromSlice(input));
-    }
-    fuzz_abi.fuzzer_run();
 }
 
 test "fuzz falls back to a single empty-smith input when corpus is empty" {

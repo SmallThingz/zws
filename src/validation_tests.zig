@@ -4,25 +4,26 @@ const test_support = @import("test_support.zig");
 
 const Io = std.Io;
 
-fn fuzzMalformedFrames(_: void, smith: *std.testing.Smith) !void {
-    var input_buf: [96]u8 = undefined;
-    const len = smith.slice(&input_buf);
-    var reader = Io.Reader.fixed(input_buf[0..len]);
-    var sink: [256]u8 = undefined;
-    var writer = Io.Writer.fixed(sink[0..]);
-    var conn = zws.Conn.Default.init(&reader, &writer, .{});
-
-    var steps: usize = 0;
-    while (steps < 8) : (steps += 1) {
-        const before_seek = reader.seek;
-        _ = conn.beginFrame() catch break;
-        conn.discardFrame() catch break;
-        if (reader.seek == before_seek and !conn.recv_active) break;
-    }
-}
-
 test "fuzz malformed frame streams do not panic" {
-    try std.testing.fuzz({}, fuzzMalformedFrames, .{
+    const Harness = struct {
+        fn fuzzMalformedFrames(_: void, smith: *std.testing.Smith) !void {
+            var input_buf: [96]u8 = undefined;
+            const len = smith.slice(&input_buf);
+            var reader = Io.Reader.fixed(input_buf[0..len]);
+            var sink: [256]u8 = undefined;
+            var writer = Io.Writer.fixed(sink[0..]);
+            var conn = zws.Conn.Default.init(&reader, &writer, .{});
+
+            var steps: usize = 0;
+            while (steps < 8) : (steps += 1) {
+                const before_seek = reader.seek;
+                _ = conn.beginFrame() catch break;
+                conn.discardFrame() catch break;
+                if (reader.seek == before_seek and !conn.recv_active) break;
+            }
+        }
+    };
+    try std.testing.fuzz({}, Harness.fuzzMalformedFrames, .{
         .corpus = &.{
             "",
             "\x81",
@@ -123,6 +124,8 @@ test "property random fragmented messages with interleaved pings preserve payloa
         var expected_ping_len: usize = 0;
         var offset: usize = 0;
 
+        // Generate valid fragmented messages, then inject ping frames between
+        // fragments to stress message assembly plus auto-pong ordering.
         for (0..fragment_count) |frag_idx| {
             const remaining = total_len - offset;
             const last = frag_idx + 1 == fragment_count;

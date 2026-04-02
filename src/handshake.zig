@@ -60,20 +60,6 @@ fn validateClientKey(key: []const u8) bool {
     return true;
 }
 
-fn assignHeader(req: *Request, name: []const u8, value: []const u8) void {
-    if (std.ascii.eqlIgnoreCase(name, "connection")) {
-        req.connection = value;
-    } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
-        req.upgrade = value;
-    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
-        req.sec_websocket_key = value;
-    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
-        req.sec_websocket_version = value;
-    } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-extensions")) {
-        req.sec_websocket_extensions = value;
-    }
-}
-
 fn parseRequest(reader: *Io.Reader) (Error || Io.Reader.Error)!Request {
     const line0_incl = reader.takeDelimiterInclusive('\n') catch |err| switch (err) {
         error.StreamTooLong => return error.BadRequest,
@@ -101,48 +87,22 @@ fn parseRequest(reader: *Io.Reader) (Error || Io.Reader.Error)!Request {
         if (line.len == 0) break;
 
         const colon = std.mem.indexOfScalar(u8, line, ':') orelse return error.BadRequest;
-        assignHeader(&req, line[0..colon], trimSpaces(line[colon + 1 ..]));
+        const name = line[0..colon];
+        const value = trimSpaces(line[colon + 1 ..]);
+        if (std.ascii.eqlIgnoreCase(name, "connection")) {
+            req.connection = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "upgrade")) {
+            req.upgrade = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-key")) {
+            req.sec_websocket_key = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-version")) {
+            req.sec_websocket_version = value;
+        } else if (std.ascii.eqlIgnoreCase(name, "sec-websocket-extensions")) {
+            req.sec_websocket_extensions = value;
+        }
     }
 
     return req;
-}
-
-fn negotiatedPerMessageDeflateForOffer(
-    requested: extensions.PerMessageDeflate,
-    preferred: extensions.PerMessageDeflate,
-) extensions.PerMessageDeflate {
-    return .{
-        .server_no_context_takeover = preferred.server_no_context_takeover,
-        .client_no_context_takeover = preferred.client_no_context_takeover and requested.client_no_context_takeover,
-    };
-}
-
-fn perMessageDeflateOfferScore(
-    requested: extensions.PerMessageDeflate,
-    preferred: extensions.PerMessageDeflate,
-) usize {
-    var score: usize = 0;
-    if (preferred.client_no_context_takeover and requested.client_no_context_takeover) score += 1;
-    return score;
-}
-
-fn negotiatePerMessageDeflate(header_value: ?[]const u8) Error!?extensions.PerMessageDeflate {
-    const offered = header_value orelse return null;
-    if (!extensions.offersPerMessageDeflate(offered)) return null;
-
-    const preferred: extensions.PerMessageDeflate = .{};
-    var offers = extensions.parsePerMessageDeflate(offered);
-    var negotiated: ?extensions.PerMessageDeflate = null;
-    var best_score: usize = 0;
-    while (offers.next() catch return error.ExtensionsNotSupported) |requested| {
-        const candidate = negotiatedPerMessageDeflateForOffer(requested, preferred);
-        const score = perMessageDeflateOfferScore(requested, preferred);
-        if (negotiated == null or score > best_score) {
-            negotiated = candidate;
-            best_score = score;
-        }
-    }
-    return negotiated;
 }
 
 fn acceptRequest(req: Request) Error!Accepted {
@@ -160,9 +120,33 @@ fn acceptRequest(req: Request) Error!Accepted {
     if (!std.mem.eql(u8, version, "13")) return error.UnsupportedWebSocketVersion;
 
     const accept_key = try computeAcceptKey(key);
+    const permessage_deflate = blk: {
+        const offered = req.sec_websocket_extensions orelse break :blk null;
+        if (!extensions.offersPerMessageDeflate(offered)) break :blk null;
+
+        // Repeated permessage-deflate tokens are alternative offers. Prefer the
+        // most constrained alternative we can legally echo back.
+        const preferred: extensions.PerMessageDeflate = .{};
+        var offers = extensions.parsePerMessageDeflate(offered);
+        var negotiated: ?extensions.PerMessageDeflate = null;
+        var best_score: usize = 0;
+        while (offers.next() catch return error.ExtensionsNotSupported) |requested| {
+            const candidate: extensions.PerMessageDeflate = .{
+                .server_no_context_takeover = preferred.server_no_context_takeover,
+                .client_no_context_takeover = preferred.client_no_context_takeover and requested.client_no_context_takeover,
+            };
+            var score: usize = 0;
+            if (preferred.client_no_context_takeover and requested.client_no_context_takeover) score += 1;
+            if (negotiated == null or score > best_score) {
+                negotiated = candidate;
+                best_score = score;
+            }
+        }
+        break :blk negotiated;
+    };
     return .{
         .accept_key = accept_key,
-        .permessage_deflate = try negotiatePerMessageDeflate(req.sec_websocket_extensions),
+        .permessage_deflate = permessage_deflate,
     };
 }
 
@@ -325,6 +309,15 @@ test "acceptRequest accepts repeated permessage-deflate offers as alternatives" 
             .client_no_context_takeover = true,
         },
         accepted.permessage_deflate.?,
+    );
+}
+
+test "acceptRequest ignores unrelated extensions while still rejecting duplicate negotiated permessage-deflate responses" {
+    try std.testing.expectError(
+        error.DuplicateExtensionOffer,
+        extensions.parsePerMessageDeflateFirst(
+            "x-test, permessage-deflate, y-test, permessage-deflate; client_no_context_takeover",
+        ),
     );
 }
 

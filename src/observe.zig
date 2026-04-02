@@ -34,6 +34,8 @@ fn isHookSelfPointer(comptime Param: type, comptime Hooks: type) bool {
     return info.pointer.child == Hooks;
 }
 
+// Keep runtime-hook validation fully comptime-driven so disabled deadline
+// support disappears from specialized connection types entirely.
 fn hasNowNsSignature(comptime Hooks: type) bool {
     if (!@hasDecl(Hooks, "nowNs")) return false;
     const fn_info = switch (@typeInfo(@TypeOf(Hooks.nowNs))) {

@@ -47,20 +47,34 @@ pub fn Scratch(comptime opts: Options) type {
 
 pub fn AsyncScratch(comptime opts: AsyncOptions) type {
     comptime validateAsyncOptions(opts);
-    return AsyncScratchType(opts);
-}
+    return struct {
+        slots: [opts.max_inflight]AsyncSlotStorage(opts) = undefined,
 
-fn executionKind(comptime opts: anytype) enum { sequential, async } {
-    const T = @TypeOf(opts);
-    if (@hasField(T, "max_inflight")) return .async;
-    return .sequential;
+        const Self = @This();
+
+        pub fn init() Self {
+            var out: Self = undefined;
+            inline for (&out.slots) |*slot| slot.* = .{};
+            return out;
+        }
+    };
 }
 
 pub fn SliceContext(comptime opts: anytype, comptime ConnType: type, comptime StateType: type) type {
-    return switch (comptime executionKind(opts)) {
-        .sequential => SliceContextSequential(normalizeOptions(opts), ConnType, StateType),
-        .async => SliceContextAsync(normalizeAsyncOptions(opts), ConnType, StateType),
-    };
+    if (@hasField(@TypeOf(opts), "max_inflight")) {
+        const T = @TypeOf(opts);
+        const normalized: AsyncOptions = if (T == AsyncOptions)
+            opts
+        else
+            .{
+                .close_on_handler_error = if (@hasField(T, "close_on_handler_error")) opts.close_on_handler_error else true,
+                .max_inflight = if (@hasField(T, "max_inflight")) opts.max_inflight else 4,
+                .message_buffer_len = if (@hasField(T, "message_buffer_len")) opts.message_buffer_len else 64 * 1024,
+                .stage_buffer_len = if (@hasField(T, "stage_buffer_len")) opts.stage_buffer_len else 0,
+            };
+        return SliceContextAsync(normalized, ConnType, StateType);
+    }
+    return SliceContextSequential(normalizeOptions(opts), ConnType, StateType);
 }
 
 fn SliceContextSequential(comptime opts: Options, comptime ConnType: type, comptime StateType: type) type {
@@ -233,7 +247,7 @@ fn runSequential(
 ) anyerror!void {
     const ConnType = pointerChildType(@TypeOf(conn_ptr), "conn_ptr");
     const StateType = pointerChildType(@TypeOf(state_ptr), "state_ptr");
-    defer flushPendingOutput(conn_ptr) catch {};
+    defer if (conn_ptr.writer.buffered().len != 0) conn_ptr.flush() catch {};
 
     if (comptime opts.receive_mode == .solid_slice) {
         while (true) {
@@ -259,9 +273,27 @@ fn runSequential(
 
     while (true) {
         try flushBeforeRead(conn_ptr);
-        const start = beginMessageStream(conn_ptr) catch |err| switch (err) {
-            error.EndOfStream, error.ConnectionClosed => return,
-            else => return err,
+        const start = blk: {
+            var control_buf: [125]u8 = undefined;
+            while (true) {
+                const header = conn_ptr.beginFrame() catch |err| switch (err) {
+                    error.EndOfStream, error.ConnectionClosed => return,
+                    else => return err,
+                };
+                if (proto.isControl(header.opcode)) {
+                    const payload = try conn_ptr.readFrameAll(control_buf[0..]);
+                    if (try handleControlFrame(conn_ptr, payload, header.opcode)) return;
+                    continue;
+                }
+                const opcode = proto.messageOpcode(header.opcode) orelse return error.UnexpectedContinuation;
+                if (comptime ConnType.static_config.supports_permessage_deflate) {
+                    if (header.compressed) return error.InvalidCompressedMessage;
+                }
+                break :blk MessageStart{
+                    .opcode = opcode,
+                    .fin = header.fin,
+                };
+            }
         };
         var stream = StreamReader(ConnType).init(conn_ptr, start);
         var ctx: StreamContext(opts, ConnType, StateType) = .{
@@ -291,7 +323,20 @@ pub fn runAsync(
     const ConnType = pointerChildType(@TypeOf(conn_ptr), "conn_ptr");
     const StateType = pointerChildType(@TypeOf(state_ptr), "state_ptr");
     const Runtime = pointerChildType(@TypeOf(runtime), "runtime");
-    comptime validateAsyncRuntime(Runtime, opts, ConnType, StateType);
+    comptime {
+        if (!@hasDecl(Runtime, "runtime_handler")) {
+            @compileError("runtime must be created with Handler.AsyncRuntime(...)");
+        }
+        if (!std.meta.eql(Runtime.runtime_options, opts)) {
+            @compileError("runtime async options do not match runAsync options");
+        }
+        if (Runtime.runtime_conn_type != ConnType) {
+            @compileError("runtime connection type does not match conn_ptr");
+        }
+        if (Runtime.runtime_state_type != StateType) {
+            @compileError("runtime state type does not match state_ptr");
+        }
+    }
     const HooksType = @TypeOf(conn_ptr.hooks);
     const ReadConnType = conn.ConnWithHooks(.{
         .role = ConnType.static_config.role,
@@ -355,27 +400,6 @@ pub fn runAsync(
     if (shared.firstError()) |err| return err;
 }
 
-fn beginMessageStream(c: anytype) anyerror!MessageStart {
-    const ConnType = pointerChildType(@TypeOf(c), "c");
-    var control_buf: [125]u8 = undefined;
-    while (true) {
-        const header = try c.beginFrame();
-        if (proto.isControl(header.opcode)) {
-            const payload = try c.readFrameAll(control_buf[0..]);
-            if (try handleControlFrame(c, payload, header.opcode)) return error.ConnectionClosed;
-            continue;
-        }
-        const opcode = proto.messageOpcode(header.opcode) orelse return error.UnexpectedContinuation;
-        if (comptime ConnType.static_config.supports_permessage_deflate) {
-            if (header.compressed) return error.InvalidCompressedMessage;
-        }
-        return .{
-            .opcode = opcode,
-            .fin = header.fin,
-        };
-    }
-}
-
 fn handleControlFrame(c: anytype, payload: []const u8, opcode: conn.Opcode) anyerror!bool {
     switch (opcode) {
         .ping => {
@@ -408,7 +432,11 @@ fn processHandlerResult(comptime opts: Options, io: Io, ctx: anytype, comptime h
     switch (raw_info) {
         .error_union => {
             const value = raw catch |err| {
-                handleHandlerError(opts, ctx, err);
+                const c = ctx._output;
+                if (comptime opts.close_on_handler_error) {
+                    c.writeClose(1011, "") catch {};
+                    c.flush() catch {};
+                }
                 return err;
             };
             try writeResult(ctx, value);
@@ -427,7 +455,11 @@ fn processAsyncHandlerResult(comptime opts: AsyncOptions, io: Io, ctx: anytype, 
     switch (raw_info) {
         .error_union => {
             const value = raw catch |err| {
-                handleAsyncHandlerError(opts, ctx, err);
+                const output = ctx._output;
+                const first = output.shared.recordError(err);
+                if (comptime opts.close_on_handler_error) {
+                    if (first) output.sendInternalClose(1011, "");
+                }
                 return err;
             };
             try writeResult(ctx, value);
@@ -447,21 +479,6 @@ fn writeResult(ctx: anytype, value: anytype) anyerror!void {
     const T = @TypeOf(value);
     if (T == void) return;
     try ctx.respond(value);
-}
-
-fn handleHandlerError(comptime opts: Options, ctx: anytype, _: anyerror) void {
-    const c = ctx._output;
-    if (comptime !opts.close_on_handler_error) return;
-    c.writeClose(1011, "") catch {};
-    c.flush() catch {};
-}
-
-fn handleAsyncHandlerError(comptime opts: AsyncOptions, ctx: anytype, err: anyerror) void {
-    const output = ctx._output;
-    const first = output.shared.recordError(err);
-    if (comptime !opts.close_on_handler_error) return;
-    if (!first) return;
-    output.sendInternalClose(1011, "");
 }
 
 fn callHandler(comptime ReturnType: type, comptime handler: anytype, io: Io, ctx: anytype) ReturnType {
@@ -489,7 +506,24 @@ fn writeNormalizedResponse(target: anytype, request_opcode: conn.MessageOpcode, 
             if (stageChunks(stage_buf, chunks)) |staged| {
                 try writeSingleBody(target, response_opcode, staged);
             } else {
-                try writeChunkedBody(target, response_opcode, chunks);
+                const first_opcode = switch (response_opcode) {
+                    .text => conn.Opcode.text,
+                    .binary => conn.Opcode.binary,
+                };
+
+                if (chunks.len == 0) {
+                    try target.writeFrame(first_opcode, "", true, false);
+                    return;
+                }
+
+                for (chunks, 0..) |chunk, idx| {
+                    const fin = idx + 1 == chunks.len;
+                    if (idx == 0) {
+                        try target.writeFrame(first_opcode, chunk, fin, false);
+                    } else {
+                        try target.writeFrame(.continuation, chunk, fin, false);
+                    }
+                }
             }
         },
     }
@@ -499,27 +533,6 @@ fn writeSingleBody(target: anytype, opcode: conn.MessageOpcode, body: []const u8
     switch (opcode) {
         .text => try target.writeText(body),
         .binary => try target.writeBinary(body),
-    }
-}
-
-fn writeChunkedBody(target: anytype, opcode: conn.MessageOpcode, chunks: []const []const u8) anyerror!void {
-    const first_opcode = switch (opcode) {
-        .text => conn.Opcode.text,
-        .binary => conn.Opcode.binary,
-    };
-
-    if (chunks.len == 0) {
-        try target.writeFrame(first_opcode, "", true, false);
-        return;
-    }
-
-    for (chunks, 0..) |chunk, idx| {
-        const fin = idx + 1 == chunks.len;
-        if (idx == 0) {
-            try target.writeFrame(first_opcode, chunk, fin, false);
-        } else {
-            try target.writeFrame(.continuation, chunk, fin, false);
-        }
     }
 }
 
@@ -641,39 +654,11 @@ fn validateAsyncOptions(comptime opts: AsyncOptions) void {
     }
 }
 
-fn normalizeAsyncOptions(comptime value: anytype) AsyncOptions {
-    const T = @TypeOf(value);
-    if (T == AsyncOptions) return value;
-    return .{
-        .close_on_handler_error = if (@hasField(T, "close_on_handler_error")) value.close_on_handler_error else true,
-        .max_inflight = if (@hasField(T, "max_inflight")) value.max_inflight else 4,
-        .message_buffer_len = if (@hasField(T, "message_buffer_len")) value.message_buffer_len else 64 * 1024,
-        .stage_buffer_len = if (@hasField(T, "stage_buffer_len")) value.stage_buffer_len else 0,
-    };
-}
-
-fn validateAsyncRuntime(comptime Runtime: type, comptime opts: AsyncOptions, comptime ConnType: type, comptime StateType: type) void {
-    if (!@hasDecl(Runtime, "runtime_handler")) {
-        @compileError("runtime must be created with Handler.AsyncRuntime(...)");
-    }
-    if (!std.meta.eql(Runtime.runtime_options, opts)) {
-        @compileError("runtime async options do not match runAsync options");
-    }
-    if (Runtime.runtime_conn_type != ConnType) {
-        @compileError("runtime connection type does not match conn_ptr");
-    }
-    if (Runtime.runtime_state_type != StateType) {
-        @compileError("runtime state type does not match state_ptr");
-    }
-}
-
-fn flushPendingOutput(c: anytype) anyerror!void {
-    if (c.writer.buffered().len == 0) return;
-    try c.flush();
-}
-
 fn flushBeforeRead(c: anytype) anyerror!void {
     if (c.writer.buffered().len == 0) return;
+    // Do not flush while unread bytes are already buffered locally: that would
+    // interleave an outbound flush with progress we can make from in-memory
+    // input and needlessly serialize the read side.
     if (c.reader.bufferedLen() != 0) return;
     try c.flush();
 }
@@ -688,20 +673,6 @@ fn SequentialScratch(comptime opts: Options) type {
 
         pub fn init() Self {
             return .{};
-        }
-    };
-}
-
-fn AsyncScratchType(comptime opts: AsyncOptions) type {
-    return struct {
-        slots: [opts.max_inflight]AsyncSlotStorage(opts) = undefined,
-
-        const Self = @This();
-
-        pub fn init() Self {
-            var out: Self = undefined;
-            inline for (&out.slots) |*slot| slot.* = .{};
-            return out;
         }
     };
 }
@@ -725,6 +696,9 @@ fn AsyncShared(comptime ConnType: type) type {
     return struct {
         io: Io,
         conn: *ConnType,
+        // `mutex` protects slot/error/shutdown state, while `write_mutex`
+        // serializes frame emission. Keeping them split avoids blocking slot
+        // turnover on long writes.
         write_mutex: Io.Mutex = .init,
         mutex: Io.Mutex = .init,
         cond: Io.Condition = .init,

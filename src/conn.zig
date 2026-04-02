@@ -180,7 +180,11 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         }
 
         pub fn initWithHooks(reader: *Io.Reader, writer: *Io.Writer, config: anytype, hooks: Hooks) Self {
-            const seed = nextMaskSeed() ^
+            const Seed = struct {
+                var value: u64 = 0x9e37_79b9_7f4a_7c15;
+            };
+            Seed.value +%= 0xbf58_476d_1ce4_e5b9;
+            const seed = Seed.value ^
                 @as(u64, @truncate(@intFromPtr(reader))) ^
                 (@as(u64, @truncate(@intFromPtr(writer))) << 1);
             return .{
@@ -203,7 +207,18 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                     if (@hasField(T, "permessage_deflate")) normalizePerMessageDeflateConfig(config.permessage_deflate) else null
                 else {},
                 .timeouts = if (runtime_hooks)
-                    if (@hasField(T, "timeouts")) normalizeTimeoutConfig(config.timeouts) else .{}
+                    if (@hasField(T, "timeouts")) blk: {
+                        const timeouts = config.timeouts;
+                        const TimeoutsType = @TypeOf(timeouts);
+                        break :blk if (TimeoutsType == observe.TimeoutConfig)
+                            timeouts
+                        else
+                            .{
+                                .read_ns = if (@hasField(TimeoutsType, "read_ns")) timeouts.read_ns else null,
+                                .write_ns = if (@hasField(TimeoutsType, "write_ns")) timeouts.write_ns else null,
+                                .flush_ns = if (@hasField(TimeoutsType, "flush_ns")) timeouts.flush_ns else null,
+                            };
+                    } else .{}
                 else {},
             };
         }
@@ -222,39 +237,20 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             };
             return .{
                 .allocator = child.allocator,
-                .negotiated = if (@hasField(Child, "negotiated")) normalizeNegotiatedPerMessageDeflate(child.negotiated) else .{},
+                .negotiated = if (@hasField(Child, "negotiated")) blk: {
+                    const negotiated = child.negotiated;
+                    const NegotiatedType = @TypeOf(negotiated);
+                    break :blk if (NegotiatedType == extensions.PerMessageDeflate)
+                        negotiated
+                    else
+                        .{
+                            .server_no_context_takeover = if (@hasField(NegotiatedType, "server_no_context_takeover")) negotiated.server_no_context_takeover else false,
+                            .client_no_context_takeover = if (@hasField(NegotiatedType, "client_no_context_takeover")) negotiated.client_no_context_takeover else false,
+                        };
+                } else .{},
                 .compression_level = if (@hasField(Child, "compression_level")) child.compression_level else 1,
                 .compress_outgoing = if (@hasField(Child, "compress_outgoing")) child.compress_outgoing else false,
             };
-        }
-
-        // Only the negotiated takeover bits affect the wire format today, so the
-        // stored negotiated extension state is reduced to those booleans.
-        fn normalizeNegotiatedPerMessageDeflate(value: anytype) extensions.PerMessageDeflate {
-            const T = @TypeOf(value);
-            if (T == extensions.PerMessageDeflate) return value;
-            return .{
-                .server_no_context_takeover = if (@hasField(T, "server_no_context_takeover")) value.server_no_context_takeover else false,
-                .client_no_context_takeover = if (@hasField(T, "client_no_context_takeover")) value.client_no_context_takeover else false,
-            };
-        }
-
-        fn normalizeTimeoutConfig(value: anytype) observe.TimeoutConfig {
-            const T = @TypeOf(value);
-            if (T == observe.TimeoutConfig) return value;
-            return .{
-                .read_ns = if (@hasField(T, "read_ns")) value.read_ns else null,
-                .write_ns = if (@hasField(T, "write_ns")) value.write_ns else null,
-                .flush_ns = if (@hasField(T, "flush_ns")) value.flush_ns else null,
-            };
-        }
-
-        fn nextMaskSeed() u64 {
-            const Seed = struct {
-                var value: u64 = 0x9e37_79b9_7f4a_7c15;
-            };
-            Seed.value +%= 0xbf58_476d_1ce4_e5b9;
-            return Seed.value;
         }
 
         pub fn flush(self: *Self) (ProtocolError || Io.Writer.Error)!void {
@@ -924,7 +920,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         fn inflateMessage(self: *Self, compressed_payload: []const u8, dest: []u8) ProtocolError![]u8 {
             if (comptime supports_permessage_deflate and permessage_deflate_context_takeover) {
                 if (self.shouldUseIncomingContextTakeover()) {
-                    const inflated_takeover = self.inflateMessageTakeover(compressed_payload, dest) catch |err| switch (err) {
+                    const inflater = self.ensureRecvTakeoverInflater();
+                    const inflated_takeover = inflater.inflateMessage(compressionAllocator(self), compressed_payload, dest) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         error.CounterTooLarge => return error.MessageTooLarge,
                         error.MessageTooLarge => return error.MessageTooLarge,
@@ -1009,12 +1006,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
                 self.recv_takeover.?.init();
             }
             return &self.recv_takeover.?;
-        }
-
-        fn inflateMessageTakeover(self: *Self, compressed_payload: []const u8, dest: []u8) flate_backend.InflateError![]u8 {
-            if (comptime !supports_permessage_deflate or !permessage_deflate_context_takeover) unreachable;
-            const inflater = self.ensureRecvTakeoverInflater();
-            return inflater.inflateMessage(compressionAllocator(self), compressed_payload, dest);
         }
 
         fn validateOutgoingSequence(self: *Self, opcode: Opcode, fin: bool) ProtocolError!void {

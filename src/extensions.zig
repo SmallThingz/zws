@@ -41,7 +41,62 @@ pub const PerMessageDeflateOfferIterator = struct {
                 self.cursor += 1;
             }
 
-            if (try parsePerMessageDeflateOffer(extension_part)) |offer| return offer;
+            // Handshake requests may repeat `permessage-deflate` to advertise
+            // alternative parameter sets. Preserve those as separate iterator
+            // results so negotiation can choose the best compatible offer.
+            var param_it = std.mem.splitScalar(u8, extension_part, ';');
+            const name = std.mem.trim(u8, param_it.next() orelse continue, " \t");
+            if (!std.ascii.eqlIgnoreCase(name, "permessage-deflate")) continue;
+
+            var parsed: PerMessageDeflate = .{
+                .server_no_context_takeover = false,
+                .client_no_context_takeover = false,
+            };
+            var saw_server_no_context_takeover = false;
+            var saw_client_no_context_takeover = false;
+            var saw_server_max_window_bits = false;
+            var saw_client_max_window_bits = false;
+
+            while (param_it.next()) |param_part| {
+                const param = std.mem.trim(u8, param_part, " \t");
+                if (param.len == 0) continue;
+                const eq = std.mem.indexOfScalar(u8, param, '=');
+                const param_name = std.mem.trim(u8, if (eq) |idx| param[0..idx] else param, " \t");
+                const param_value = if (eq) |idx| std.mem.trim(u8, param[idx + 1 ..], " \t") else null;
+
+                if (std.ascii.eqlIgnoreCase(param_name, "server_no_context_takeover")) {
+                    if (param_value != null) return error.InvalidExtensionParameter;
+                    if (saw_server_no_context_takeover) return error.DuplicateExtensionParameter;
+                    saw_server_no_context_takeover = true;
+                    parsed.server_no_context_takeover = true;
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(param_name, "client_no_context_takeover")) {
+                    if (param_value != null) return error.InvalidExtensionParameter;
+                    if (saw_client_no_context_takeover) return error.DuplicateExtensionParameter;
+                    saw_client_no_context_takeover = true;
+                    parsed.client_no_context_takeover = true;
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(param_name, "server_max_window_bits")) {
+                    if (saw_server_max_window_bits) return error.DuplicateExtensionParameter;
+                    const value = param_value orelse return error.InvalidExtensionParameter;
+                    _ = parseWindowBits(value) catch return error.InvalidExtensionParameter;
+                    saw_server_max_window_bits = true;
+                    continue;
+                }
+                if (std.ascii.eqlIgnoreCase(param_name, "client_max_window_bits")) {
+                    if (saw_client_max_window_bits) return error.DuplicateExtensionParameter;
+                    if (param_value) |value| {
+                        _ = parseWindowBits(value) catch return error.InvalidExtensionParameter;
+                    }
+                    saw_client_max_window_bits = true;
+                    continue;
+                }
+                return error.InvalidExtensionParameter;
+            }
+
+            return parsed;
         }
         return null;
     }
@@ -62,67 +117,14 @@ pub fn parsePerMessageDeflate(header_value: []const u8) PerMessageDeflateOfferIt
 }
 
 pub fn parsePerMessageDeflateFirst(header_value: []const u8) ParsePerMessageDeflateError!?PerMessageDeflate {
+    // Use the iterator when parsing request offers. This helper is the stricter
+    // response-style path: at most one negotiated permessage-deflate token may
+    // remain after filtering unrelated extensions.
     var offers = parsePerMessageDeflate(header_value);
     const first = try offers.next();
     if (first == null) return null;
     if ((try offers.next()) != null) return error.DuplicateExtensionOffer;
     return first;
-}
-
-fn parsePerMessageDeflateOffer(extension_part: []const u8) ParsePerMessageDeflateError!?PerMessageDeflate {
-    var param_it = std.mem.splitScalar(u8, extension_part, ';');
-    const name = std.mem.trim(u8, param_it.next() orelse return null, " \t");
-    if (!std.ascii.eqlIgnoreCase(name, "permessage-deflate")) return null;
-
-    var parsed: PerMessageDeflate = .{
-        .server_no_context_takeover = false,
-        .client_no_context_takeover = false,
-    };
-    var saw_server_no_context_takeover = false;
-    var saw_client_no_context_takeover = false;
-    var saw_server_max_window_bits = false;
-    var saw_client_max_window_bits = false;
-
-    while (param_it.next()) |param_part| {
-        const param = std.mem.trim(u8, param_part, " \t");
-        if (param.len == 0) continue;
-        const eq = std.mem.indexOfScalar(u8, param, '=');
-        const param_name = std.mem.trim(u8, if (eq) |idx| param[0..idx] else param, " \t");
-        const param_value = if (eq) |idx| std.mem.trim(u8, param[idx + 1 ..], " \t") else null;
-
-        if (std.ascii.eqlIgnoreCase(param_name, "server_no_context_takeover")) {
-            if (param_value != null) return error.InvalidExtensionParameter;
-            if (saw_server_no_context_takeover) return error.DuplicateExtensionParameter;
-            saw_server_no_context_takeover = true;
-            parsed.server_no_context_takeover = true;
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(param_name, "client_no_context_takeover")) {
-            if (param_value != null) return error.InvalidExtensionParameter;
-            if (saw_client_no_context_takeover) return error.DuplicateExtensionParameter;
-            saw_client_no_context_takeover = true;
-            parsed.client_no_context_takeover = true;
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(param_name, "server_max_window_bits")) {
-            if (saw_server_max_window_bits) return error.DuplicateExtensionParameter;
-            const value = param_value orelse return error.InvalidExtensionParameter;
-            _ = parseWindowBits(value) catch return error.InvalidExtensionParameter;
-            saw_server_max_window_bits = true;
-            continue;
-        }
-        if (std.ascii.eqlIgnoreCase(param_name, "client_max_window_bits")) {
-            if (saw_client_max_window_bits) return error.DuplicateExtensionParameter;
-            if (param_value) |value| {
-                _ = parseWindowBits(value) catch return error.InvalidExtensionParameter;
-            }
-            saw_client_max_window_bits = true;
-            continue;
-        }
-        return error.InvalidExtensionParameter;
-    }
-
-    return parsed;
 }
 
 fn parseWindowBits(value: []const u8) error{InvalidWindowBits}!u8 {
