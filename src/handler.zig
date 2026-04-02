@@ -284,20 +284,12 @@ fn runAsync(
     var read_conn = ReadConnType.initWithHooks(conn_ptr.reader, &read_writer.interface, conn_ptr.config, conn_ptr.hooks);
 
     const Worker = struct {
-        fn main(slot: *Slot, shared_ptr: *Shared, output_ptr: *AsyncOutput(ConnType), state: *StateType) void {
+        fn main(slots: []Slot, shared_ptr: *Shared, output_ptr: *AsyncOutput(ConnType), state: *StateType) void {
             while (true) {
-                slot.mutex.lockUncancelable(shared_ptr.io);
-                while (!slot.has_work and !slot.stop) {
-                    slot.cond.waitUncancelable(shared_ptr.io, &slot.mutex);
-                }
-                if (slot.stop and !slot.has_work) {
-                    slot.mutex.unlock(shared_ptr.io);
-                    return;
-                }
+                const slot_index = shared_ptr.nextReadySlot(slots) orelse return;
+                const slot = &slots[slot_index];
                 const opcode = slot.opcode;
                 const message_len = slot.message_len;
-                slot.has_work = false;
-                slot.mutex.unlock(shared_ptr.io);
 
                 var ctx: SliceContext(ConnType, StateType) = .{
                     .io = shared_ptr.io,
@@ -320,21 +312,14 @@ fn runAsync(
 
     var started_threads: usize = 0;
     errdefer {
-        for (scratch.slots[0..started_threads]) |*slot| {
-            slot.mutex.lockUncancelable(io);
-            slot.stop = true;
-            slot.cond.signal(io);
-            slot.mutex.unlock(io);
-        }
-        for (scratch.slots[0..started_threads]) |*slot| {
-            if (slot.thread) |thread| thread.join();
-            slot.thread = null;
+        shared.stopAccepting(false);
+        for (scratch.workers[0..started_threads]) |thread| {
+            if (thread) |worker| worker.join();
         }
     }
 
-    for (&scratch.slots) |*slot| {
-        slot.* = .{};
-        slot.thread = try std.Thread.spawn(.{}, Worker.main, .{ slot, &shared, &output, state_ptr });
+    for (&scratch.workers) |*worker| {
+        worker.* = try std.Thread.spawn(.{}, Worker.main, .{ scratch.slots[0..], &shared, &output, state_ptr });
         started_threads += 1;
     }
     while (try shared.reserveSlot(scratch.slots[0..])) |slot_index| {
@@ -361,23 +346,15 @@ fn runAsync(
             },
         };
 
-        slot.mutex.lockUncancelable(io);
         slot.opcode = message.opcode;
         slot.message_len = message.payload.len;
-        slot.has_work = true;
-        slot.cond.signal(io);
-        slot.mutex.unlock(io);
+        shared.enqueueReadySlot(slot);
     }
 
-    for (&scratch.slots) |*slot| {
-        slot.mutex.lockUncancelable(io);
-        slot.stop = true;
-        slot.cond.signal(io);
-        slot.mutex.unlock(io);
-    }
-    for (&scratch.slots) |*slot| {
-        if (slot.thread) |thread| thread.join();
-        slot.thread = null;
+    shared.stopAccepting(false);
+    for (&scratch.workers) |*worker| {
+        if (worker.*) |thread| thread.join();
+        worker.* = null;
     }
 
     if (shared.firstError()) |err| return err;
@@ -647,12 +624,14 @@ fn SequentialScratch(comptime opts: Options) type {
 fn AsyncScratch(comptime opts: Options) type {
     return struct {
         slots: [opts.async_max_inflight]AsyncSlot(opts) = undefined,
+        workers: [asyncWorkerCount(opts)]?std.Thread = undefined,
 
         const Self = @This();
 
         pub fn init() Self {
             var out: Self = undefined;
             inline for (&out.slots) |*slot| slot.* = .{};
+            inline for (&out.workers) |*worker| worker.* = null;
             return out;
         }
     };
@@ -662,16 +641,16 @@ fn AsyncSlot(comptime opts: Options) type {
     const stage_len = effectiveStageBufferLen(opts);
     return struct {
         busy: bool = false,
-        mutex: Io.Mutex = .init,
-        cond: Io.Condition = .init,
-        has_work: bool = false,
-        stop: bool = false,
+        queued: bool = false,
         opcode: conn.MessageOpcode = .text,
         message_len: usize = 0,
         message_buf: [opts.message_buffer_len]u8 = undefined,
         stage_buf: [stage_len]u8 = undefined,
-        thread: ?std.Thread = null,
     };
+}
+
+fn asyncWorkerCount(comptime opts: Options) usize {
+    return @min(opts.async_max_inflight, 4);
 }
 
 fn effectiveStageBufferLen(comptime opts: Options) usize {
@@ -720,16 +699,41 @@ fn AsyncShared(comptime ConnType: type) type {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             slot.busy = false;
+            slot.queued = false;
             self.inflight -= 1;
-            self.cond.signal(self.io);
+            self.cond.broadcast(self.io);
         }
 
         fn finishSlot(self: *Self, slot: anytype) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             slot.busy = false;
+            slot.queued = false;
             self.inflight -= 1;
+            self.cond.broadcast(self.io);
+        }
+
+        fn enqueueReadySlot(self: *Self, slot: anytype) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            slot.queued = true;
             self.cond.signal(self.io);
+        }
+
+        fn nextReadySlot(self: *Self, slots: anytype) ?usize {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+
+            while (true) {
+                for (slots, 0..) |*slot, idx| {
+                    if (slot.busy and slot.queued) {
+                        slot.queued = false;
+                        return idx;
+                    }
+                }
+                if (self.stopping) return null;
+                self.cond.waitUncancelable(self.io, &self.mutex);
+            }
         }
 
         fn stopAccepting(self: *Self, shutdown_writes: bool) void {
