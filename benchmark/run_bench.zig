@@ -5,6 +5,7 @@ const Io = std.Io;
 const Config = struct {
     host: []const u8 = "127.0.0.1",
     port: u16 = 9001,
+    conns: usize = 1,
     pipeline: usize = 1,
     msg_size: usize = 16,
     mode: []const u8 = "sync",
@@ -101,6 +102,9 @@ pub fn main(init: std.process.Init) !void {
             } else if (std.mem.eql(u8, kv.key, "port")) {
                 cfg.port = try std.fmt.parseInt(u16, kv.val, 10);
                 try bench_args.append(allocator, arg);
+            } else if (std.mem.eql(u8, kv.key, "conns")) {
+                cfg.conns = try std.fmt.parseInt(usize, kv.val, 10);
+                try bench_args.append(allocator, arg);
             } else if (std.mem.eql(u8, kv.key, "pipeline")) {
                 cfg.pipeline = try std.fmt.parseInt(usize, kv.val, 10);
                 try bench_args.append(allocator, arg);
@@ -123,19 +127,22 @@ pub fn main(init: std.process.Init) !void {
         try runForwarded(init.io, bench_args.items, root);
         return;
     }
+    if (cfg.conns == 0) return error.InvalidConns;
 
     var port_buf: [32]u8 = undefined;
     var pipeline_buf: [32]u8 = undefined;
     var size_buf: [32]u8 = undefined;
     var deadline_buf: [32]u8 = undefined;
     var mode_buf: [32]u8 = undefined;
+    var expected_conns_buf: [32]u8 = undefined;
     const port_arg = try std.fmt.bufPrint(&port_buf, "--port={d}", .{cfg.port});
     const pipeline_arg = try std.fmt.bufPrint(&pipeline_buf, "--pipeline={d}", .{cfg.pipeline});
     const size_arg = try std.fmt.bufPrint(&size_buf, "--msg-size={d}", .{cfg.msg_size});
     const mode_arg = try std.fmt.bufPrint(&mode_buf, "--mode={s}", .{cfg.mode});
     const deadline_arg = try std.fmt.bufPrint(&deadline_buf, "--deadline-ms={d}", .{cfg.deadline_ms});
+    const expected_conns_arg = try std.fmt.bufPrint(&expected_conns_buf, "--expected-conns={d}", .{cfg.conns});
 
-    var server = try spawnBackground(init.io, &.{ server_path, port_arg, pipeline_arg, size_arg, mode_arg, deadline_arg }, root);
+    var server = try spawnBackground(init.io, &.{ server_path, port_arg, pipeline_arg, size_arg, expected_conns_arg, mode_arg, deadline_arg }, root);
     defer terminateChild(init.io, &server);
     try waitForPort(init.io, cfg.port, 10_000);
     try runForwarded(init.io, bench_args.items, root);

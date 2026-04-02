@@ -43,13 +43,16 @@ const handler_async_opts: zws.Handler.AsyncOptions = .{
     .stage_buffer_len = 64 * 1024,
 };
 
-const BenchAsyncRuntime = zws.Handler.AsyncRuntime(handler_async_opts, BenchConnAsync, u8, EchoHandler(handler_async_opts, BenchConnAsync).handle, .{ .worker_count = 4 });
-const BenchAsyncDeadlineRuntime = zws.Handler.AsyncRuntime(handler_async_opts, BenchConnAsyncDeadline, u8, EchoHandler(handler_async_opts, BenchConnAsyncDeadline).handle, .{ .worker_count = 4 });
+const BenchAsyncRuntimeSingle = zws.Handler.AsyncRuntime(handler_async_opts, BenchConnAsync, u8, EchoHandler(handler_async_opts, BenchConnAsync).handle, .{ .worker_count = 1 });
+const BenchAsyncRuntimeMulti = zws.Handler.AsyncRuntime(handler_async_opts, BenchConnAsync, u8, EchoHandler(handler_async_opts, BenchConnAsync).handle, .{ .worker_count = 4 });
+const BenchAsyncDeadlineRuntimeSingle = zws.Handler.AsyncRuntime(handler_async_opts, BenchConnAsyncDeadline, u8, EchoHandler(handler_async_opts, BenchConnAsyncDeadline).handle, .{ .worker_count = 1 });
+const BenchAsyncDeadlineRuntimeMulti = zws.Handler.AsyncRuntime(handler_async_opts, BenchConnAsyncDeadline, u8, EchoHandler(handler_async_opts, BenchConnAsyncDeadline).handle, .{ .worker_count = 4 });
 
 const Config = struct {
     port: u16 = 9001,
     pipeline: usize = 1,
     msg_size: usize = 16,
+    expected_conns: usize = 1,
     deadline_ms: usize = 0,
     mode: Mode = .sync,
 };
@@ -61,7 +64,7 @@ fn usage(io: Io) !void {
         \\zwebsocket-bench-server
         \\
         \\Usage:
-        \\  zwebsocket-bench-server [--port=9001] [--pipeline=1] [--msg-size=16] [--mode=sync|async] [--deadline-ms=0]
+        \\  zwebsocket-bench-server [--port=9001] [--pipeline=1] [--msg-size=16] [--expected-conns=1] [--mode=sync|async] [--deadline-ms=0]
         \\
     );
     try stdout.interface.flush();
@@ -192,12 +195,85 @@ fn handleConnSyncDeadline(io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Can
     return handleConnWithHandler(BenchConnSyncDeadline, handler_sync_opts, io, stream, cfg);
 }
 
-fn handleConnAsync(runtime: *BenchAsyncRuntime, io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
+fn handleConnAsyncSingle(runtime: *BenchAsyncRuntimeSingle, io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
     return handleConnWithAsyncHandler(BenchConnAsync, handler_async_opts, runtime, io, stream, cfg);
 }
 
-fn handleConnAsyncDeadline(runtime: *BenchAsyncDeadlineRuntime, io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
+fn handleConnAsyncMulti(runtime: *BenchAsyncRuntimeMulti, io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
+    return handleConnWithAsyncHandler(BenchConnAsync, handler_async_opts, runtime, io, stream, cfg);
+}
+
+fn handleConnAsyncDeadlineSingle(runtime: *BenchAsyncDeadlineRuntimeSingle, io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
     return handleConnWithAsyncHandler(BenchConnAsyncDeadline, handler_async_opts, runtime, io, stream, cfg);
+}
+
+fn handleConnAsyncDeadlineMulti(runtime: *BenchAsyncDeadlineRuntimeMulti, io: Io, stream: std.Io.net.Stream, cfg: Config) Io.Cancelable!void {
+    return handleConnWithAsyncHandler(BenchConnAsyncDeadline, handler_async_opts, runtime, io, stream, cfg);
+}
+
+fn dispatchAccept(
+    comptime handler: anytype,
+    init: std.process.Init,
+    group: *Io.Group,
+    stream: std.Io.net.Stream,
+    cfg: Config,
+) void {
+    group.concurrent(init.io, handler, .{ init.io, stream, cfg }) catch {
+        stream.close(init.io);
+    };
+}
+
+fn dispatchAcceptAsync(
+    comptime handler: anytype,
+    runtime: anytype,
+    init: std.process.Init,
+    group: *Io.Group,
+    stream: std.Io.net.Stream,
+    cfg: Config,
+) void {
+    group.concurrent(init.io, handler, .{ runtime, init.io, stream, cfg }) catch {
+        stream.close(init.io);
+    };
+}
+
+fn runSyncLoop(init: std.process.Init, listener: anytype, cfg: Config) !void {
+    var group: Io.Group = .init;
+    defer group.cancel(init.io);
+
+    while (true) {
+        const stream = listener.accept(init.io) catch |err| switch (err) {
+            error.SocketNotListening, error.Canceled => return,
+            else => return,
+        };
+        if (cfg.deadline_ms == 0) {
+            dispatchAccept(handleConnSync, init, &group, stream, cfg);
+        } else {
+            dispatchAccept(handleConnSyncDeadline, init, &group, stream, cfg);
+        }
+    }
+}
+
+fn runAsyncLoop(
+    comptime RuntimeType: type,
+    comptime handler: anytype,
+    init: std.process.Init,
+    listener: anytype,
+    cfg: Config,
+) !void {
+    var runtime = RuntimeType.init(init.io);
+    try runtime.start();
+    defer runtime.deinit();
+
+    var group: Io.Group = .init;
+    defer group.cancel(init.io);
+
+    while (true) {
+        const stream = listener.accept(init.io) catch |err| switch (err) {
+            error.SocketNotListening, error.Canceled => return,
+            else => return,
+        };
+        dispatchAcceptAsync(handler, &runtime, init, &group, stream, cfg);
+    }
 }
 
 pub fn main(init: std.process.Init) !void {
@@ -220,6 +296,8 @@ pub fn main(init: std.process.Init) !void {
                 cfg.pipeline = try std.fmt.parseInt(usize, kv.val, 10);
             } else if (std.mem.eql(u8, kv.key, "msg-size")) {
                 cfg.msg_size = try std.fmt.parseInt(usize, kv.val, 10);
+            } else if (std.mem.eql(u8, kv.key, "expected-conns")) {
+                cfg.expected_conns = try std.fmt.parseInt(usize, kv.val, 10);
             } else if (std.mem.eql(u8, kv.key, "deadline-ms")) {
                 cfg.deadline_ms = try std.fmt.parseInt(usize, kv.val, 10);
             } else if (std.mem.eql(u8, kv.key, "mode")) {
@@ -232,49 +310,27 @@ pub fn main(init: std.process.Init) !void {
         return error.UnknownArg;
     }
     if (cfg.pipeline == 0) return error.InvalidPipeline;
+    if (cfg.expected_conns == 0) return error.InvalidConns;
 
     const addr: std.Io.net.IpAddress = .{ .ip4 = std.Io.net.Ip4Address.loopback(cfg.port) };
     var listener = try std.Io.net.IpAddress.listen(&addr, init.io, .{ .reuse_address = true });
     defer listener.deinit(init.io);
-
-    var async_runtime = BenchAsyncRuntime.init(init.io);
-    try async_runtime.start();
-    defer async_runtime.deinit();
-    var async_deadline_runtime = BenchAsyncDeadlineRuntime.init(init.io);
-    try async_deadline_runtime.start();
-    defer async_deadline_runtime.deinit();
-
-    var group: Io.Group = .init;
-    defer group.cancel(init.io);
-
-    while (true) {
-        const stream = listener.accept(init.io) catch |err| switch (err) {
-            error.SocketNotListening, error.Canceled => return,
-            else => return,
-        };
-        switch (cfg.mode) {
-            .sync => {
-                if (cfg.deadline_ms == 0) {
-                    group.concurrent(init.io, handleConnSync, .{ init.io, stream, cfg }) catch {
-                        stream.close(init.io);
-                    };
+    switch (cfg.mode) {
+        .sync => try runSyncLoop(init, &listener, cfg),
+        .async => {
+            if (cfg.deadline_ms == 0) {
+                if (cfg.expected_conns <= 1) {
+                    try runAsyncLoop(BenchAsyncRuntimeSingle, handleConnAsyncSingle, init, &listener, cfg);
                 } else {
-                    group.concurrent(init.io, handleConnSyncDeadline, .{ init.io, stream, cfg }) catch {
-                        stream.close(init.io);
-                    };
+                    try runAsyncLoop(BenchAsyncRuntimeMulti, handleConnAsyncMulti, init, &listener, cfg);
                 }
-            },
-            .async => {
-                if (cfg.deadline_ms == 0) {
-                    group.concurrent(init.io, handleConnAsync, .{ &async_runtime, init.io, stream, cfg }) catch {
-                        stream.close(init.io);
-                    };
+            } else {
+                if (cfg.expected_conns <= 1) {
+                    try runAsyncLoop(BenchAsyncDeadlineRuntimeSingle, handleConnAsyncDeadlineSingle, init, &listener, cfg);
                 } else {
-                    group.concurrent(init.io, handleConnAsyncDeadline, .{ &async_deadline_runtime, init.io, stream, cfg }) catch {
-                        stream.close(init.io);
-                    };
+                    try runAsyncLoop(BenchAsyncDeadlineRuntimeMulti, handleConnAsyncDeadlineMulti, init, &listener, cfg);
                 }
-            },
-        }
+            }
+        },
     }
 }

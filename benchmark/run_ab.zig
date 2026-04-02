@@ -252,6 +252,7 @@ fn startServers(io: std.Io, root: []const u8, cfg: Config, suite: Suite, paths: 
     var zws_pipeline_buf: [32]u8 = undefined;
     var zws_size_buf: [32]u8 = undefined;
     var zws_deadline_buf: [32]u8 = undefined;
+    var zws_expected_conns_buf: [32]u8 = undefined;
 
     const zws_sync_port_arg = try std.fmt.bufPrint(&zws_sync_port_buf, "--port={d}", .{cfg.zws_sync_port});
     const zws_sync_dl_port_arg = try std.fmt.bufPrint(&zws_sync_dl_port_buf, "--port={d}", .{cfg.zws_sync_deadline_port});
@@ -260,6 +261,7 @@ fn startServers(io: std.Io, root: []const u8, cfg: Config, suite: Suite, paths: 
     const zws_pipeline_arg = try std.fmt.bufPrint(&zws_pipeline_buf, "--pipeline={d}", .{suite.pipeline});
     const zws_size_arg = try std.fmt.bufPrint(&zws_size_buf, "--msg-size={d}", .{cfg.msg_size});
     const zws_deadline_arg = try std.fmt.bufPrint(&zws_deadline_buf, "--deadline-ms={d}", .{cfg.zws_deadline_ms});
+    const zws_expected_conns_arg = try std.fmt.bufPrint(&zws_expected_conns_buf, "--expected-conns={d}", .{suite.conns});
 
     var uws_sync_port_buf: [16]u8 = undefined;
     var uws_sync_dl_port_buf: [16]u8 = undefined;
@@ -273,10 +275,10 @@ fn startServers(io: std.Io, root: []const u8, cfg: Config, suite: Suite, paths: 
     const uws_deadline_ms_arg = try std.fmt.bufPrint(&uws_deadline_ms_buf, "--deadline-ms={d}", .{cfg.uws_deadline_ms});
 
     const children: Servers = .{
-        .zws_sync = try spawnBackground(io, &.{ paths.zws_server, zws_sync_port_arg, zws_pipeline_arg, zws_size_arg, "--mode=sync" }, root),
-        .zws_sync_deadline = try spawnBackground(io, &.{ paths.zws_server, zws_sync_dl_port_arg, zws_pipeline_arg, zws_size_arg, "--mode=sync", zws_deadline_arg }, root),
-        .zws_async = try spawnBackground(io, &.{ paths.zws_server, zws_async_port_arg, zws_pipeline_arg, zws_size_arg, "--mode=async" }, root),
-        .zws_async_deadline = try spawnBackground(io, &.{ paths.zws_server, zws_async_dl_port_arg, zws_pipeline_arg, zws_size_arg, "--mode=async", zws_deadline_arg }, root),
+        .zws_sync = try spawnBackground(io, &.{ paths.zws_server, zws_sync_port_arg, zws_pipeline_arg, zws_size_arg, zws_expected_conns_arg, "--mode=sync" }, root),
+        .zws_sync_deadline = try spawnBackground(io, &.{ paths.zws_server, zws_sync_dl_port_arg, zws_pipeline_arg, zws_size_arg, zws_expected_conns_arg, "--mode=sync", zws_deadline_arg }, root),
+        .zws_async = try spawnBackground(io, &.{ paths.zws_server, zws_async_port_arg, zws_pipeline_arg, zws_size_arg, zws_expected_conns_arg, "--mode=async" }, root),
+        .zws_async_deadline = try spawnBackground(io, &.{ paths.zws_server, zws_async_dl_port_arg, zws_pipeline_arg, zws_size_arg, zws_expected_conns_arg, "--mode=async", zws_deadline_arg }, root),
         .uws_sync = try spawnBackground(io, &.{ paths.uws_server, uws_sync_port_arg, "--mode=sync" }, root),
         .uws_sync_deadline = try spawnBackground(io, &.{ paths.uws_server, uws_sync_dl_port_arg, "--mode=sync", uws_deadline_ms_arg }, root),
         .uws_async = try spawnBackground(io, &.{ paths.uws_server, uws_async_port_arg, "--mode=async" }, root),
