@@ -51,14 +51,14 @@ Notes:
 
 Source: `benchmark/results/latest.json`
 
-Config: host=`127.0.0.1` path=`/` rounds=2 single_conns=1 multi_conns=16 iters=200000 warmup=10000 pipeline_depth=8 msg_size=16 bench_timeout_ms=120000 zws_deadline_ms=30000 uws_deadline_ms=30000
+Config: host=`127.0.0.1` path=`/` rounds=1 single_conns=1 multi_conns=4 iters=5000 warmup=500 pipeline_depth=4 msg_size=16 bench_timeout_ms=120000 zws_deadline_ms=30000 uws_deadline_ms=30000
 
 | Suite | zws-sync | zws-sync+dl | zws-async | zws-async+dl | uWS-sync | uWS-sync+dl | uWS-async | uWS-async+dl |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
-| single / non-pipelined | 160401.12 | 154357.58 | 97049.36 | 96139.75 | 148612.56 | 156508.31 | 134982.23 | 134232.97 |
-| single / pipelined | 461563.61 | 411746.09 | 197746.75 | 185423.27 | 1077679.07 | 1069422.27 | 413422.62 | 394770.05 |
-| multi / non-pipelined | 904154.08 | 885448.39 | 282056.74 | 274546.63 | 426655.73 | 427852.93 | 380106.78 | 379073.07 |
-| multi / pipelined | 1447234.04 | 1480038.91 | 1006375.87 | 924243.43 | 3218017.67 | 3242521.10 | 556386.31 | 551075.29 |
+| single / non-pipelined | 111439.19 | 94246.61 | 73721.95 | 73061.01 | 128607.14 | 90111.46 | 116662.81 | 121586.31 |
+| single / pipelined | 326675.94 | 382862.58 | 141817.95 | 133676.31 | 362430.70 | 466046.68 | 284693.68 | 183694.09 |
+| multi / non-pipelined | 330209.33 | 428342.42 | 274271.87 | 288601.27 | 359620.32 | 348076.77 | 298542.82 | 355188.31 |
+| multi / pipelined | 523950.44 | 589391.52 | 244909.09 | 283294.65 | 1168268.18 | 1336132.35 | 410679.32 | 499845.49 |
 
 Fairness notes: all peers use the same benchmark client, identical per-suite client settings, and the matrix runs strict interleaved rounds for every peer inside each suite.
 <!-- BENCH_COMPARE:END -->

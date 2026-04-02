@@ -11,19 +11,22 @@ pub const ReceiveMode = enum {
     stream,
 };
 
-pub const ExecutionMode = enum {
-    sequential,
-    async,
-};
-
 pub const Options = struct {
     receive_mode: ReceiveMode = .solid_slice,
-    execution: ExecutionMode = .sequential,
-    auto_flush: bool = true,
     close_on_handler_error: bool = true,
-    async_max_inflight: usize = 4,
     message_buffer_len: usize = 64 * 1024,
     stage_buffer_len: usize = 0,
+};
+
+pub const AsyncOptions = struct {
+    close_on_handler_error: bool = true,
+    max_inflight: usize = 4,
+    message_buffer_len: usize = 64 * 1024,
+    stage_buffer_len: usize = 0,
+};
+
+pub const RuntimeConfig = struct {
+    worker_count: usize = 4,
 };
 
 pub const Body = union(enum) {
@@ -39,37 +42,41 @@ pub const Response = struct {
 
 pub fn Scratch(comptime opts: Options) type {
     comptime validateOptions(opts);
-    return switch (opts.execution) {
-        .sequential => SequentialScratch(opts),
-        .async => AsyncScratch(opts),
+    return SequentialScratch(opts);
+}
+
+pub fn AsyncScratch(comptime opts: AsyncOptions) type {
+    comptime validateAsyncOptions(opts);
+    return AsyncScratchType(opts);
+}
+
+fn executionKind(comptime opts: anytype) enum { sequential, async } {
+    const T = @TypeOf(opts);
+    if (@hasField(T, "max_inflight")) return .async;
+    return .sequential;
+}
+
+pub fn SliceContext(comptime opts: anytype, comptime ConnType: type, comptime StateType: type) type {
+    return switch (comptime executionKind(opts)) {
+        .sequential => SliceContextSequential(normalizeOptions(opts), ConnType, StateType),
+        .async => SliceContextAsync(normalizeAsyncOptions(opts), ConnType, StateType),
     };
 }
 
-// The context carries only the output surface needed for the chosen execution
-// mode so sequential handlers do not pay for async bookkeeping fields.
-fn OutputType(comptime opts: Options, comptime ConnType: type) type {
-    return switch (opts.execution) {
-        .sequential => *ConnType,
-        .async => *AsyncOutput(ConnType),
-    };
-}
-
-pub fn SliceContext(comptime opts: Options, comptime ConnType: type, comptime StateType: type) type {
+fn SliceContextSequential(comptime opts: Options, comptime ConnType: type, comptime StateType: type) type {
+    _ = opts;
     return struct {
         io: Io,
         state: *StateType,
         message: conn.Message,
-        _output: OutputType(opts, ConnType),
+        _output: *ConnType,
         _stage_buf: []u8 = &.{},
 
         const Self = @This();
 
         pub fn respond(self: *Self, value: anytype) anyerror!void {
             const normalized = normalizeResponse(value);
-            switch (comptime opts.execution) {
-                .sequential => try writeNormalizedResponse(self._output, self.message.opcode, normalized, self._stage_buf),
-                .async => try self._output.writeResponse(self.message.opcode, normalized, self._stage_buf),
-            }
+            try writeNormalizedResponse(self._output, self.message.opcode, normalized, self._stage_buf);
         }
 
         pub fn flush(self: *Self) anyerror!void {
@@ -78,12 +85,36 @@ pub fn SliceContext(comptime opts: Options, comptime ConnType: type, comptime St
     };
 }
 
-pub fn StreamContext(comptime opts: Options, comptime ConnType: type, comptime StateType: type) type {
+fn SliceContextAsync(comptime opts: AsyncOptions, comptime ConnType: type, comptime StateType: type) type {
+    _ = opts;
+    return struct {
+        io: Io,
+        state: *StateType,
+        message: conn.Message,
+        _output: *AsyncOutput(ConnType),
+        _stage_buf: []u8 = &.{},
+
+        const Self = @This();
+
+        pub fn respond(self: *Self, value: anytype) anyerror!void {
+            const normalized = normalizeResponse(value);
+            try self._output.writeResponse(self.message.opcode, normalized, self._stage_buf);
+        }
+
+        pub fn flush(self: *Self) anyerror!void {
+            try self._output.flush();
+        }
+    };
+}
+
+pub fn StreamContext(comptime opts: anytype, comptime ConnType: type, comptime StateType: type) type {
+    const seq_opts = normalizeOptions(opts);
+    _ = seq_opts;
     return struct {
         io: Io,
         state: *StateType,
         stream: *StreamReader(ConnType),
-        _output: OutputType(opts, ConnType),
+        _output: *ConnType,
         _stage_buf: []u8 = &.{},
 
         const Self = @This();
@@ -102,10 +133,7 @@ pub fn StreamContext(comptime opts: Options, comptime ConnType: type, comptime S
 
         pub fn respond(self: *Self, value: anytype) anyerror!void {
             const normalized = normalizeResponse(value);
-            switch (comptime opts.execution) {
-                .sequential => try writeNormalizedResponse(self._output, self.stream.opcode, normalized, self._stage_buf),
-                .async => try self._output.writeResponse(self.stream.opcode, normalized, self._stage_buf),
-            }
+            try writeNormalizedResponse(self._output, self.stream.opcode, normalized, self._stage_buf);
         }
 
         pub fn flush(self: *Self) anyerror!void {
@@ -192,11 +220,7 @@ pub fn run(
 ) anyerror!void {
     comptime validateOptions(opts);
     _ = handlerFnInfo(@TypeOf(handler));
-
-    if (comptime opts.execution == .sequential) {
-        return runSequential(opts, io, conn_ptr, state_ptr, scratch, handler);
-    }
-    return runAsync(opts, io, conn_ptr, state_ptr, scratch, handler);
+    return runSequential(opts, io, conn_ptr, state_ptr, scratch, handler);
 }
 
 fn runSequential(
@@ -209,9 +233,11 @@ fn runSequential(
 ) anyerror!void {
     const ConnType = pointerChildType(@TypeOf(conn_ptr), "conn_ptr");
     const StateType = pointerChildType(@TypeOf(state_ptr), "state_ptr");
+    defer flushPendingOutput(conn_ptr) catch {};
 
     if (comptime opts.receive_mode == .solid_slice) {
         while (true) {
+            try flushBeforeRead(conn_ptr);
             const message = (conn_ptr.readMessageBorrowed() catch |err| switch (err) {
                 error.EndOfStream, error.ConnectionClosed => return,
                 else => return err,
@@ -232,6 +258,7 @@ fn runSequential(
     }
 
     while (true) {
+        try flushBeforeRead(conn_ptr);
         const start = beginMessageStream(conn_ptr) catch |err| switch (err) {
             error.EndOfStream, error.ConnectionClosed => return,
             else => return err,
@@ -252,16 +279,19 @@ fn runSequential(
     }
 }
 
-fn runAsync(
-    comptime opts: Options,
+pub fn runAsync(
+    comptime opts: AsyncOptions,
     io: Io,
+    runtime: anytype,
     conn_ptr: anytype,
     state_ptr: anytype,
     scratch: *AsyncScratch(opts),
-    comptime handler: anytype,
 ) anyerror!void {
+    comptime validateAsyncOptions(opts);
     const ConnType = pointerChildType(@TypeOf(conn_ptr), "conn_ptr");
     const StateType = pointerChildType(@TypeOf(state_ptr), "state_ptr");
+    const Runtime = pointerChildType(@TypeOf(runtime), "runtime");
+    comptime validateAsyncRuntime(Runtime, opts, ConnType, StateType);
     const HooksType = @TypeOf(conn_ptr.hooks);
     const ReadConnType = conn.ConnWithHooks(.{
         .role = ConnType.static_config.role,
@@ -275,59 +305,16 @@ fn runAsync(
         .permessage_deflate_require_compression_gain = ConnType.static_config.permessage_deflate_require_compression_gain,
     }, HooksType);
     const Shared = AsyncShared(ConnType);
-    const Slot = AsyncSlot(opts);
+    var jobs: [opts.max_inflight]Runtime.Job = undefined;
 
     var shared: Shared = .{
         .io = io,
         .conn = conn_ptr,
     };
-    var output: AsyncOutput(ConnType) = .{
-        .shared = &shared,
-    };
 
     var read_writer_buf: [256]u8 = undefined;
     var read_writer = LockedWriterProxy.init(io, conn_ptr.writer, &shared.write_mutex, read_writer_buf[0..]);
     var read_conn = ReadConnType.initWithHooks(conn_ptr.reader, &read_writer.interface, conn_ptr.config, conn_ptr.hooks);
-
-    const Worker = struct {
-        fn main(slots: []Slot, shared_ptr: *Shared, output_ptr: *AsyncOutput(ConnType), state: *StateType) void {
-            while (true) {
-                const slot_index = shared_ptr.nextReadySlot(slots) orelse return;
-                const slot = &slots[slot_index];
-                const opcode = slot.opcode;
-                const message_len = slot.message_len;
-
-                var ctx: SliceContext(opts, ConnType, StateType) = .{
-                    .io = shared_ptr.io,
-                    .state = state,
-                    .message = .{
-                        .opcode = opcode,
-                        .payload = slot.message_buf[0..message_len],
-                    },
-                    ._output = output_ptr,
-                    ._stage_buf = slot.stage_buf[0..],
-                };
-
-                processHandlerResult(opts, shared_ptr.io, &ctx, handler) catch |err| {
-                    _ = shared_ptr.recordError(err);
-                };
-                shared_ptr.releaseSlot(slot);
-            }
-        }
-    };
-
-    var started_threads: usize = 0;
-    errdefer {
-        shared.stopAccepting(false);
-        for (scratch.workers[0..started_threads]) |thread| {
-            if (thread) |worker| worker.join();
-        }
-    }
-
-    for (&scratch.workers) |*worker| {
-        worker.* = try std.Thread.spawn(.{}, Worker.main, .{ scratch.slots[0..], &shared, &output, state_ptr });
-        started_threads += 1;
-    }
     while (try shared.reserveSlot(scratch.slots[0..])) |slot_index| {
         const slot = &scratch.slots[slot_index];
         read_conn.close_sent = conn_ptr.close_sent;
@@ -354,14 +341,16 @@ fn runAsync(
 
         slot.opcode = message.opcode;
         slot.message_len = message.payload.len;
-        shared.enqueueReadySlot(slot);
+        jobs[slot_index] = .{
+            .slot = slot,
+            .shared = &shared,
+            .state = state_ptr,
+        };
+        runtime.enqueue(&jobs[slot_index]);
     }
 
     shared.stopAccepting(false);
-    for (&scratch.workers) |*worker| {
-        if (worker.*) |thread| thread.join();
-        worker.* = null;
-    }
+    shared.waitIdle();
 
     if (shared.firstError()) |err| return err;
 }
@@ -428,9 +417,30 @@ fn processHandlerResult(comptime opts: Options, io: Io, ctx: anytype, comptime h
             try writeResult(ctx, raw);
         },
     }
-    if (comptime opts.auto_flush) {
-        try ctx.flush();
+}
+
+fn processAsyncHandlerResult(comptime opts: AsyncOptions, io: Io, ctx: anytype, comptime handler: anytype) anyerror!void {
+    const fn_info = handlerFnInfo(@TypeOf(handler));
+    const ReturnType = fn_info.return_type orelse @compileError("handler must have a return type");
+    const raw: ReturnType = callHandler(ReturnType, handler, io, ctx);
+    const raw_info = @typeInfo(@TypeOf(raw));
+    switch (raw_info) {
+        .error_union => {
+            const value = raw catch |err| {
+                handleAsyncHandlerError(opts, ctx, err);
+                return err;
+            };
+            try writeResult(ctx, value);
+        },
+        else => {
+            try writeResult(ctx, raw);
+        },
     }
+    ctx.flush() catch |err| {
+        if (err == error.ConnectionClosed and ctx._output.shared.shutdownWrites()) return;
+        _ = ctx._output.shared.recordError(err);
+        return err;
+    };
 }
 
 fn writeResult(ctx: anytype, value: anytype) anyerror!void {
@@ -439,22 +449,19 @@ fn writeResult(ctx: anytype, value: anytype) anyerror!void {
     try ctx.respond(value);
 }
 
-fn handleHandlerError(comptime opts: Options, ctx: anytype, err: anyerror) void {
-    switch (comptime opts.execution) {
-        .sequential => {
-            const c = ctx._output;
-            if (comptime !opts.close_on_handler_error) return;
-            c.writeClose(1011, "") catch {};
-            c.flush() catch {};
-        },
-        .async => {
-            const a = ctx._output;
-            const first = a.shared.recordError(err);
-            if (comptime !opts.close_on_handler_error) return;
-            if (!first) return;
-            a.sendInternalClose(1011, "");
-        },
-    }
+fn handleHandlerError(comptime opts: Options, ctx: anytype, _: anyerror) void {
+    const c = ctx._output;
+    if (comptime !opts.close_on_handler_error) return;
+    c.writeClose(1011, "") catch {};
+    c.flush() catch {};
+}
+
+fn handleAsyncHandlerError(comptime opts: AsyncOptions, ctx: anytype, err: anyerror) void {
+    const output = ctx._output;
+    const first = output.shared.recordError(err);
+    if (comptime !opts.close_on_handler_error) return;
+    if (!first) return;
+    output.sendInternalClose(1011, "");
 }
 
 fn callHandler(comptime ReturnType: type, comptime handler: anytype, io: Io, ctx: anytype) ReturnType {
@@ -609,21 +616,70 @@ fn validateOptions(comptime opts: Options) void {
     if (opts.receive_mode == .solid_slice and opts.message_buffer_len == 0) {
         @compileError("handler solid-slice mode requires message_buffer_len > 0");
     }
-    if (opts.execution == .async) {
-        if (builtin.single_threaded) {
-            @compileError("handler async mode requires a threaded build");
-        }
-        if (opts.receive_mode != .solid_slice) {
-            @compileError("handler async mode only supports .receive_mode = .solid_slice");
-        }
-        if (opts.async_max_inflight == 0) {
-            @compileError("handler async mode requires async_max_inflight > 0");
-        }
+}
+
+fn normalizeOptions(comptime value: anytype) Options {
+    const T = @TypeOf(value);
+    if (T == Options) return value;
+    return .{
+        .receive_mode = if (@hasField(T, "receive_mode")) value.receive_mode else .solid_slice,
+        .close_on_handler_error = if (@hasField(T, "close_on_handler_error")) value.close_on_handler_error else true,
+        .message_buffer_len = if (@hasField(T, "message_buffer_len")) value.message_buffer_len else 64 * 1024,
+        .stage_buffer_len = if (@hasField(T, "stage_buffer_len")) value.stage_buffer_len else 0,
+    };
+}
+
+fn validateAsyncOptions(comptime opts: AsyncOptions) void {
+    if (builtin.single_threaded) {
+        @compileError("handler async mode requires a threaded build");
+    }
+    if (opts.message_buffer_len == 0) {
+        @compileError("handler async mode requires message_buffer_len > 0");
+    }
+    if (opts.max_inflight == 0) {
+        @compileError("handler async mode requires max_inflight > 0");
     }
 }
 
+fn normalizeAsyncOptions(comptime value: anytype) AsyncOptions {
+    const T = @TypeOf(value);
+    if (T == AsyncOptions) return value;
+    return .{
+        .close_on_handler_error = if (@hasField(T, "close_on_handler_error")) value.close_on_handler_error else true,
+        .max_inflight = if (@hasField(T, "max_inflight")) value.max_inflight else 4,
+        .message_buffer_len = if (@hasField(T, "message_buffer_len")) value.message_buffer_len else 64 * 1024,
+        .stage_buffer_len = if (@hasField(T, "stage_buffer_len")) value.stage_buffer_len else 0,
+    };
+}
+
+fn validateAsyncRuntime(comptime Runtime: type, comptime opts: AsyncOptions, comptime ConnType: type, comptime StateType: type) void {
+    if (!@hasDecl(Runtime, "runtime_handler")) {
+        @compileError("runtime must be created with Handler.AsyncRuntime(...)");
+    }
+    if (!std.meta.eql(Runtime.runtime_options, opts)) {
+        @compileError("runtime async options do not match runAsync options");
+    }
+    if (Runtime.runtime_conn_type != ConnType) {
+        @compileError("runtime connection type does not match conn_ptr");
+    }
+    if (Runtime.runtime_state_type != StateType) {
+        @compileError("runtime state type does not match state_ptr");
+    }
+}
+
+fn flushPendingOutput(c: anytype) anyerror!void {
+    if (c.writer.buffered().len == 0) return;
+    try c.flush();
+}
+
+fn flushBeforeRead(c: anytype) anyerror!void {
+    if (c.writer.buffered().len == 0) return;
+    if (c.reader.bufferedLen() != 0) return;
+    try c.flush();
+}
+
 fn SequentialScratch(comptime opts: Options) type {
-    const stage_len = effectiveStageBufferLen(opts);
+    const stage_len = effectiveStageBufferLen(opts.message_buffer_len, opts.stage_buffer_len);
     return struct {
         message_buf: [if (opts.receive_mode == .solid_slice) opts.message_buffer_len else 0]u8 = undefined,
         stage_buf: [stage_len]u8 = undefined,
@@ -636,27 +692,24 @@ fn SequentialScratch(comptime opts: Options) type {
     };
 }
 
-fn AsyncScratch(comptime opts: Options) type {
+fn AsyncScratchType(comptime opts: AsyncOptions) type {
     return struct {
-        slots: [opts.async_max_inflight]AsyncSlot(opts) = undefined,
-        workers: [asyncWorkerCount(opts)]?std.Thread = undefined,
+        slots: [opts.max_inflight]AsyncSlotStorage(opts) = undefined,
 
         const Self = @This();
 
         pub fn init() Self {
             var out: Self = undefined;
             inline for (&out.slots) |*slot| slot.* = .{};
-            inline for (&out.workers) |*worker| worker.* = null;
             return out;
         }
     };
 }
 
-fn AsyncSlot(comptime opts: Options) type {
-    const stage_len = effectiveStageBufferLen(opts);
+fn AsyncSlotStorage(comptime opts: AsyncOptions) type {
+    const stage_len = effectiveStageBufferLen(opts.message_buffer_len, opts.stage_buffer_len);
     return struct {
         busy: bool = false,
-        queued: bool = false,
         opcode: conn.MessageOpcode = .text,
         message_len: usize = 0,
         message_buf: [opts.message_buffer_len]u8 = undefined,
@@ -664,12 +717,8 @@ fn AsyncSlot(comptime opts: Options) type {
     };
 }
 
-fn asyncWorkerCount(comptime opts: Options) usize {
-    return @min(opts.async_max_inflight, 4);
-}
-
-fn effectiveStageBufferLen(comptime opts: Options) usize {
-    return if (opts.stage_buffer_len == 0) opts.message_buffer_len else opts.stage_buffer_len;
+fn effectiveStageBufferLen(message_buffer_len: usize, stage_buffer_len: usize) usize {
+    return if (stage_buffer_len == 0) message_buffer_len else stage_buffer_len;
 }
 
 fn AsyncShared(comptime ConnType: type) type {
@@ -680,13 +729,14 @@ fn AsyncShared(comptime ConnType: type) type {
         mutex: Io.Mutex = .init,
         cond: Io.Condition = .init,
         stopping: bool = false,
-        shutdown: std.atomic.Value(bool) = .init(false),
+        shutdown_writes: bool = false,
         first_error: ?anyerror = null,
+        busy_count: usize = 0,
 
         const Self = @This();
 
         fn reserveSlot(self: *Self, slots: anytype) Io.Cancelable!?usize {
-            try self.mutex.lock(self.io);
+            self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
 
             while (true) {
@@ -694,10 +744,11 @@ fn AsyncShared(comptime ConnType: type) type {
                 for (slots, 0..) |*slot, idx| {
                     if (!slot.busy) {
                         slot.busy = true;
+                        self.busy_count += 1;
                         return idx;
                     }
                 }
-                try self.cond.wait(self.io, &self.mutex);
+                self.cond.waitUncancelable(self.io, &self.mutex);
             }
         }
 
@@ -705,39 +756,24 @@ fn AsyncShared(comptime ConnType: type) type {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             slot.busy = false;
-            slot.queued = false;
+            self.busy_count -= 1;
             self.cond.broadcast(self.io);
-        }
-
-        fn enqueueReadySlot(self: *Self, slot: anytype) void {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            slot.queued = true;
-            self.cond.signal(self.io);
-        }
-
-        fn nextReadySlot(self: *Self, slots: anytype) ?usize {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-
-            while (true) {
-                for (slots, 0..) |*slot, idx| {
-                    if (slot.busy and slot.queued) {
-                        slot.queued = false;
-                        return idx;
-                    }
-                }
-                if (self.stopping) return null;
-                self.cond.waitUncancelable(self.io, &self.mutex);
-            }
         }
 
         fn stopAccepting(self: *Self, shutdown_writes: bool) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             self.stopping = true;
-            if (shutdown_writes) self.shutdown.store(true, .release);
+            self.shutdown_writes = self.shutdown_writes or shutdown_writes;
             self.cond.broadcast(self.io);
+        }
+
+        fn waitIdle(self: *Self) void {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            while (self.busy_count != 0) {
+                self.cond.waitUncancelable(self.io, &self.mutex);
+            }
         }
 
         fn recordError(self: *Self, err: anyerror) bool {
@@ -746,7 +782,7 @@ fn AsyncShared(comptime ConnType: type) type {
             const first = self.first_error == null;
             if (first) self.first_error = err;
             self.stopping = true;
-            self.shutdown.store(true, .release);
+            self.shutdown_writes = true;
             self.cond.broadcast(self.io);
             return first;
         }
@@ -755,6 +791,12 @@ fn AsyncShared(comptime ConnType: type) type {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             return self.first_error;
+        }
+
+        fn shutdownWrites(self: *Self) bool {
+            self.mutex.lockUncancelable(self.io);
+            defer self.mutex.unlock(self.io);
+            return self.shutdown_writes;
         }
     };
 }
@@ -765,19 +807,17 @@ fn AsyncOutput(comptime ConnType: type) type {
 
         const Self = @This();
 
-        // Hold the write gate for the whole logical response so chunked replies do
-        // not interleave frames when multiple workers finish concurrently.
         pub fn writeResponse(self: *Self, request_opcode: conn.MessageOpcode, response: Response, stage_buf: []u8) anyerror!void {
-            try self.shared.write_mutex.lock(self.shared.io);
+            self.shared.write_mutex.lockUncancelable(self.shared.io);
             defer self.shared.write_mutex.unlock(self.shared.io);
-            if (self.shared.shutdown.load(.acquire)) return error.ConnectionClosed;
+            if (self.shared.shutdown_writes) return error.ConnectionClosed;
             try writeNormalizedResponse(self.shared.conn, request_opcode, response, stage_buf);
         }
 
         pub fn flush(self: *Self) anyerror!void {
-            try self.shared.write_mutex.lock(self.shared.io);
+            self.shared.write_mutex.lockUncancelable(self.shared.io);
             defer self.shared.write_mutex.unlock(self.shared.io);
-            if (self.shared.shutdown.load(.acquire)) return error.ConnectionClosed;
+            if (self.shared.shutdown_writes) return error.ConnectionClosed;
             try self.shared.conn.flush();
         }
 
@@ -786,6 +826,140 @@ fn AsyncOutput(comptime ConnType: type) type {
             defer self.shared.write_mutex.unlock(self.shared.io);
             self.shared.conn.writeClose(code, reason) catch {};
             self.shared.conn.flush() catch {};
+        }
+    };
+}
+
+pub fn AsyncRuntime(
+    comptime opts: AsyncOptions,
+    comptime ConnType: type,
+    comptime StateType: type,
+    comptime handler: anytype,
+    comptime cfg: RuntimeConfig,
+) type {
+    _ = handlerFnInfo(@TypeOf(handler));
+    if (cfg.worker_count == 0) {
+        @compileError("handler async runtime requires worker_count > 0");
+    }
+
+    return struct {
+        pub const runtime_options = opts;
+        pub const runtime_conn_type = ConnType;
+        pub const runtime_state_type = StateType;
+        pub const runtime_handler = handler;
+
+        const Self = @This();
+        const Slot = AsyncSlotStorage(opts);
+        const Shared = AsyncShared(ConnType);
+
+        pub const Job = struct {
+            next: ?*Job = null,
+            slot: *Slot,
+            shared: *Shared,
+            state: *StateType,
+        };
+
+        const Queue = struct {
+            mutex: Io.Mutex = .init,
+            cond: Io.Condition = .init,
+            head: ?*Job = null,
+            tail: ?*Job = null,
+            stop: bool = false,
+            thread: ?std.Thread = null,
+        };
+
+        io: Io,
+        workers: [cfg.worker_count]Queue = undefined,
+        next_worker: std.atomic.Value(usize) = .init(0),
+        started: bool = false,
+
+        pub fn init(io: Io) Self {
+            var out: Self = undefined;
+            out.io = io;
+            inline for (&out.workers) |*queue| queue.* = .{};
+            out.next_worker = .init(0);
+            return out;
+        }
+
+        pub fn start(self: *Self) !void {
+            if (self.started) return;
+            errdefer self.deinit();
+            for (&self.workers, 0..) |*queue, idx| {
+                queue.thread = try std.Thread.spawn(.{}, workerMain, .{ self, idx });
+            }
+            self.started = true;
+        }
+
+        pub fn deinit(self: *Self) void {
+            if (!self.started) return;
+            for (&self.workers) |*queue| {
+                queue.mutex.lockUncancelable(self.io);
+                queue.stop = true;
+                queue.cond.broadcast(self.io);
+                queue.mutex.unlock(self.io);
+            }
+            for (&self.workers) |*queue| {
+                if (queue.thread) |thread| thread.join();
+                queue.thread = null;
+            }
+            self.started = false;
+        }
+
+        fn enqueue(self: *Self, job: *Job) void {
+            const idx = self.next_worker.fetchAdd(1, .monotonic) % cfg.worker_count;
+            const queue = &self.workers[idx];
+            queue.mutex.lockUncancelable(self.io);
+            defer queue.mutex.unlock(self.io);
+            job.next = null;
+            if (queue.tail) |tail| {
+                tail.next = job;
+            } else {
+                queue.head = job;
+            }
+            queue.tail = job;
+            queue.cond.signal(self.io);
+        }
+
+        fn workerMain(self: *Self, idx: usize) void {
+            const queue = &self.workers[idx];
+            while (true) {
+                const job = pop(self, queue) orelse return;
+                processSlot(job);
+            }
+        }
+
+        fn pop(self: *Self, queue: *Queue) ?*Job {
+            queue.mutex.lockUncancelable(self.io);
+            defer queue.mutex.unlock(self.io);
+            while (queue.head == null and !queue.stop) {
+                queue.cond.waitUncancelable(self.io, &queue.mutex);
+            }
+            const job = queue.head orelse return null;
+            queue.head = job.next;
+            if (queue.head == null) queue.tail = null;
+            job.next = null;
+            return job;
+        }
+
+        fn processSlot(job: *Job) void {
+            const shared = job.shared;
+            var output: AsyncOutput(ConnType) = .{ .shared = shared };
+            var ctx: SliceContext(opts, ConnType, StateType) = .{
+                .io = shared.io,
+                .state = job.state,
+                .message = .{
+                    .opcode = job.slot.opcode,
+                    .payload = job.slot.message_buf[0..job.slot.message_len],
+                },
+                ._output = &output,
+                ._stage_buf = job.slot.stage_buf[0..],
+            };
+            processAsyncHandlerResult(opts, shared.io, &ctx, handler) catch |err| {
+                if (!(err == error.ConnectionClosed and shared.shutdownWrites())) {
+                    _ = shared.recordError(err);
+                }
+            };
+            shared.releaseSlot(job.slot);
         }
     };
 }
@@ -895,10 +1069,8 @@ test "helper utilities normalize responses and compute staging decisions directl
     try std.testing.expect(isBytesSlice([]const u8));
     try std.testing.expect(isChunkSlice([]const []const u8));
     try std.testing.expectEqualStrings(@typeName(u8), @typeName(pointerChildType(*u8, "ptr")));
-    try std.testing.expectEqual(@as(usize, 64), effectiveStageBufferLen(.{ .message_buffer_len = 64 }));
-    try std.testing.expectEqual(@as(usize, 7), effectiveStageBufferLen(.{ .message_buffer_len = 64, .stage_buffer_len = 7 }));
-    try std.testing.expectEqual(@as(usize, 4), asyncWorkerCount(.{ .execution = .async, .async_max_inflight = 9 }));
-    try std.testing.expectEqual(@as(usize, 2), asyncWorkerCount(.{ .execution = .async, .async_max_inflight = 2 }));
+    try std.testing.expectEqual(@as(usize, 64), effectiveStageBufferLen(64, 0));
+    try std.testing.expectEqual(@as(usize, 7), effectiveStageBufferLen(64, 7));
 }
 
 test "run solid-slice mode invokes handler and writes byte-slice response" {
@@ -1348,8 +1520,7 @@ test "async mode processes multiple messages concurrently and writes completion-
 
     const H = struct {
         fn handle(ctx: *SliceContext(.{
-            .execution = .async,
-            .async_max_inflight = 2,
+            .max_inflight = 2,
             .message_buffer_len = 64,
             .stage_buffer_len = 64,
         }, conn.Server, State)) ![]const u8 {
@@ -1369,18 +1540,17 @@ test "async mode processes multiple messages concurrently and writes completion-
         }
     };
 
-    var scratch = Scratch(.{
-        .execution = .async,
-        .async_max_inflight = 2,
+    const async_opts: AsyncOptions = .{
+        .max_inflight = 2,
         .message_buffer_len = 64,
         .stage_buffer_len = 64,
-    }).init();
-    try run(.{
-        .execution = .async,
-        .async_max_inflight = 2,
-        .message_buffer_len = 64,
-        .stage_buffer_len = 64,
-    }, io, &server_conn, &state, &scratch, H.handle);
+    };
+    const Runtime = AsyncRuntime(async_opts, conn.Server, State, H.handle, .{ .worker_count = 2 });
+    var runtime = Runtime.init(io);
+    try runtime.start();
+    defer runtime.deinit();
+    var scratch = AsyncScratch(async_opts).init();
+    try runAsync(async_opts, io, &runtime, &server_conn, &state, &scratch);
 
     try std.testing.expectEqual(@as(usize, 2), state.calls);
 
@@ -1411,24 +1581,23 @@ test "async mode sends one 1011 and returns handler error" {
 
     const H = struct {
         fn handle(_: *SliceContext(.{
-            .execution = .async,
-            .async_max_inflight = 1,
+            .max_inflight = 1,
             .message_buffer_len = 64,
         }, conn.Server, u8)) error{HandlerFailed}!void {
             return error.HandlerFailed;
         }
     };
     var state: u8 = 0;
-    var scratch = Scratch(.{
-        .execution = .async,
-        .async_max_inflight = 1,
+    const async_opts: AsyncOptions = .{
+        .max_inflight = 1,
         .message_buffer_len = 64,
-    }).init();
-    try std.testing.expectError(error.HandlerFailed, run(.{
-        .execution = .async,
-        .async_max_inflight = 1,
-        .message_buffer_len = 64,
-    }, io, &server_conn, &state, &scratch, H.handle));
+    };
+    const Runtime = AsyncRuntime(async_opts, conn.Server, u8, H.handle, .{ .worker_count = 1 });
+    var runtime = Runtime.init(io);
+    try runtime.start();
+    defer runtime.deinit();
+    var scratch = AsyncScratch(async_opts).init();
+    try std.testing.expectError(error.HandlerFailed, runAsync(async_opts, io, &runtime, &server_conn, &state, &scratch));
 
     var out_reader = Io.Reader.fixed(output[0..writer.end]);
     var sink: [0]u8 = .{};
