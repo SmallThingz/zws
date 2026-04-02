@@ -305,7 +305,7 @@ fn runAsync(
                 processHandlerResult(opts, shared_ptr.io, &ctx, handler) catch |err| {
                     _ = shared_ptr.recordError(err);
                 };
-                shared_ptr.finishSlot(slot);
+                shared_ptr.releaseSlot(slot);
             }
         }
     };
@@ -328,19 +328,19 @@ fn runAsync(
 
         const message = read_conn.readMessage(slot.message_buf[0..]) catch |err| switch (err) {
             error.EndOfStream => {
-                shared.releaseReservedSlot(slot);
+                shared.releaseSlot(slot);
                 shared.stopAccepting(false);
                 break;
             },
             error.ConnectionClosed => {
-                shared.releaseReservedSlot(slot);
+                shared.releaseSlot(slot);
                 conn_ptr.close_received = conn_ptr.close_received or read_conn.close_received;
                 conn_ptr.close_sent = conn_ptr.close_sent or read_conn.close_sent;
                 shared.stopAccepting(true);
                 break;
             },
             else => {
-                shared.releaseReservedSlot(slot);
+                shared.releaseSlot(slot);
                 _ = shared.recordError(err);
                 break;
             },
@@ -673,7 +673,6 @@ fn AsyncShared(comptime ConnType: type) type {
         cond: Io.Condition = .init,
         stopping: bool = false,
         shutdown: std.atomic.Value(bool) = .init(false),
-        inflight: usize = 0,
         first_error: ?anyerror = null,
 
         const Self = @This();
@@ -687,7 +686,6 @@ fn AsyncShared(comptime ConnType: type) type {
                 for (slots, 0..) |*slot, idx| {
                     if (!slot.busy) {
                         slot.busy = true;
-                        self.inflight += 1;
                         return idx;
                     }
                 }
@@ -695,21 +693,11 @@ fn AsyncShared(comptime ConnType: type) type {
             }
         }
 
-        fn releaseReservedSlot(self: *Self, slot: anytype) void {
+        fn releaseSlot(self: *Self, slot: anytype) void {
             self.mutex.lockUncancelable(self.io);
             defer self.mutex.unlock(self.io);
             slot.busy = false;
             slot.queued = false;
-            self.inflight -= 1;
-            self.cond.broadcast(self.io);
-        }
-
-        fn finishSlot(self: *Self, slot: anytype) void {
-            self.mutex.lockUncancelable(self.io);
-            defer self.mutex.unlock(self.io);
-            slot.busy = false;
-            slot.queued = false;
-            self.inflight -= 1;
             self.cond.broadcast(self.io);
         }
 
