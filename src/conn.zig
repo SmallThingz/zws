@@ -127,6 +127,8 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
     const permessage_deflate_context_takeover = static.permessage_deflate_context_takeover;
     const permessage_deflate_min_payload_len = static.permessage_deflate_min_payload_len;
     const permessage_deflate_require_compression_gain = static.permessage_deflate_require_compression_gain;
+    const StoredPerMessageDeflateField = if (supports_permessage_deflate) ?PerMessageDeflateConfig else void;
+    const StoredTimeoutsField = if (runtime_hooks) observe.TimeoutConfig else void;
     const HooksField = if (runtime_hooks) Hooks else void;
     const MaskPrngField = if (sends_masked) std.Random.DefaultPrng else void;
     const RecvMaskField = if (expects_masked) [mask_len]u8 else void;
@@ -136,12 +138,19 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
     const RecvTakeoverField = if (supports_permessage_deflate and permessage_deflate_context_takeover) ?flate_backend.TakeoverInflater else void;
     if (comptime runtime_hooks) observe.validateHooks(Hooks);
 
+    const StoredConfig = struct {
+        max_frame_payload_len: u64 = std.math.maxInt(u64),
+        max_message_payload_len: usize = std.math.maxInt(usize),
+        permessage_deflate: StoredPerMessageDeflateField = if (supports_permessage_deflate) null else {},
+        timeouts: StoredTimeoutsField = if (runtime_hooks) .{} else {},
+    };
+
     return struct {
         pub const static_config = static;
 
         reader: *Io.Reader,
         writer: *Io.Writer,
-        config: Config,
+        config: StoredConfig,
         hooks: HooksField = if (runtime_hooks) undefined else {},
         mask_prng: MaskPrngField = if (sends_masked) undefined else {},
 
@@ -162,25 +171,77 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
         const Self = @This();
         const masked_write_scratch_len = 4096;
         const TimedOp = struct {
-            phase: observe.IoPhase,
             start_ns: u64,
             budget_ns: u64,
         };
 
-        pub fn init(reader: *Io.Reader, writer: *Io.Writer, config: Config) Self {
+        pub fn init(reader: *Io.Reader, writer: *Io.Writer, config: anytype) Self {
             return initWithHooks(reader, writer, config, .{});
         }
 
-        pub fn initWithHooks(reader: *Io.Reader, writer: *Io.Writer, config: Config, hooks: Hooks) Self {
+        pub fn initWithHooks(reader: *Io.Reader, writer: *Io.Writer, config: anytype, hooks: Hooks) Self {
             const seed = nextMaskSeed() ^
                 @as(u64, @truncate(@intFromPtr(reader))) ^
                 (@as(u64, @truncate(@intFromPtr(writer))) << 1);
             return .{
                 .reader = reader,
                 .writer = writer,
-                .config = config,
+                .config = normalizeConfig(config),
                 .hooks = if (runtime_hooks) hooks else {},
                 .mask_prng = if (sends_masked) std.Random.DefaultPrng.init(seed) else {},
+            };
+        }
+
+        fn normalizeConfig(config: anytype) StoredConfig {
+            const T = @TypeOf(config);
+            return .{
+                .max_frame_payload_len = if (@hasField(T, "max_frame_payload_len")) config.max_frame_payload_len else std.math.maxInt(u64),
+                .max_message_payload_len = if (@hasField(T, "max_message_payload_len")) config.max_message_payload_len else std.math.maxInt(usize),
+                .permessage_deflate = if (supports_permessage_deflate)
+                    if (@hasField(T, "permessage_deflate")) normalizePerMessageDeflateConfig(config.permessage_deflate) else null
+                else
+                    {},
+                .timeouts = if (runtime_hooks)
+                    if (@hasField(T, "timeouts")) normalizeTimeoutConfig(config.timeouts) else .{}
+                else
+                    {},
+            };
+        }
+
+        fn normalizePerMessageDeflateConfig(value: anytype) ?PerMessageDeflateConfig {
+            const T = @TypeOf(value);
+            if (T == ?PerMessageDeflateConfig) return value;
+            if (T == PerMessageDeflateConfig) return value;
+
+            const Child, const child = switch (@typeInfo(T)) {
+                .optional => |info| .{ info.child, value orelse return null },
+                .@"struct" => .{ T, value },
+                else => @compileError("permessage_deflate must be conn.PerMessageDeflateConfig, ?conn.PerMessageDeflateConfig, or a structurally-compatible config"),
+            };
+            return .{
+                .allocator = child.allocator,
+                .negotiated = if (@hasField(Child, "negotiated")) normalizeNegotiatedPerMessageDeflate(child.negotiated) else .{},
+                .compression_level = if (@hasField(Child, "compression_level")) child.compression_level else 1,
+                .compress_outgoing = if (@hasField(Child, "compress_outgoing")) child.compress_outgoing else false,
+            };
+        }
+
+        fn normalizeNegotiatedPerMessageDeflate(value: anytype) extensions.PerMessageDeflate {
+            const T = @TypeOf(value);
+            if (T == extensions.PerMessageDeflate) return value;
+            return .{
+                .server_no_context_takeover = if (@hasField(T, "server_no_context_takeover")) value.server_no_context_takeover else false,
+                .client_no_context_takeover = if (@hasField(T, "client_no_context_takeover")) value.client_no_context_takeover else false,
+            };
+        }
+
+        fn normalizeTimeoutConfig(value: anytype) observe.TimeoutConfig {
+            const T = @TypeOf(value);
+            if (T == observe.TimeoutConfig) return value;
+            return .{
+                .read_ns = if (@hasField(T, "read_ns")) value.read_ns else null,
+                .write_ns = if (@hasField(T, "write_ns")) value.write_ns else null,
+                .flush_ns = if (@hasField(T, "flush_ns")) value.flush_ns else null,
             };
         }
 
@@ -227,7 +288,6 @@ pub fn ConnWithHooks(comptime static: StaticConfig, comptime Hooks: type) type {
             }
 
             return .{
-                .phase = phase,
                 .start_ns = start_ns,
                 .budget_ns = budget_ns,
             };

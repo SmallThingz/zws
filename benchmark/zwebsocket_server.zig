@@ -94,9 +94,9 @@ fn connConfig(cfg: Config) zws.Conn.Config {
     };
 }
 
-fn EchoHandler(comptime ConnType: type) type {
+fn EchoHandler(comptime handler_opts: zws.Handler.Options, comptime ConnType: type) type {
     return struct {
-        fn handle(ctx: *zws.Handler.SliceContext(ConnType, u8)) struct {
+        fn handle(ctx: *zws.Handler.SliceContext(handler_opts, ConnType, u8)) struct {
             opcode: zws.Protocol.MessageOpcode,
             body: []const u8,
         } {
@@ -139,7 +139,7 @@ fn handleConnWithHandler(
     var scratch = zws.Handler.Scratch(handler_opts).init();
     var state: u8 = 0;
 
-    zws.Handler.run(handler_opts, io, &conn, &state, &scratch, EchoHandler(ConnType).handle) catch |err| switch (err) {
+    zws.Handler.run(handler_opts, io, &conn, &state, &scratch, EchoHandler(handler_opts, ConnType).handle) catch |err| switch (err) {
         error.EndOfStream, error.ConnectionClosed => return,
         else => {
             common.closeForProtocolError(&conn, &sw.interface, err);

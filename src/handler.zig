@@ -45,39 +45,46 @@ pub fn Scratch(comptime opts: Options) type {
     };
 }
 
-pub fn SliceContext(comptime ConnType: type, comptime StateType: type) type {
+fn OutputType(comptime opts: Options, comptime ConnType: type) type {
+    return switch (opts.execution) {
+        .sequential => *ConnType,
+        .async => *AsyncOutput(ConnType),
+    };
+}
+
+pub fn SliceContext(comptime opts: Options, comptime ConnType: type, comptime StateType: type) type {
     return struct {
         io: Io,
         state: *StateType,
         message: conn.Message,
-        _output: ContextOutput(ConnType),
+        _output: OutputType(opts, ConnType),
         _stage_buf: []u8 = &.{},
 
         const Self = @This();
 
         pub fn respond(self: *Self, value: anytype) anyerror!void {
             const normalized = normalizeResponse(value);
-            switch (self._output) {
-                .conn => |c| try writeNormalizedResponse(c, self.message.opcode, normalized, self._stage_buf),
-                .async => |a| try a.writeResponse(self.message.opcode, normalized, self._stage_buf),
+            switch (comptime opts.execution) {
+                .sequential => try writeNormalizedResponse(self._output, self.message.opcode, normalized, self._stage_buf),
+                .async => try self._output.writeResponse(self.message.opcode, normalized, self._stage_buf),
             }
         }
 
         pub fn flush(self: *Self) anyerror!void {
-            switch (self._output) {
-                .conn => |c| try c.flush(),
-                .async => |a| try a.flush(),
+            switch (comptime opts.execution) {
+                .sequential => try self._output.flush(),
+                .async => try self._output.flush(),
             }
         }
     };
 }
 
-pub fn StreamContext(comptime ConnType: type, comptime StateType: type) type {
+pub fn StreamContext(comptime opts: Options, comptime ConnType: type, comptime StateType: type) type {
     return struct {
         io: Io,
         state: *StateType,
         stream: *StreamReader(ConnType),
-        _output: ContextOutput(ConnType),
+        _output: OutputType(opts, ConnType),
         _stage_buf: []u8 = &.{},
 
         const Self = @This();
@@ -96,16 +103,16 @@ pub fn StreamContext(comptime ConnType: type, comptime StateType: type) type {
 
         pub fn respond(self: *Self, value: anytype) anyerror!void {
             const normalized = normalizeResponse(value);
-            switch (self._output) {
-                .conn => |c| try writeNormalizedResponse(c, self.stream.opcode, normalized, self._stage_buf),
-                .async => |a| try a.writeResponse(self.stream.opcode, normalized, self._stage_buf),
+            switch (comptime opts.execution) {
+                .sequential => try writeNormalizedResponse(self._output, self.stream.opcode, normalized, self._stage_buf),
+                .async => try self._output.writeResponse(self.stream.opcode, normalized, self._stage_buf),
             }
         }
 
         pub fn flush(self: *Self) anyerror!void {
-            switch (self._output) {
-                .conn => |c| try c.flush(),
-                .async => |a| try a.flush(),
+            switch (comptime opts.execution) {
+                .sequential => try self._output.flush(),
+                .async => try self._output.flush(),
             }
         }
     };
@@ -217,11 +224,11 @@ fn runSequential(
                 else => return err,
             });
 
-            var ctx: SliceContext(ConnType, StateType) = .{
+            var ctx: SliceContext(opts, ConnType, StateType) = .{
                 .io = io,
                 .state = state_ptr,
                 .message = message,
-                ._output = .{ .conn = conn_ptr },
+                ._output = conn_ptr,
             };
             try processHandlerResult(opts, io, &ctx, handler);
         }
@@ -233,11 +240,11 @@ fn runSequential(
             else => return err,
         };
         var stream = StreamReader(ConnType).init(conn_ptr, start);
-        var ctx: StreamContext(ConnType, StateType) = .{
+        var ctx: StreamContext(opts, ConnType, StateType) = .{
             .io = io,
             .state = state_ptr,
             .stream = &stream,
-            ._output = .{ .conn = conn_ptr },
+            ._output = conn_ptr,
         };
         try processHandlerResult(opts, io, &ctx, handler);
         stream.discard() catch |err| switch (err) {
@@ -292,14 +299,14 @@ fn runAsync(
                 const opcode = slot.opcode;
                 const message_len = slot.message_len;
 
-                var ctx: SliceContext(ConnType, StateType) = .{
+                var ctx: SliceContext(opts, ConnType, StateType) = .{
                     .io = shared_ptr.io,
                     .state = state,
                     .message = .{
                         .opcode = opcode,
                         .payload = slot.message_buf[0..message_len],
                     },
-                    ._output = .{ .async = output_ptr },
+                    ._output = output_ptr,
                     ._stage_buf = slot.stage_buf[0..],
                 };
 
@@ -435,13 +442,15 @@ fn writeResult(ctx: anytype, value: anytype) anyerror!void {
 }
 
 fn handleHandlerError(comptime opts: Options, ctx: anytype, err: anyerror) void {
-    switch (ctx._output) {
-        .conn => |c| {
+    switch (comptime opts.execution) {
+        .sequential => {
+            const c = ctx._output;
             if (comptime !opts.close_on_handler_error) return;
             c.writeClose(1011, "") catch {};
             c.flush() catch {};
         },
-        .async => |a| {
+        .async => {
+            const a = ctx._output;
             const first = a.shared.recordError(err);
             if (comptime !opts.close_on_handler_error) return;
             if (!first) return;
@@ -661,13 +670,6 @@ fn effectiveStageBufferLen(comptime opts: Options) usize {
     return if (opts.stage_buffer_len == 0) opts.message_buffer_len else opts.stage_buffer_len;
 }
 
-fn ContextOutput(comptime ConnType: type) type {
-    return union(enum) {
-        conn: *ConnType,
-        async: *AsyncOutput(ConnType),
-    };
-}
-
 fn AsyncShared(comptime ConnType: type) type {
     return struct {
         io: Io,
@@ -860,7 +862,7 @@ test "run solid-slice mode invokes handler and writes byte-slice response" {
     var state: State = .{};
 
     const H = struct {
-        fn handle(ctx: *SliceContext(conn.Server, State)) []const u8 {
+        fn handle(ctx: *SliceContext(.{}, conn.Server, State)) []const u8 {
             ctx.state.calls += 1;
             std.testing.expectEqual(conn.MessageOpcode.text, ctx.message.opcode) catch unreachable;
             std.testing.expectEqualStrings("ping", ctx.message.payload) catch unreachable;
@@ -899,7 +901,7 @@ test "run solid-slice mode accepts struct responses with body and opcode" {
         body: []const u8,
     };
     const H = struct {
-        fn handle(_: *SliceContext(conn.Server, u8)) R {
+        fn handle(_: *SliceContext(.{}, conn.Server, u8)) R {
             return .{
                 .opcode = .binary,
                 .body = "abc",
@@ -934,7 +936,7 @@ test "run solid-slice mode can use borrowed messages when scratch is smaller tha
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(ctx: *SliceContext(conn.Server, u8)) []const u8 {
+        fn handle(ctx: *SliceContext(.{ .message_buffer_len = 1 }, conn.Server, u8)) []const u8 {
             std.testing.expectEqualStrings("ping", ctx.message.payload) catch unreachable;
             return "pong";
         }
@@ -968,7 +970,7 @@ test "run solid-slice mode writes chunked response bodies as fragmented frames" 
 
     const chunks = [_][]const u8{ "a", "bc", "def" };
     const H = struct {
-        fn handle(_: *SliceContext(conn.Server, u8)) []const []const u8 {
+        fn handle(_: *SliceContext(.{}, conn.Server, u8)) []const []const u8 {
             return chunks[0..];
         }
     };
@@ -1008,7 +1010,7 @@ test "run stream mode reads fragmented messages without internal message assembl
     var state: State = .{};
 
     const H = struct {
-        fn handle(ctx: *StreamContext(conn.Server, State)) ![]const u8 {
+        fn handle(ctx: *StreamContext(.{ .receive_mode = .stream }, conn.Server, State)) ![]const u8 {
             var tmp: [2]u8 = undefined;
             ctx.state.len = 0;
             while (true) {
@@ -1057,7 +1059,7 @@ test "run accepts handlers that take io and return error unions" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(io_param: Io, _: *SliceContext(conn.Server, u8)) ![]const u8 {
+        fn handle(io_param: Io, _: *SliceContext(.{}, conn.Server, u8)) ![]const u8 {
             _ = io_param;
             return "done";
         }
@@ -1079,7 +1081,7 @@ test "run closes with 1011 on handler error by default" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(_: *SliceContext(conn.Server, u8)) error{HandlerFailed}!void {
+        fn handle(_: *SliceContext(.{}, conn.Server, u8)) error{HandlerFailed}!void {
             return error.HandlerFailed;
         }
     };
@@ -1110,7 +1112,7 @@ test "run can skip 1011 close on handler error when configured" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(_: *SliceContext(conn.Server, u8)) error{HandlerFailed}!void {
+        fn handle(_: *SliceContext(.{ .close_on_handler_error = false }, conn.Server, u8)) error{HandlerFailed}!void {
             return error.HandlerFailed;
         }
     };
@@ -1132,7 +1134,7 @@ test "run supports struct responses with empty body" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(_: *SliceContext(conn.Server, u8)) struct { body: void } {
+        fn handle(_: *SliceContext(.{}, conn.Server, u8)) struct { body: void } {
             return .{ .body = {} };
         }
     };
@@ -1157,7 +1159,7 @@ test "run stream mode discards unread message tail before continuing" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(ctx: *StreamContext(conn.Server, u8)) ![]const u8 {
+        fn handle(ctx: *StreamContext(.{ .receive_mode = .stream }, conn.Server, u8)) ![]const u8 {
             var tmp: [2]u8 = undefined;
             const first = try ctx.readChunk(tmp[0..]);
             try std.testing.expectEqualStrings("he", first);
@@ -1205,7 +1207,7 @@ test "run stream mode rejects compressed messages" {
     const io = std.Io.Threaded.global_single_threaded.io();
 
     const H = struct {
-        fn handle(_: *StreamContext(conn.Server, u8)) !void {}
+        fn handle(_: *StreamContext(.{ .receive_mode = .stream }, conn.Server, u8)) !void {}
     };
     var state: u8 = 0;
     var scratch = Scratch(.{ .receive_mode = .stream }).init();
@@ -1238,7 +1240,12 @@ test "async mode processes multiple messages concurrently and writes completion-
     var state: State = .{};
 
     const H = struct {
-        fn handle(ctx: *SliceContext(conn.Server, State)) ![]const u8 {
+        fn handle(ctx: *SliceContext(.{
+            .execution = .async,
+            .async_max_inflight = 2,
+            .message_buffer_len = 64,
+            .stage_buffer_len = 64,
+        }, conn.Server, State)) ![]const u8 {
             ctx.state.mutex.lockUncancelable(ctx.io);
             ctx.state.calls += 1;
             if (std.mem.eql(u8, ctx.message.payload, "slow")) {
@@ -1296,7 +1303,11 @@ test "async mode sends one 1011 and returns handler error" {
     const io = std.testing.io;
 
     const H = struct {
-        fn handle(_: *SliceContext(conn.Server, u8)) error{HandlerFailed}!void {
+        fn handle(_: *SliceContext(.{
+            .execution = .async,
+            .async_max_inflight = 1,
+            .message_buffer_len = 64,
+        }, conn.Server, u8)) error{HandlerFailed}!void {
             return error.HandlerFailed;
         }
     };
